@@ -28,6 +28,10 @@ export default function TripDetailPage() {
   const searchTimer = useRef(null);
   const [removingId, setRemovingId] = useState(null);
 
+  // reorder state
+  const [movingId, setMovingId] = useState(null);
+  const [moveError, setMoveError] = useState("");
+
   const load = useCallback(async () => {
     const { data: t } = await supabase.from("trips").select("*").eq("id", id).maybeSingle();
     setTrip(t || null);
@@ -119,6 +123,26 @@ export default function TripDetailPage() {
     if (!error) load();
   }
 
+  async function moveStop(dayStops, stop, direction) {
+    const idx = dayStops.findIndex((s) => s.id === stop.id);
+    const swapIdx = direction === "up" ? idx - 1 : idx + 1;
+    if (swapIdx < 0 || swapIdx >= dayStops.length) return;
+    const other = dayStops[swapIdx];
+    setMoveError("");
+    setMovingId(stop.id);
+    try {
+      const { error: e1 } = await supabase.from("trip_stops").update({ sequence_order: other.sequence_order }).eq("id", stop.id);
+      if (e1) throw e1;
+      const { error: e2 } = await supabase.from("trip_stops").update({ sequence_order: stop.sequence_order }).eq("id", other.id);
+      if (e2) throw e2;
+      await load();
+    } catch (err) {
+      setMoveError(err.message || "Could not reorder these stops.");
+    } finally {
+      setMovingId(null);
+    }
+  }
+
   async function deleteTrip() {
     if (!confirm(`Delete "${trip.name}"? This cannot be undone.`)) return;
     setDeleteError("");
@@ -140,7 +164,6 @@ export default function TripDetailPage() {
     return acc;
   }, {});
   const dayNumbers = Object.keys(byDay).map(Number).sort((a, b) => a - b);
-  const maxDay = stops.length ? Math.max(...stops.map((s) => s.day_number || 1)) : 1;
 
   return (
     <div className="view">
@@ -231,33 +254,59 @@ export default function TripDetailPage() {
 
           <div className="card">
             <h3>Schools on this Trip</h3>
+            {moveError && <div className="notice danger" style={{ marginBottom: 10 }}>{moveError}</div>}
             {stops.length ? (
-              dayNumbers.map((day) => (
-                <div key={day} style={{ marginBottom: 14 }}>
-                  <div style={{ fontSize: 12, fontWeight: 700, color: "#697386", textTransform: "uppercase", marginBottom: 6 }}>
-                    Day {day}
-                  </div>
-                  {byDay[day].map((stop) => (
-                    <div className="log-item" key={stop.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
-                      <div>
-                        <strong>{stop.schools?.name}</strong> — {stop.schools?.city}, {stop.schools?.state}
-                        {stop.is_fixed_appointment && (
-                          <span className="badge badge-unverified" style={{ marginLeft: 8 }}>
-                            Fixed{stop.appointment_time ? `: ${stop.appointment_time}` : ""}
-                          </span>
-                        )}
-                      </div>
-                      <button
-                        className="btn btn-sm btn-danger"
-                        onClick={() => removeStop(stop.id)}
-                        disabled={removingId === stop.id}
-                      >
-                        {removingId === stop.id ? "…" : "Remove"}
-                      </button>
+              dayNumbers.map((day) => {
+                const dayStops = byDay[day];
+                return (
+                  <div key={day} style={{ marginBottom: 14 }}>
+                    <div style={{ fontSize: 12, fontWeight: 700, color: "#697386", textTransform: "uppercase", marginBottom: 6 }}>
+                      Day {day}
                     </div>
-                  ))}
-                </div>
-              ))
+                    {dayStops.map((stop, idx) => (
+                      <div className="log-item" key={stop.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                        <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                          <div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 1 }}>
+                            <button
+                              className="btn btn-sm"
+                              style={{ padding: "1px 7px", lineHeight: 1.4 }}
+                              onClick={() => moveStop(dayStops, stop, "up")}
+                              disabled={idx === 0 || movingId === stop.id}
+                              title="Move up"
+                            >
+                              ▲
+                            </button>
+                            <button
+                              className="btn btn-sm"
+                              style={{ padding: "1px 7px", lineHeight: 1.4 }}
+                              onClick={() => moveStop(dayStops, stop, "down")}
+                              disabled={idx === dayStops.length - 1 || movingId === stop.id}
+                              title="Move down"
+                            >
+                              ▼
+                            </button>
+                          </div>
+                          <div>
+                            <strong>{stop.schools?.name}</strong> — {stop.schools?.city}, {stop.schools?.state}
+                            {stop.is_fixed_appointment && (
+                              <span className="badge badge-unverified" style={{ marginLeft: 8 }}>
+                                Fixed{stop.appointment_time ? `: ${stop.appointment_time}` : ""}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                        <button
+                          className="btn btn-sm btn-danger"
+                          onClick={() => removeStop(stop.id)}
+                          disabled={removingId === stop.id}
+                        >
+                          {removingId === stop.id ? "…" : "Remove"}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                );
+              })
             ) : (
               <div className="empty-state">No schools added yet. Search above to add the first stop.</div>
             )}
