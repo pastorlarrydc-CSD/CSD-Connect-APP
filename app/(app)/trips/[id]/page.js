@@ -3,6 +3,7 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
+import { optimizeRoute } from "@/lib/routeOptimizer";
 import "@/lib/auth-context";
 
 const STATUS_LABEL = { planning: "Planning", active: "Active", completed: "Completed" };
@@ -32,13 +33,18 @@ export default function TripDetailPage() {
   const [movingId, setMovingId] = useState(null);
   const [moveError, setMoveError] = useState("");
 
+  // route optimizer state
+  const [optimizingDay, setOptimizingDay] = useState(null);
+  const [optimizeError, setOptimizeError] = useState({});
+  const [optimizeSummary, setOptimizeSummary] = useState({});
+
   const load = useCallback(async () => {
     const { data: t } = await supabase.from("trips").select("*").eq("id", id).maybeSingle();
     setTrip(t || null);
     if (t) {
       const { data: s } = await supabase
         .from("trip_stops")
-        .select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,addr1)")
+        .select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,addr1,lat,lon)")
         .eq("trip_id", id)
         .order("day_number", { ascending: true })
         .order("sequence_order", { ascending: true });
@@ -140,6 +146,92 @@ export default function TripDetailPage() {
       setMoveError(err.message || "Could not reorder these stops.");
     } finally {
       setMovingId(null);
+    }
+  }
+
+  // Optimizes one day's route. Fixed-appointment stops (is_fixed_appointment)
+  // stay exactly where they are -- they act as anchors, and the flexible
+  // stops around them get optimized within the segment between anchors.
+  async function optimizeDay(day, dayStops) {
+    setOptimizeError((prev) => ({ ...prev, [day]: "" }));
+    setOptimizeSummary((prev) => ({ ...prev, [day]: null }));
+
+    if (trip.start_lat == null || trip.start_lon == null || trip.end_lat == null || trip.end_lon == null) {
+      setOptimizeError((prev) => ({
+        ...prev,
+        [day]: "This trip needs a geocoded starting and ending location before routes can be optimized. Edit the trip's locations and try again.",
+      }));
+      return;
+    }
+
+    const missingCoords = dayStops.filter((s) => s.schools?.lat == null || s.schools?.lon == null);
+    if (missingCoords.length) {
+      setOptimizeError((prev) => ({
+        ...prev,
+        [day]: `${missingCoords.length} school${missingCoords.length === 1 ? "" : "s"} on this day (${missingCoords
+          .map((s) => s.schools?.name || "unknown")
+          .join(", ")}) don't have map coordinates on file, so this day can't be optimized yet.`,
+      }));
+      return;
+    }
+
+    setOptimizingDay(day);
+    try {
+      const globalStart = { lat: trip.start_lat, lon: trip.start_lon };
+      const globalEnd = { lat: trip.end_lat, lon: trip.end_lon };
+
+      // Walk the day in order, splitting into segments of flexible stops
+      // bounded by fixed-appointment anchors (or the trip's start/end).
+      const finalOrder = [];
+      let segmentStart = globalStart;
+      let buffer = [];
+      let totalBefore = 0;
+      let totalAfter = 0;
+
+      const flushBuffer = (segmentEnd) => {
+        if (!buffer.length) return;
+        const asPoints = buffer.map((s) => ({ ...s, lat: s.schools.lat, lon: s.schools.lon }));
+        const result = optimizeRoute({ start: segmentStart, stops: asPoints, end: segmentEnd });
+        totalBefore += result.unoptimizedMiles;
+        totalAfter += result.totalMiles;
+        // result.stops are the reordered `asPoints` entries -- map back to the
+        // original stop objects by id.
+        result.stops.forEach((pt) => {
+          finalOrder.push(buffer.find((b) => b.id === pt.id));
+        });
+        buffer = [];
+      };
+
+      for (const stop of dayStops) {
+        if (stop.is_fixed_appointment) {
+          flushBuffer({ lat: stop.schools.lat, lon: stop.schools.lon });
+          finalOrder.push(stop);
+          segmentStart = { lat: stop.schools.lat, lon: stop.schools.lon };
+        } else {
+          buffer.push(stop);
+        }
+      }
+      flushBuffer(globalEnd);
+
+      // Persist new sequence_order values (only where changed).
+      const updates = finalOrder
+        .map((stop, idx) => ({ stop, idx }))
+        .filter(({ stop, idx }) => stop.sequence_order !== idx);
+
+      for (const { stop, idx } of updates) {
+        const { error } = await supabase.from("trip_stops").update({ sequence_order: idx }).eq("id", stop.id);
+        if (error) throw error;
+      }
+
+      setOptimizeSummary((prev) => ({
+        ...prev,
+        [day]: { before: totalBefore, after: totalAfter, changed: updates.length > 0 },
+      }));
+      await load();
+    } catch (err) {
+      setOptimizeError((prev) => ({ ...prev, [day]: err.message || "Could not optimize this day's route." }));
+    } finally {
+      setOptimizingDay(null);
     }
   }
 
@@ -258,11 +350,35 @@ export default function TripDetailPage() {
             {stops.length ? (
               dayNumbers.map((day) => {
                 const dayStops = byDay[day];
+                const summary = optimizeSummary[day];
+                const dayError = optimizeError[day];
                 return (
-                  <div key={day} style={{ marginBottom: 14 }}>
-                    <div style={{ fontSize: 12, fontWeight: 700, color: "#697386", textTransform: "uppercase", marginBottom: 6 }}>
-                      Day {day}
+                  <div key={day} style={{ marginBottom: 18 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                      <div style={{ fontSize: 12, fontWeight: 700, color: "#697386", textTransform: "uppercase" }}>
+                        Day {day}
+                      </div>
+                      <button
+                        className="btn btn-sm"
+                        onClick={() => optimizeDay(day, dayStops)}
+                        disabled={optimizingDay === day || dayStops.length < 2}
+                        title={dayStops.length < 2 ? "Add at least 2 schools to this day to optimize" : "Reorder this day's stops for the shortest route"}
+                      >
+                        {optimizingDay === day ? "Optimizing…" : "Optimize Route"}
+                      </button>
                     </div>
+
+                    {dayError && <div className="notice danger" style={{ marginBottom: 8, fontSize: 12.5 }}>{dayError}</div>}
+                    {summary && (
+                      <div className="notice info" style={{ marginBottom: 8, fontSize: 12.5 }}>
+                        {summary.changed
+                          ? `Optimized: ${summary.after.toFixed(1)} mi (was ${summary.before.toFixed(1)} mi, ${Math.round(
+                              (1 - summary.after / summary.before) * 100
+                            )}% shorter).`
+                          : `Already the shortest order at ${summary.after.toFixed(1)} mi.`}
+                      </div>
+                    )}
+
                     {dayStops.map((stop, idx) => (
                       <div className="log-item" key={stop.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
                         <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
