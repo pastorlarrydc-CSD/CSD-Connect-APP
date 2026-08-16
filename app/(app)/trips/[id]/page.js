@@ -3,7 +3,7 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
-import { optimizeRoute } from "@/lib/routeOptimizer";
+import { optimizeRoute, haversineMiles } from "@/lib/routeOptimizer";
 import "@/lib/auth-context";
 
 const STATUS_LABEL = { planning: "Planning", active: "Active", completed: "Completed" };
@@ -50,6 +50,13 @@ export default function TripDetailPage() {
   const [noteText, setNoteText] = useState("");
   const [savingNote, setSavingNote] = useState(false);
   const [noteError, setNoteError] = useState("");
+
+  // nearby-schools suggestion state
+  const [nearbyRadius, setNearbyRadius] = useState(15);
+  const [nearbySchools, setNearbySchools] = useState(null);
+  const [nearbyLoading, setNearbyLoading] = useState(false);
+  const [nearbyError, setNearbyError] = useState("");
+  const [addingNearbyId, setAddingNearbyId] = useState(null);
 
   const load = useCallback(async () => {
     const { data: t } = await supabase.from("trips").select("*").eq("id", id).maybeSingle();
@@ -233,6 +240,91 @@ export default function TripDetailPage() {
     const addrParts = [school?.addr1, school?.city, school?.state].filter(Boolean).join(", ");
     if (!addrParts) return null;
     return `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(addrParts)}`;
+  }
+
+  // Finds schools not already on this trip whose coordinates fall within
+  // `nearbyRadius` miles of ANY existing route point (trip start/end or a
+  // stop). Cheap in two stages: a lat/lon bounding-box query narrows ~14.6k
+  // schools down to the local area server-side, then an exact haversine
+  // check (reusing the Phase 2 optimizer's distance function) filters that
+  // small candidate set precisely, client-side. No external geocoding API.
+  async function findNearbySchools() {
+    setNearbyError("");
+    setNearbySchools(null);
+
+    const routePoints = [];
+    if (trip.start_lat != null && trip.start_lon != null) routePoints.push({ lat: trip.start_lat, lon: trip.start_lon });
+    if (trip.end_lat != null && trip.end_lon != null) routePoints.push({ lat: trip.end_lat, lon: trip.end_lon });
+    stops.forEach((s) => {
+      if (s.schools?.lat != null && s.schools?.lon != null) routePoints.push({ lat: s.schools.lat, lon: s.schools.lon });
+    });
+
+    if (!routePoints.length) {
+      setNearbyError("This trip has no geocoded stops or start/end location yet, so there's no route to search near.");
+      return;
+    }
+
+    setNearbyLoading(true);
+    try {
+      const bufferDeg = nearbyRadius / 60; // ~60 miles per degree of latitude, a little generous on purpose
+      const minLat = Math.min(...routePoints.map((p) => p.lat)) - bufferDeg;
+      const maxLat = Math.max(...routePoints.map((p) => p.lat)) + bufferDeg;
+      const minLon = Math.min(...routePoints.map((p) => p.lon)) - bufferDeg;
+      const maxLon = Math.max(...routePoints.map((p) => p.lon)) + bufferDeg;
+
+      const { data, error } = await supabase
+        .from("schools")
+        .select("id,name,city,state,lat,lon,hc_first_name,hc_last_name")
+        .gte("lat", minLat)
+        .lte("lat", maxLat)
+        .gte("lon", minLon)
+        .lte("lon", maxLon)
+        .not("lat", "is", null)
+        .not("lon", "is", null)
+        .limit(500);
+      if (error) throw error;
+
+      const onTripIds = new Set(stops.map((s) => s.school_id));
+      const withDistance = (data || [])
+        .filter((school) => !onTripIds.has(school.id))
+        .map((school) => {
+          const distances = routePoints.map((p) => haversineMiles(p, { lat: school.lat, lon: school.lon }));
+          return { ...school, distanceMiles: Math.min(...distances) };
+        })
+        .filter((school) => school.distanceMiles <= nearbyRadius)
+        .sort((a, b) => a.distanceMiles - b.distanceMiles)
+        .slice(0, 15);
+
+      setNearbySchools(withDistance);
+    } catch (err) {
+      setNearbyError(err.message || "Could not search for nearby schools.");
+    } finally {
+      setNearbyLoading(false);
+    }
+  }
+
+  async function addNearbyStop(school) {
+    setNearbyError("");
+    setAddingNearbyId(school.id);
+    try {
+      const day = Math.max(1, parseInt(addDay, 10) || 1);
+      const stopsOnDay = stops.filter((s) => s.day_number === day);
+      const nextSeq = stopsOnDay.length ? Math.max(...stopsOnDay.map((s) => s.sequence_order || 0)) + 1 : 0;
+      const { error } = await supabase.from("trip_stops").insert({
+        trip_id: id,
+        college_id: trip.college_id,
+        school_id: school.id,
+        day_number: day,
+        sequence_order: nextSeq,
+      });
+      if (error) throw error;
+      setNearbySchools((prev) => (prev || []).filter((s) => s.id !== school.id));
+      await load();
+    } catch (err) {
+      setNearbyError(err.message || "Could not add this school to the trip.");
+    } finally {
+      setAddingNearbyId(null);
+    }
   }
 
   // Optimizes one day's route. Fixed-appointment stops (is_fixed_appointment)
@@ -428,6 +520,46 @@ export default function TripDetailPage() {
                 {adding ? "Adding…" : "Add to Trip"}
               </button>
             </form>
+          </div>
+
+          <div className="card" style={{ marginBottom: 14 }}>
+            <h3>Nearby Schools</h3>
+            {nearbyError && <div className="notice danger" style={{ marginBottom: 10 }}>{nearbyError}</div>}
+            <div style={{ display: "flex", gap: 8, alignItems: "flex-end", marginBottom: 10 }}>
+              <div className="form-field" style={{ marginBottom: 0 }}>
+                <label>Within</label>
+                <select value={nearbyRadius} onChange={(e) => setNearbyRadius(parseInt(e.target.value, 10))}>
+                  <option value={10}>10 miles</option>
+                  <option value={15}>15 miles</option>
+                  <option value={25}>25 miles</option>
+                  <option value={50}>50 miles</option>
+                </select>
+              </div>
+              <button className="btn btn-sm" onClick={findNearbySchools} disabled={nearbyLoading}>
+                {nearbyLoading ? "Searching…" : "Find Nearby Schools"}
+              </button>
+            </div>
+            {nearbySchools && (
+              nearbySchools.length ? (
+                nearbySchools.map((school) => (
+                  <div key={school.id} className="log-item" style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+                    <div>
+                      <strong>{school.name}</strong> — {school.city}, {school.state}
+                      <span style={{ color: "#697386", marginLeft: 6 }}>· {school.distanceMiles.toFixed(1)} mi from route</span>
+                    </div>
+                    <button
+                      className="btn btn-sm"
+                      onClick={() => addNearbyStop(school)}
+                      disabled={addingNearbyId === school.id}
+                    >
+                      {addingNearbyId === school.id ? "…" : `Add (Day ${Math.max(1, parseInt(addDay, 10) || 1)})`}
+                    </button>
+                  </div>
+                ))
+              ) : (
+                <div className="empty-state">No schools with map coordinates found within {nearbyRadius} miles of this route.</div>
+              )
+            )}
           </div>
 
           <div className="card">
