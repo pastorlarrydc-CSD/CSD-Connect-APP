@@ -45,6 +45,12 @@ export default function TripDetailPage() {
   const [savingFixed, setSavingFixed] = useState(false);
   const [fixedError, setFixedError] = useState("");
 
+  // per-stop notes editor state
+  const [editingNoteId, setEditingNoteId] = useState(null);
+  const [noteText, setNoteText] = useState("");
+  const [savingNote, setSavingNote] = useState(false);
+  const [noteError, setNoteError] = useState("");
+
   const load = useCallback(async () => {
     const { data: t } = await supabase.from("trips").select("*").eq("id", id).maybeSingle();
     setTrip(t || null);
@@ -188,6 +194,45 @@ export default function TripDetailPage() {
     } finally {
       setSavingFixed(false);
     }
+  }
+
+  function openNoteEditor(stop) {
+    setNoteError("");
+    setEditingNoteId(stop.id);
+    setNoteText(stop.notes || "");
+  }
+
+  function cancelNoteEditor() {
+    setEditingNoteId(null);
+    setNoteError("");
+  }
+
+  async function saveNote(e) {
+    e.preventDefault();
+    setNoteError("");
+    setSavingNote(true);
+    try {
+      const { error } = await supabase
+        .from("trip_stops")
+        .update({ notes: noteText.trim() || null })
+        .eq("id", editingNoteId);
+      if (error) throw error;
+      setEditingNoteId(null);
+      await load();
+    } catch (err) {
+      setNoteError(err.message || "Could not save this note.");
+    } finally {
+      setSavingNote(false);
+    }
+  }
+
+  function directionsUrl(school) {
+    if (school?.lat != null && school?.lon != null) {
+      return `https://www.google.com/maps/dir/?api=1&destination=${school.lat},${school.lon}`;
+    }
+    const addrParts = [school?.addr1, school?.city, school?.state].filter(Boolean).join(", ");
+    if (!addrParts) return null;
+    return `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(addrParts)}`;
   }
 
   // Optimizes one day's route. Fixed-appointment stops (is_fixed_appointment)
@@ -451,11 +496,38 @@ export default function TripDetailPage() {
                                   Fixed{stop.appointment_time ? `: ${stop.appointment_time}` : ""}
                                 </span>
                               )}
+                              <div style={{ display: "flex", gap: 10, marginTop: 4, fontSize: 12 }}>
+                                {stop.schools?.hc_cell ? (
+                                  <a href={`tel:${stop.schools.hc_cell.replace(/\D/g, "")}`}>📞 Call</a>
+                                ) : (
+                                  <span className="empty-state" style={{ padding: 0 }}>No cell on file</span>
+                                )}
+                                {stop.schools?.hc_email ? (
+                                  <a href={`mailto:${stop.schools.hc_email}`}>✉️ Email</a>
+                                ) : (
+                                  <span className="empty-state" style={{ padding: 0 }}>No email on file</span>
+                                )}
+                                {directionsUrl(stop.schools) ? (
+                                  <a href={directionsUrl(stop.schools)} target="_blank" rel="noopener noreferrer">
+                                    📍 Directions
+                                  </a>
+                                ) : (
+                                  <span className="empty-state" style={{ padding: 0 }}>No address on file</span>
+                                )}
+                              </div>
+                              {stop.notes && editingNoteId !== stop.id && (
+                                <div style={{ marginTop: 4, fontSize: 12.5, color: "#3c4658" }}>
+                                  📝 {stop.notes}
+                                </div>
+                              )}
                             </div>
                           </div>
                           <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
                             <button className="btn btn-sm" onClick={() => openFixedEditor(stop)}>
                               {stop.is_fixed_appointment ? "Edit Time" : "Set Fixed Time"}
+                            </button>
+                            <button className="btn btn-sm" onClick={() => openNoteEditor(stop)}>
+                              {stop.notes ? "Edit Note" : "Add Note"}
                             </button>
                             <button
                               className="btn btn-sm btn-danger"
@@ -466,6 +538,31 @@ export default function TripDetailPage() {
                             </button>
                           </div>
                         </div>
+
+                        {editingNoteId === stop.id && (
+                          <form
+                            onSubmit={saveNote}
+                            style={{ background: "#f7f8fa", border: "1px solid #dde1e7", borderRadius: 8, padding: 10, marginTop: -4, marginBottom: 8 }}
+                          >
+                            {noteError && <div className="notice danger" style={{ marginBottom: 8 }}>{noteError}</div>}
+                            <div className="form-field" style={{ marginBottom: 8 }}>
+                              <label>Note for this stop</label>
+                              <input
+                                value={noteText}
+                                onChange={(e) => setNoteText(e.target.value)}
+                                placeholder="Bring updated senior film, ask about the 6'3 slot receiver…"
+                              />
+                            </div>
+                            <div style={{ display: "flex", gap: 8 }}>
+                              <button className="btn btn-sm btn-primary" disabled={savingNote}>
+                                {savingNote ? "Saving…" : "Save"}
+                              </button>
+                              <button type="button" className="btn btn-sm" onClick={cancelNoteEditor} disabled={savingNote}>
+                                Cancel
+                              </button>
+                            </div>
+                          </form>
+                        )}
 
                         {editingStopId === stop.id && (
                           <form
