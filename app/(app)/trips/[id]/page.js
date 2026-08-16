@@ -38,6 +38,13 @@ export default function TripDetailPage() {
   const [optimizeError, setOptimizeError] = useState({});
   const [optimizeSummary, setOptimizeSummary] = useState({});
 
+  // fixed-appointment editor state
+  const [editingStopId, setEditingStopId] = useState(null);
+  const [editFixed, setEditFixed] = useState(false);
+  const [editTime, setEditTime] = useState("");
+  const [savingFixed, setSavingFixed] = useState(false);
+  const [fixedError, setFixedError] = useState("");
+
   const load = useCallback(async () => {
     const { data: t } = await supabase.from("trips").select("*").eq("id", id).maybeSingle();
     setTrip(t || null);
@@ -146,6 +153,40 @@ export default function TripDetailPage() {
       setMoveError(err.message || "Could not reorder these stops.");
     } finally {
       setMovingId(null);
+    }
+  }
+
+  function openFixedEditor(stop) {
+    setFixedError("");
+    setEditingStopId(stop.id);
+    setEditFixed(!!stop.is_fixed_appointment);
+    setEditTime(stop.appointment_time || "");
+  }
+
+  function cancelFixedEditor() {
+    setEditingStopId(null);
+    setFixedError("");
+  }
+
+  async function saveFixedAppointment(e) {
+    e.preventDefault();
+    setFixedError("");
+    setSavingFixed(true);
+    try {
+      const { error } = await supabase
+        .from("trip_stops")
+        .update({
+          is_fixed_appointment: editFixed,
+          appointment_time: editFixed ? editTime.trim() || null : null,
+        })
+        .eq("id", editingStopId);
+      if (error) throw error;
+      setEditingStopId(null);
+      await load();
+    } catch (err) {
+      setFixedError(err.message || "Could not save this appointment.");
+    } finally {
+      setSavingFixed(false);
     }
   }
 
@@ -380,44 +421,86 @@ export default function TripDetailPage() {
                     )}
 
                     {dayStops.map((stop, idx) => (
-                      <div className="log-item" key={stop.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
-                        <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
-                          <div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 1 }}>
-                            <button
-                              className="btn btn-sm"
-                              style={{ padding: "1px 7px", lineHeight: 1.4 }}
-                              onClick={() => moveStop(dayStops, stop, "up")}
-                              disabled={idx === 0 || movingId === stop.id}
-                              title="Move up"
-                            >
-                              ▲
-                            </button>
-                            <button
-                              className="btn btn-sm"
-                              style={{ padding: "1px 7px", lineHeight: 1.4 }}
-                              onClick={() => moveStop(dayStops, stop, "down")}
-                              disabled={idx === dayStops.length - 1 || movingId === stop.id}
-                              title="Move down"
-                            >
-                              ▼
-                            </button>
+                      <div key={stop.id}>
+                        <div className="log-item" style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                          <div style={{ display: "flex", gap: 8, alignItems: "flex-start" }}>
+                            <div style={{ display: "flex", flexDirection: "column", gap: 2, marginTop: 1 }}>
+                              <button
+                                className="btn btn-sm"
+                                style={{ padding: "1px 7px", lineHeight: 1.4 }}
+                                onClick={() => moveStop(dayStops, stop, "up")}
+                                disabled={idx === 0 || movingId === stop.id}
+                                title="Move up"
+                              >
+                                ▲
+                              </button>
+                              <button
+                                className="btn btn-sm"
+                                style={{ padding: "1px 7px", lineHeight: 1.4 }}
+                                onClick={() => moveStop(dayStops, stop, "down")}
+                                disabled={idx === dayStops.length - 1 || movingId === stop.id}
+                                title="Move down"
+                              >
+                                ▼
+                              </button>
+                            </div>
+                            <div>
+                              <strong>{stop.schools?.name}</strong> — {stop.schools?.city}, {stop.schools?.state}
+                              {stop.is_fixed_appointment && (
+                                <span className="badge badge-unverified" style={{ marginLeft: 8 }}>
+                                  Fixed{stop.appointment_time ? `: ${stop.appointment_time}` : ""}
+                                </span>
+                              )}
+                            </div>
                           </div>
-                          <div>
-                            <strong>{stop.schools?.name}</strong> — {stop.schools?.city}, {stop.schools?.state}
-                            {stop.is_fixed_appointment && (
-                              <span className="badge badge-unverified" style={{ marginLeft: 8 }}>
-                                Fixed{stop.appointment_time ? `: ${stop.appointment_time}` : ""}
-                              </span>
-                            )}
+                          <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                            <button className="btn btn-sm" onClick={() => openFixedEditor(stop)}>
+                              {stop.is_fixed_appointment ? "Edit Time" : "Set Fixed Time"}
+                            </button>
+                            <button
+                              className="btn btn-sm btn-danger"
+                              onClick={() => removeStop(stop.id)}
+                              disabled={removingId === stop.id}
+                            >
+                              {removingId === stop.id ? "…" : "Remove"}
+                            </button>
                           </div>
                         </div>
-                        <button
-                          className="btn btn-sm btn-danger"
-                          onClick={() => removeStop(stop.id)}
-                          disabled={removingId === stop.id}
-                        >
-                          {removingId === stop.id ? "…" : "Remove"}
-                        </button>
+
+                        {editingStopId === stop.id && (
+                          <form
+                            onSubmit={saveFixedAppointment}
+                            style={{ background: "#f7f8fa", border: "1px solid #dde1e7", borderRadius: 8, padding: 10, marginTop: -4, marginBottom: 8 }}
+                          >
+                            {fixedError && <div className="notice danger" style={{ marginBottom: 8 }}>{fixedError}</div>}
+                            <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12.5, marginBottom: 8 }}>
+                              <input
+                                type="checkbox"
+                                checked={editFixed}
+                                onChange={(e) => setEditFixed(e.target.checked)}
+                              />
+                              This is a fixed appointment — lock it in place so Optimize Route won't move it
+                            </label>
+                            {editFixed && (
+                              <div className="form-field" style={{ marginBottom: 8 }}>
+                                <label>Appointment time</label>
+                                <input
+                                  value={editTime}
+                                  onChange={(e) => setEditTime(e.target.value)}
+                                  placeholder="e.g. 10:00 AM"
+                                />
+                              </div>
+                            )}
+                            <div style={{ display: "flex", gap: 8 }}>
+                              <button className="btn btn-sm btn-primary" disabled={savingFixed}>
+                                {savingFixed ? "Saving…" : "Save"}
+                              </button>
+                              <button type="button" className="btn btn-sm" onClick={cancelFixedEditor} disabled={savingFixed}>
+                                Cancel
+                              </button>
+                            </div>
+                          </form>
+                        )}
                       </div>
                     ))}
                   </div>
