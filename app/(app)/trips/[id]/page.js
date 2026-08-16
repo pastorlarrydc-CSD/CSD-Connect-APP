@@ -4,6 +4,7 @@ import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { optimizeRoute, haversineMiles } from "@/lib/routeOptimizer";
+import { rebalanceTrip } from "@/lib/tripRebalancer";
 import "@/lib/auth-context";
 
 const STATUS_LABEL = { planning: "Planning", active: "Active", completed: "Completed" };
@@ -62,6 +63,11 @@ export default function TripDetailPage() {
   const [savingStatus, setSavingStatus] = useState(false);
   const [statusError, setStatusError] = useState("");
   const [savingVisitId, setSavingVisitId] = useState(null);
+
+  // multi-day rebalancer state
+  const [rebalancing, setRebalancing] = useState(false);
+  const [rebalanceError, setRebalanceError] = useState("");
+  const [rebalanceSummary, setRebalanceSummary] = useState(null);
 
   const load = useCallback(async () => {
     const { data: t } = await supabase.from("trips").select("*").eq("id", id).maybeSingle();
@@ -418,6 +424,80 @@ export default function TripDetailPage() {
     }
   }
 
+  // Rebalances which day each flexible stop belongs to, across the whole
+  // trip, to cut total mileage. Fixed appointments never move. Unlike
+  // optimizeDay (which only reorders stops *within* one day), this can
+  // move a stop from Day 2 to Day 1 if that's a shorter overall trip.
+  async function rebalanceAllDays() {
+    setRebalanceError("");
+    setRebalanceSummary(null);
+
+    if (trip.start_lat == null || trip.start_lon == null || trip.end_lat == null || trip.end_lon == null) {
+      setRebalanceError(
+        "This trip needs a geocoded starting and ending location before days can be rebalanced. Edit the trip's locations and try again."
+      );
+      return;
+    }
+
+    const missingCoords = stops.filter((s) => s.schools?.lat == null || s.schools?.lon == null);
+    if (missingCoords.length) {
+      setRebalanceError(
+        `${missingCoords.length} school${missingCoords.length === 1 ? "" : "s"} on this trip (${missingCoords
+          .map((s) => s.schools?.name || "unknown")
+          .join(", ")}) don't have map coordinates on file, so the trip can't be rebalanced yet.`
+      );
+      return;
+    }
+
+    const dayCount = new Set(stops.map((s) => s.day_number)).size;
+    if (dayCount < 2) {
+      setRebalanceError("Add stops across at least 2 days before rebalancing.");
+      return;
+    }
+
+    setRebalancing(true);
+    try {
+      const start = { lat: trip.start_lat, lon: trip.start_lon };
+      const end = { lat: trip.end_lat, lon: trip.end_lon };
+      const asPoints = stops.map((s) => ({ ...s, lat: s.schools.lat, lon: s.schools.lon }));
+
+      const result = rebalanceTrip({ start, end, stops: asPoints });
+
+      // Persist both the new day_number (where it changed) and the
+      // optimized sequence_order within each day, one stop at a time.
+      const updates = [];
+      Object.entries(result.perDay).forEach(([day, { stops: orderedStops }]) => {
+        orderedStops.forEach((pt, idx) => {
+          const original = stops.find((s) => s.id === pt.id);
+          const newDay = Number(day);
+          if (original.day_number !== newDay || original.sequence_order !== idx) {
+            updates.push({ id: pt.id, day_number: newDay, sequence_order: idx });
+          }
+        });
+      });
+
+      for (const u of updates) {
+        const { error } = await supabase
+          .from("trip_stops")
+          .update({ day_number: u.day_number, sequence_order: u.sequence_order })
+          .eq("id", u.id);
+        if (error) throw error;
+      }
+
+      setRebalanceSummary({
+        before: result.totalBefore,
+        after: result.totalAfter,
+        changed: result.changed,
+        movedCount: updates.filter((u) => stops.find((s) => s.id === u.id)?.day_number !== u.day_number).length,
+      });
+      await load();
+    } catch (err) {
+      setRebalanceError(err.message || "Could not rebalance this trip.");
+    } finally {
+      setRebalancing(false);
+    }
+  }
+
   async function updateTripStatus(newStatus) {
     setStatusError("");
     setSavingStatus(true);
@@ -604,7 +684,33 @@ export default function TripDetailPage() {
           </div>
 
           <div className="card">
-            <h3>Schools on this Trip</h3>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6, gap: 8, flexWrap: "wrap" }}>
+              <h3 style={{ marginBottom: 0 }}>Schools on this Trip</h3>
+              <button
+                className="btn btn-sm"
+                onClick={rebalanceAllDays}
+                disabled={rebalancing || dayNumbers.length < 2}
+                title={
+                  dayNumbers.length < 2
+                    ? "Add stops across at least 2 days to rebalance"
+                    : "Move flexible stops between days to shorten the trip overall (fixed appointments stay put)"
+                }
+              >
+                {rebalancing ? "Rebalancing…" : "Rebalance Trip"}
+              </button>
+            </div>
+            {rebalanceError && <div className="notice danger" style={{ marginBottom: 10, fontSize: 12.5 }}>{rebalanceError}</div>}
+            {rebalanceSummary && (
+              <div className="notice info" style={{ marginBottom: 10, fontSize: 12.5 }}>
+                {rebalanceSummary.changed
+                  ? `Rebalanced ${rebalanceSummary.movedCount} stop${rebalanceSummary.movedCount === 1 ? "" : "s"} across days: ${rebalanceSummary.after.toFixed(
+                      1
+                    )} mi total (was ${rebalanceSummary.before.toFixed(1)} mi, ${Math.round(
+                      (1 - rebalanceSummary.after / rebalanceSummary.before) * 100
+                    )}% shorter). Fixed appointments were left in place.`
+                  : "Already the best day split — no changes made."}
+              </div>
+            )}
             {moveError && <div className="notice danger" style={{ marginBottom: 10 }}>{moveError}</div>}
             {stops.length ? (
               dayNumbers.map((day) => {
