@@ -58,6 +58,11 @@ export default function TripDetailPage() {
   const [nearbyError, setNearbyError] = useState("");
   const [addingNearbyId, setAddingNearbyId] = useState(null);
 
+  // trip status + per-stop visit tracking
+  const [savingStatus, setSavingStatus] = useState(false);
+  const [statusError, setStatusError] = useState("");
+  const [savingVisitId, setSavingVisitId] = useState(null);
+
   const load = useCallback(async () => {
     const { data: t } = await supabase.from("trips").select("*").eq("id", id).maybeSingle();
     setTrip(t || null);
@@ -413,6 +418,30 @@ export default function TripDetailPage() {
     }
   }
 
+  async function updateTripStatus(newStatus) {
+    setStatusError("");
+    setSavingStatus(true);
+    try {
+      const { error } = await supabase.from("trips").update({ status: newStatus }).eq("id", id);
+      if (error) throw error;
+      await load();
+    } catch (err) {
+      setStatusError(err.message || "Could not update trip status.");
+    } finally {
+      setSavingStatus(false);
+    }
+  }
+
+  async function updateVisitStatus(stopId, newStatus) {
+    setSavingVisitId(stopId);
+    try {
+      await supabase.from("trip_stops").update({ visit_status: newStatus }).eq("id", stopId);
+      await load();
+    } finally {
+      setSavingVisitId(null);
+    }
+  }
+
   async function deleteTrip() {
     if (!confirm(`Delete "${trip.name}"? This cannot be undone.`)) return;
     setDeleteError("");
@@ -450,7 +479,19 @@ export default function TripDetailPage() {
             {stops.length} school{stops.length === 1 ? "" : "s"}
           </p>
         </div>
-        <span className="badge badge-contacted">{STATUS_LABEL[trip.status] || trip.status}</span>
+        <div style={{ textAlign: "right" }}>
+          <select
+            value={trip.status}
+            onChange={(e) => updateTripStatus(e.target.value)}
+            disabled={savingStatus}
+            style={{ border: "1px solid #dde1e7", borderRadius: 20, padding: "5px 10px", fontSize: 12.5, fontWeight: 700, color: "#1c5fb3", background: "#e7effc" }}
+          >
+            {Object.entries(STATUS_LABEL).map(([value, label]) => (
+              <option key={value} value={value}>{label}</option>
+            ))}
+          </select>
+          {statusError && <div className="notice danger" style={{ marginTop: 6, fontSize: 12 }}>{statusError}</div>}
+        </div>
       </div>
 
       <div className="grid grid-2">
@@ -654,7 +695,24 @@ export default function TripDetailPage() {
                               )}
                             </div>
                           </div>
-                          <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                          <div style={{ display: "flex", gap: 6, flexShrink: 0, alignItems: "center" }}>
+                            <select
+                              value={stop.visit_status}
+                              onChange={(e) => updateVisitStatus(stop.id, e.target.value)}
+                              disabled={savingVisitId === stop.id}
+                              className={
+                                stop.visit_status === "visited"
+                                  ? "badge badge-public"
+                                  : stop.visit_status === "skipped"
+                                  ? "badge badge-private"
+                                  : "badge badge-not-contacted"
+                              }
+                              style={{ border: "none", padding: "4px 6px" }}
+                            >
+                              <option value="planned">Planned</option>
+                              <option value="visited">Visited</option>
+                              <option value="skipped">Skipped</option>
+                            </select>
                             <button className="btn btn-sm" onClick={() => openFixedEditor(stop)}>
                               {stop.is_fixed_appointment ? "Edit Time" : "Set Fixed Time"}
                             </button>
