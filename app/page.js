@@ -1,0 +1,1 @@
+"use client";import{useEffect as t}from"react";import{useRouter as r}from"next/navigation";import{useAuth as n}from"@/lib/auth-context";export default function i(){const o=r(),{session:e}=n();return t(()=>{e!==void 0&&o.replace(e?"/dashboard":"/login")},[e,o]),<div style={{padding:40,textAlign:"center",color:"#697386"}}>Loading CSD CoachConnect…</div>}

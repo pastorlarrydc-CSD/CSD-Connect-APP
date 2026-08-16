@@ -1,0 +1,19 @@
+{
+  "name": "csd-coachconnect",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "2.45.4",
+    "leaflet": "1.9.4",
+    "leaflet.markercluster": "^1.5.3",
+    "next": "14.2.35",
+    "papaparse": "5.4.1",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  }
+}
