@@ -1,46 +1,279 @@
-"use client";import{useEffect as _,useState as i,useCallback as y}from"react";import{useParams as T,useRouter as k}from"next/navigation";import D from"next/link";import{getSupabaseBrowserClient as S}from"@/lib/supabase/client";import"@/lib/auth-context";const w={planning:"Planning",active:"Active",completed:"Completed"};export default function B(){const{id:s}=T(),p=k(),n=S(),[a,u]=i(null),[o,g]=i([]),[f,h]=i(!0),[d,r]=i(!1),[l,c]=i(""),m=y(async()=>{const{data:e}=await n.from("trips").select("*").eq("id",s).maybeSingle();if(u(e||null),e){const{data:t}=await n.from("trip_stops").select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,addr1)").eq("trip_id",s).order("day_number",{ascending:!0}).order("sequence_order",{ascending:!0});g(t||[])}h(!1)},[n,s]);_(()=>{m()},[m]);async function N(){if(!confirm(`Delete "${a.name}"? This cannot be undone.`))return;c(""),r(!0);const{error:e}=await n.from("trips").delete().eq("id",s);if(r(!1),e){c(e.message);return}p.push("/trips")}if(f)return<div className="view"><div className="empty-state">Loading trip…</div></div>;if(!a)return<div className="view"><div className="notice danger">Trip not found.</div></div>;const v=o.reduce((e,t)=>((e[t.day_number]=e[t.day_number]||[]).push(t),e),{}),b=Object.keys(v).map(Number).sort((e,t)=>e-t);return<div className="view">
-      <D href="/trips"className="btn btn-sm"style={{marginBottom:12,display:"inline-flex"}}>← Back to Trips</D>
+"use client";
+import { useEffect, useState, useCallback, useRef } from "react";
+import { useParams, useRouter } from "next/navigation";
+import Link from "next/link";
+import { getSupabaseBrowserClient } from "@/lib/supabase/client";
+import "@/lib/auth-context";
+
+const STATUS_LABEL = { planning: "Planning", active: "Active", completed: "Completed" };
+
+export default function TripDetailPage() {
+  const { id } = useParams();
+  const router = useRouter();
+  const supabase = getSupabaseBrowserClient();
+
+  const [trip, setTrip] = useState(null);
+  const [stops, setStops] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
+
+  // school search / add-stop state
+  const [query, setQuery] = useState("");
+  const [results, setResults] = useState([]);
+  const [selectedSchool, setSelectedSchool] = useState(null);
+  const [addDay, setAddDay] = useState(1);
+  const [adding, setAdding] = useState(false);
+  const [addError, setAddError] = useState("");
+  const searchTimer = useRef(null);
+  const [removingId, setRemovingId] = useState(null);
+
+  const load = useCallback(async () => {
+    const { data: t } = await supabase.from("trips").select("*").eq("id", id).maybeSingle();
+    setTrip(t || null);
+    if (t) {
+      const { data: s } = await supabase
+        .from("trip_stops")
+        .select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,addr1)")
+        .eq("trip_id", id)
+        .order("day_number", { ascending: true })
+        .order("sequence_order", { ascending: true });
+      setStops(s || []);
+      // default the "add" day to the last day used, or 1 if none yet
+      if (s && s.length) {
+        setAddDay(Math.max(...s.map((row) => row.day_number || 1)));
+      }
+    }
+    setLoading(false);
+  }, [supabase, id]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  function searchSchools(value) {
+    setQuery(value);
+    setSelectedSchool(null);
+    if (searchTimer.current) clearTimeout(searchTimer.current);
+    if (value.trim().length < 2) {
+      setResults([]);
+      return;
+    }
+    searchTimer.current = setTimeout(async () => {
+      const { data } = await supabase
+        .from("schools")
+        .select("id,name,city,state")
+        .or(`name.ilike.%${value.trim()}%,city.ilike.%${value.trim()}%`)
+        .order("name", { ascending: true })
+        .limit(8);
+      setResults(data || []);
+    }, 250);
+  }
+
+  function pickSchool(school) {
+    setSelectedSchool(school);
+    setQuery(`${school.name} — ${school.city}, ${school.state}`);
+    setResults([]);
+  }
+
+  async function addStop(e) {
+    e.preventDefault();
+    setAddError("");
+    if (!selectedSchool) {
+      setAddError("Search for a school and select it from the list first.");
+      return;
+    }
+    // avoid adding the same school to the trip twice
+    if (stops.some((s) => s.school_id === selectedSchool.id)) {
+      setAddError("That school is already on this trip.");
+      return;
+    }
+    setAdding(true);
+    try {
+      const day = Math.max(1, parseInt(addDay, 10) || 1);
+      const stopsOnDay = stops.filter((s) => s.day_number === day);
+      const nextSeq = stopsOnDay.length ? Math.max(...stopsOnDay.map((s) => s.sequence_order || 0)) + 1 : 0;
+      const { error } = await supabase.from("trip_stops").insert({
+        trip_id: id,
+        college_id: trip.college_id,
+        school_id: selectedSchool.id,
+        day_number: day,
+        sequence_order: nextSeq,
+      });
+      if (error) throw error;
+      setQuery("");
+      setSelectedSchool(null);
+      load();
+    } catch (err) {
+      setAddError(err.message || "Could not add this school to the trip.");
+    } finally {
+      setAdding(false);
+    }
+  }
+
+  async function removeStop(stopId) {
+    if (!confirm("Remove this school from the trip?")) return;
+    setRemovingId(stopId);
+    const { error } = await supabase.from("trip_stops").delete().eq("id", stopId);
+    setRemovingId(null);
+    if (!error) load();
+  }
+
+  async function deleteTrip() {
+    if (!confirm(`Delete "${trip.name}"? This cannot be undone.`)) return;
+    setDeleteError("");
+    setDeleting(true);
+    const { error } = await supabase.from("trips").delete().eq("id", id);
+    setDeleting(false);
+    if (error) {
+      setDeleteError(error.message);
+      return;
+    }
+    router.push("/trips");
+  }
+
+  if (loading) return <div className="view"><div className="empty-state">Loading trip…</div></div>;
+  if (!trip) return <div className="view"><div className="notice danger">Trip not found.</div></div>;
+
+  const byDay = stops.reduce((acc, s) => {
+    (acc[s.day_number] = acc[s.day_number] || []).push(s);
+    return acc;
+  }, {});
+  const dayNumbers = Object.keys(byDay).map(Number).sort((a, b) => a - b);
+  const maxDay = stops.length ? Math.max(...stops.map((s) => s.day_number || 1)) : 1;
+
+  return (
+    <div className="view">
+      <Link href="/trips" className="btn btn-sm" style={{ marginBottom: 12, display: "inline-flex" }}>
+        ← Back to Trips
+      </Link>
       <div className="view-header">
         <div>
-          <h1>{a.name}</h1>
+          <h1>{trip.name}</h1>
           <p>
-            {a.start_date||"No dates set"}{a.end_date&&a.end_date!==a.start_date?` – ${a.end_date}`:""}
-            {" · "}{o.length} school{o.length===1?"":"s"}
+            {trip.start_date || "No dates set"}
+            {trip.end_date && trip.end_date !== trip.start_date ? ` – ${trip.end_date}` : ""}
+            {" · "}
+            {stops.length} school{stops.length === 1 ? "" : "s"}
           </p>
         </div>
-        <span className="badge badge-contacted">{w[a.status]||a.status}</span>
+        <span className="badge badge-contacted">{STATUS_LABEL[trip.status] || trip.status}</span>
       </div>
 
       <div className="grid grid-2">
         <div>
-          <div className="card"style={{marginBottom:14}}>
+          <div className="card" style={{ marginBottom: 14 }}>
             <h3>Trip Details</h3>
             <div className="kv">
-              <div className="k">Starting from</div><div className="v">{a.start_location||"—"}</div>
-              <div className="k">Ending at</div><div className="v">{a.end_location||"—"}</div>
+              <div className="k">Starting from</div>
+              <div className="v">{trip.start_location || "—"}</div>
+              <div className="k">Ending at</div>
+              <div className="v">{trip.end_location || "—"}</div>
             </div>
+          </div>
+
+          <div className="card" style={{ marginBottom: 14 }}>
+            <h3>Add a School</h3>
+            {addError && <div className="notice danger" style={{ marginBottom: 10 }}>{addError}</div>}
+            <form onSubmit={addStop}>
+              <div className="grid grid-2" style={{ marginBottom: 8 }}>
+                <div className="form-field" style={{ position: "relative" }}>
+                  <label>School</label>
+                  <input
+                    value={query}
+                    onChange={(e) => searchSchools(e.target.value)}
+                    placeholder="Start typing a school name or city…"
+                    autoComplete="off"
+                  />
+                  {results.length > 0 && (
+                    <div
+                      style={{
+                        position: "absolute",
+                        top: "100%",
+                        left: 0,
+                        right: 0,
+                        zIndex: 10,
+                        background: "#fff",
+                        border: "1px solid #dde1e7",
+                        borderRadius: 8,
+                        boxShadow: "0 4px 14px rgba(11,31,58,.12)",
+                        maxHeight: 200,
+                        overflow: "auto",
+                      }}
+                    >
+                      {results.map((s) => (
+                        <div
+                          key={s.id}
+                          onClick={() => pickSchool(s)}
+                          style={{ padding: "7px 10px", fontSize: 13, cursor: "pointer", borderBottom: "1px solid #f2f3f5" }}
+                        >
+                          <strong>{s.name}</strong> <span style={{ color: "#697386" }}>— {s.city}, {s.state}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <div className="form-field">
+                  <label>Day</label>
+                  <input
+                    type="number"
+                    min={1}
+                    value={addDay}
+                    onChange={(e) => setAddDay(e.target.value)}
+                  />
+                </div>
+              </div>
+              <button className="btn btn-gold btn-sm" disabled={adding}>
+                {adding ? "Adding…" : "Add to Trip"}
+              </button>
+            </form>
           </div>
 
           <div className="card">
             <h3>Schools on this Trip</h3>
-            {o.length?b.map(e=><div key={e}style={{marginBottom:14}}>
-                  <div style={{fontSize:12,fontWeight:700,color:"#697386",textTransform:"uppercase",marginBottom:6}}>Day {e}</div>
-                  {v[e].map(t=><div className="log-item"key={t.id}>
-                      <strong>{t.schools?.name}</strong> — {t.schools?.city}, {t.schools?.state}
-                      {t.is_fixed_appointment&&<span className="badge badge-unverified"style={{marginLeft:8}}>Fixed{t.appointment_time?`: ${t.appointment_time}`:""}</span>}
-                    </div>)}
-                </div>):<div className="empty-state">No schools added yet. School selection and route optimization are coming in the next build session.</div>}
+            {stops.length ? (
+              dayNumbers.map((day) => (
+                <div key={day} style={{ marginBottom: 14 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: "#697386", textTransform: "uppercase", marginBottom: 6 }}>
+                    Day {day}
+                  </div>
+                  {byDay[day].map((stop) => (
+                    <div className="log-item" key={stop.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                      <div>
+                        <strong>{stop.schools?.name}</strong> — {stop.schools?.city}, {stop.schools?.state}
+                        {stop.is_fixed_appointment && (
+                          <span className="badge badge-unverified" style={{ marginLeft: 8 }}>
+                            Fixed{stop.appointment_time ? `: ${stop.appointment_time}` : ""}
+                          </span>
+                        )}
+                      </div>
+                      <button
+                        className="btn btn-sm btn-danger"
+                        onClick={() => removeStop(stop.id)}
+                        disabled={removingId === stop.id}
+                      >
+                        {removingId === stop.id ? "…" : "Remove"}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              ))
+            ) : (
+              <div className="empty-state">No schools added yet. Search above to add the first stop.</div>
+            )}
           </div>
         </div>
 
         <div>
           <div className="card">
             <h3>Danger Zone</h3>
-            {l&&<div className="notice danger"style={{marginBottom:10}}>{l}</div>}
-            <button className="btn btn-sm btn-danger"onClick={N}disabled={d}>
-              {d?"Deleting…":"Delete Trip"}
+            {deleteError && <div className="notice danger" style={{ marginBottom: 10 }}>{deleteError}</div>}
+            <button className="btn btn-sm btn-danger" onClick={deleteTrip} disabled={deleting}>
+              {deleting ? "Deleting…" : "Delete Trip"}
             </button>
           </div>
         </div>
       </div>
-    </div>}
+    </div>
+  );
+}
