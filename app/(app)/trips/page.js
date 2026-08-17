@@ -1,7 +1,7 @@
-"use client";import{useEffect as _,useState as r,useCallback as b}from"react";import N from"next/link";import{getSupabaseBrowserClient as k}from"@/lib/supabase/client";import{useAuth as w}from"@/lib/auth-context";const T={planning:"Planning",active:"Active",completed:"Completed"};export default function L(){const i=k(),{college:s}=w(),[t,y]=r([]),[h,a]=r(!0),d=b(async()=>{if(!s?.id){a(!1);return}const{data:e}=await i.from("trips").select("*, trip_stops(id)").eq("college_id",s.id).order("start_date",{ascending:!0,nullsFirst:!1}).order("created_at",{ascending:!1});y(e||[]),a(!1)},[i,s]);return _(()=>{d()},[d]),<div className="view">
+"use client";import{useEffect as _,useState as r,useCallback as b}from"react";import N from"next/link";import{getSupabaseBrowserClient as k}from"@/lib/supabase/client";import{useAuth as w}from"@/lib/auth-context";const T={planning:"Planning",active:"Active",completed:"Completed"};export default function L(){const i=k(),{college:s}=w(),[t,y]=r([]),[h,a]=r(!0),d=b(async()=>{if(!s?.id){a(!1);return}const{data:e}=await i.from("trips").select("*, trip_stops(id)").eq("college_id",s.id).neq("status","completed").order("start_date",{ascending:!0,nullsFirst:!1}).order("created_at",{ascending:!1});y(e||[]),a(!1)},[i,s]);return _(()=>{d()},[d]),<div className="view">
       <div className="view-header">
         <div><h1>Recruiting Trips</h1><p>Plan, optimize, and run multi-day recruiting trips built from your school database</p></div>
-        <N href="/trips/new"className="btn btn-gold">+ New Trip</N>
+        <N href="/trips/history"className="btn btn-sm"style={{marginRight:8}}>Trip History</N><N href="/trips/new"className="btn btn-gold">+ New Trip</N>
       </div>
 
       {h?<div className="empty-state">Loading trips…</div>:t.length?<div className="grid grid-2">
