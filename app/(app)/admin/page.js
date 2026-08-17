@@ -4,7 +4,7 @@
       {p&&<div className="card"style={{marginBottom:14}}>
           <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:8}}>
             <h3 style={{margin:0}}>Pending Coach-Info Corrections ({g.length})</h3>
-            <P href="/admin/bulk-update"className="btn btn-sm btn-primary">Bulk Update Coaches (CSV)</P>
+            <P href="/admin/data-quality"className="btn btn-sm btn-primary"style={{marginRight:8}}>Data Quality Review</P><P href="/admin/bulk-update"className="btn btn-sm btn-primary">Bulk Update Coaches (CSV)</P>
           </div>
           {w&&<div className="notice danger"style={{marginBottom:10}}>{w}</div>}
           {x?<div className="empty-state">Loading…</div>:g.length?g.map(e=><div key={e.id}className="log-item"style={{paddingBottom:12}}>
