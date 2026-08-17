@@ -546,9 +546,14 @@ export default function TripDetailPage() {
 
   return (
     <div className="view">
-      <Link href="/trips" className="btn btn-sm" style={{ marginBottom: 12, display: "inline-flex" }}>
-        ← Back to Trips
-      </Link>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12, flexWrap: "wrap", gap: 8 }}>
+        <Link href="/trips" className="btn btn-sm" style={{ display: "inline-flex" }}>
+          ← Back to Trips
+        </Link>
+        <Link href={`/trips/${id}/itinerary`} target="_blank" rel="noopener noreferrer" className="btn btn-sm btn-primary" style={{ display: "inline-flex" }}>
+          🖨️ Print Itinerary
+        </Link>
+      </div>
       <div className="view-header">
         <div>
           <h1>{trip.name}</h1>
