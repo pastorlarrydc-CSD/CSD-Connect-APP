@@ -1,4 +1,4 @@
-"use client";import{useEffect as w,useState as S}from"react";import{getSupabaseBrowserClient as b}from"@/lib/supabase/client";import{useAuth as y}from"@/lib/auth-context";export default function x(){const e=b(),{college:s}=y(),[t,r]=S(null);if(w(()=>{async function a(){const{data:o}=await e.from("schools").select("state"),c={};(o||[]).forEach(i=>{c[i.state]=(c[i.state]||0)+1});const m=Object.entries(c).sort((i,l)=>l[1]-i[1]).slice(0,10),[{count:u},{count:g},{count:f},{count:p}]=await Promise.all([e.from("schools").select("*",{count:"exact",head:!0}),e.from("schools").select("*",{count:"exact",head:!0}).not("hc_email","is",null).neq("hc_email",""),e.from("schools").select("*",{count:"exact",head:!0}).not("hc_cell","is",null).neq("hc_cell",""),e.from("schools").select("*",{count:"exact",head:!0}).eq("school_type","Public")]);let d=0,v=0,n=0;if(s?.id){const[{count:i},{count:l},{count:N}]=await Promise.all([e.from("coach_assignments").select("*",{count:"exact",head:!0}).eq("college_id",s.id),e.from("contact_logs").select("*",{count:"exact",head:!0}).eq("college_id",s.id),e.from("watchlist_items").select("*",{count:"exact",head:!0}).eq("college_id",s.id)]);d=i||0,v=l||0,n=N||0}r({topStates:m,total:u,withEmail:g,withCell:f,publicCount:p,assigned:d,contacted:v,watch:n})}a()},[e,s]),!t)return<div className="view"><div className="empty-state">Loading reports…</div></div>;const h=Math.max(...t.topStates.map(a=>a[1]),1);return<div className="view">
+"use client";import{useEffect as w,useState as S}from"react";import{getSupabaseBrowserClient as b}from"@/lib/supabase/client";import{useAuth as y}from"@/lib/auth-context";import{mileageRateForDate as MR}from"@/lib/mileageRates";export default function x(){const e=b(),{college:s}=y(),[t,r]=S(null);if(w(()=>{async function a(){const{data:o}=await e.from("schools").select("state"),c={};(o||[]).forEach(i=>{c[i.state]=(c[i.state]||0)+1});const m=Object.entries(c).sort((i,l)=>l[1]-i[1]).slice(0,10),[{count:u},{count:g},{count:f},{count:p}]=await Promise.all([e.from("schools").select("*",{count:"exact",head:!0}),e.from("schools").select("*",{count:"exact",head:!0}).not("hc_email","is",null).neq("hc_email",""),e.from("schools").select("*",{count:"exact",head:!0}).not("hc_cell","is",null).neq("hc_cell",""),e.from("schools").select("*",{count:"exact",head:!0}).eq("school_type","Public")]);let d=0,v=0,n=0;if(s?.id){const[{count:i},{count:l},{count:N}]=await Promise.all([e.from("coach_assignments").select("*",{count:"exact",head:!0}).eq("college_id",s.id),e.from("contact_logs").select("*",{count:"exact",head:!0}).eq("college_id",s.id),e.from("watchlist_items").select("*",{count:"exact",head:!0}).eq("college_id",s.id)]);d=i||0,v=l||0,n=N||0}let mi=0,rb=0,tc=0;if(s?.id){const{data:tr}=await e.from("trips").select("actual_miles,start_date").eq("college_id",s.id).not("actual_miles","is",null);(tr||[]).forEach(j=>{const am=Number(j.actual_miles)||0;mi+=am;rb+=am*MR(j.start_date);tc+=1});}r({topStates:m,total:u,withEmail:g,withCell:f,publicCount:p,assigned:d,contacted:v,watch:n,totalMiles:mi,totalReimbursement:rb,tripsWithMiles:tc})}a()},[e,s]),!t)return<div className="view"><div className="empty-state">Loading reports…</div></div>;const h=Math.max(...t.topStates.map(a=>a[1]),1);return<div className="view">
       <div className="view-header"><div><h1>Reports</h1><p>Live coverage and activity, computed from the production database</p></div></div>
       <div className="grid grid-2"style={{marginBottom:14}}>
         <div className="card">
@@ -27,6 +27,21 @@
           <div className="k">Assigned</div><div className="v">{t.assigned}</div>
           <div className="k">Contacted</div><div className="v">{t.contacted}</div>
           <div className="k">Watchlist</div><div className="v">{t.watch}</div>
+        </div>
+      </div>
+      <div className="card" style={{marginTop:14}}>
+        <h3>Recruiting Trip Mileage</h3>
+        {t.tripsWithMiles ? (
+          <div className="kv">
+            <div className="k">Trips with mileage logged</div><div className="v">{t.tripsWithMiles}</div>
+            <div className="k">Total actual miles</div><div className="v">{t.totalMiles.toLocaleString(undefined,{maximumFractionDigits:0})} mi</div>
+            <div className="k">Est. total reimbursement</div><div className="v">${t.totalReimbursement.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})}</div>
+          </div>
+        ) : (
+          <div className="empty-state">No trips have actual mileage logged yet. Log it from any trip&apos;s detail page after you drive it.</div>
+        )}
+        <div className="notice" style={{marginTop:10,fontSize:11.5}}>
+          Reimbursement estimate uses the IRS standard mileage rate in effect on each trip&apos;s start date — reference only, not tax advice.
         </div>
       </div>
     </div>}

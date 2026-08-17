@@ -3,8 +3,9 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
-import { optimizeRoute, haversineMiles } from "@/lib/routeOptimizer";
+import { optimizeRoute, haversineMiles, pathDistance } from "@/lib/routeOptimizer";
 import { rebalanceTrip } from "@/lib/tripRebalancer";
+import { mileageRateForDate, estimateReimbursement } from "@/lib/mileageRates";
 import "@/lib/auth-context";
 
 const STATUS_LABEL = { planning: "Planning", active: "Active", completed: "Completed" };
@@ -69,9 +70,15 @@ export default function TripDetailPage() {
   const [rebalanceError, setRebalanceError] = useState("");
   const [rebalanceSummary, setRebalanceSummary] = useState(null);
 
+  // actual mileage logging state
+  const [actualMilesInput, setActualMilesInput] = useState("");
+  const [savingMiles, setSavingMiles] = useState(false);
+  const [milesError, setMilesError] = useState("");
+
   const load = useCallback(async () => {
     const { data: t } = await supabase.from("trips").select("*").eq("id", id).maybeSingle();
     setTrip(t || null);
+    setActualMilesInput(t?.actual_miles != null ? String(t.actual_miles) : "");
     if (t) {
       const { data: s } = await supabase
         .from("trip_stops")
@@ -498,6 +505,30 @@ export default function TripDetailPage() {
     }
   }
 
+  // Logs the actual miles driven for this trip (e.g. from an odometer or
+  // Google Maps trip log), separate from the optimizer's planned-route
+  // estimate. Used for mileage-reimbursement recordkeeping.
+  async function saveActualMiles(e) {
+    e.preventDefault();
+    setMilesError("");
+    const trimmed = actualMilesInput.trim();
+    const parsed = trimmed === "" ? null : Number(trimmed);
+    if (trimmed !== "" && (Number.isNaN(parsed) || parsed < 0)) {
+      setMilesError("Enter a positive number of miles, or leave blank to clear it.");
+      return;
+    }
+    setSavingMiles(true);
+    try {
+      const { error } = await supabase.from("trips").update({ actual_miles: parsed }).eq("id", id);
+      if (error) throw error;
+      await load();
+    } catch (err) {
+      setMilesError(err.message || "Could not save actual mileage.");
+    } finally {
+      setSavingMiles(false);
+    }
+  }
+
   async function updateTripStatus(newStatus) {
     setStatusError("");
     setSavingStatus(true);
@@ -543,6 +574,26 @@ export default function TripDetailPage() {
     return acc;
   }, {});
   const dayNumbers = Object.keys(byDay).map(Number).sort((a, b) => a - b);
+
+  // Planned mileage: current day/sequence order as-is, no re-optimizing --
+  // just a straight-line (haversine) estimate for comparison against the
+  // actual miles logged below. Only computed when every stop has map
+  // coordinates and the trip has both a start and end location.
+  let plannedMiles = null;
+  if (trip.start_lat != null && trip.start_lon != null && trip.end_lat != null && trip.end_lon != null) {
+    const allHaveCoords = stops.every((s) => s.schools?.lat != null && s.schools?.lon != null);
+    if (allHaveCoords) {
+      const start = { lat: trip.start_lat, lon: trip.start_lon };
+      const end = { lat: trip.end_lat, lon: trip.end_lon };
+      plannedMiles = dayNumbers.reduce((sum, day) => {
+        const pts = byDay[day].map((s) => ({ lat: s.schools.lat, lon: s.schools.lon }));
+        return sum + pathDistance([start, ...pts, end]);
+      }, 0);
+    }
+  }
+  const actualMilesNum = trip.actual_miles != null ? Number(trip.actual_miles) : null;
+  const reimbursement = estimateReimbursement(actualMilesNum, trip.start_date);
+  const mileageRate = mileageRateForDate(trip.start_date);
 
   return (
     <div className="view">
@@ -911,6 +962,45 @@ export default function TripDetailPage() {
         </div>
 
         <div>
+          <div className="card" style={{ marginBottom: 14 }}>
+            <h3>Trip Mileage</h3>
+            <div className="kv" style={{ marginBottom: 10 }}>
+              <div className="k">Planned (optimized)</div>
+              <div className="v">{plannedMiles != null ? `${plannedMiles.toFixed(0)} mi` : "—"}</div>
+              {actualMilesNum != null && (
+                <>
+                  <div className="k">Actual logged</div>
+                  <div className="v">{actualMilesNum.toFixed(0)} mi</div>
+                  <div className="k">Est. reimbursement</div>
+                  <div className="v">
+                    ${reimbursement.toFixed(2)}
+                    <span style={{ fontWeight: 400, color: "#697386" }}> ({(mileageRate * 100).toFixed(1)}¢/mi IRS rate)</span>
+                  </div>
+                </>
+              )}
+            </div>
+            {milesError && <div className="notice danger" style={{ marginBottom: 10 }}>{milesError}</div>}
+            <form onSubmit={saveActualMiles} style={{ display: "flex", gap: 8, alignItems: "flex-end" }}>
+              <div className="form-field" style={{ marginBottom: 0, flex: 1 }}>
+                <label>Actual miles driven</label>
+                <input
+                  type="number"
+                  min="0"
+                  step="0.1"
+                  value={actualMilesInput}
+                  onChange={(e) => setActualMilesInput(e.target.value)}
+                  placeholder="e.g. from odometer or Google Maps"
+                />
+              </div>
+              <button className="btn btn-sm btn-primary" disabled={savingMiles}>
+                {savingMiles ? "Saving…" : "Save"}
+              </button>
+            </form>
+            <div className="notice" style={{ marginTop: 10, fontSize: 11.5 }}>
+              Reimbursement estimate uses the IRS standard mileage rate for this trip's date — reference only, not tax advice. Confirm your own rate and eligibility with a tax professional.
+            </div>
+          </div>
+
           <div className="card">
             <h3>Danger Zone</h3>
             {deleteError && <div className="notice danger" style={{ marginBottom: 10 }}>{deleteError}</div>}

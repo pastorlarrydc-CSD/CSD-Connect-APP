@@ -13,7 +13,7 @@
               <div className="kv"style={{marginTop:10}}>
                 <div className="k">Dates</div><div className="v">{e.start_date||"—"}{e.end_date&&e.end_date!==e.start_date?` – ${e.end_date}`:""}</div>
                 <div className="k">Stops</div><div className="v">{e.trip_stops?.length||0} school{e.trip_stops?.length===1?"":"s"}</div>
-                <div className="k">Starting from</div><div className="v">{e.start_location||"—"}</div>
+                <div className="k">Starting from</div><div className="v">{e.start_location||"—"}</div>{e.actual_miles!=null?<><div className="k">Actual mileage</div><div className="v">{Number(e.actual_miles).toFixed(0)} mi</div></>:null}
               </div>
             </N>)}
         </div>:<div className="card"><div className="empty-state">No recruiting trips yet. Click &quot;New Trip&quot; to build your first optimized route.</div></div>}
