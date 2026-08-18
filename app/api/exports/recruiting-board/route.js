@@ -3,11 +3,20 @@ import ExcelJS from "exceljs";
 import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
 
 const STATUS_LABEL = { submitted: "Submitted", reviewed: "Reviewed", contacted: "Contacted" };
+const RECRUITING_LABEL = { watching: "Watching", offered: "Offered", committed: "Committed" };
 
 const HEADER_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FF0B1F3A" } };
 const HEADER_FONT = { color: { argb: "FFFFFFFF" }, bold: true };
 const WATCHLIST_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FFE8F3EA" } };
 const NO_CONTACT_FILL = { type: "pattern", pattern: "solid", fgColor: { argb: "FFFDECEC" } };
+// Recruiting-board colors, same idea as the physical board coaches already
+// keep: blue = still watching, gold = offer out, green = committed. Takes
+// priority over the watchlist/no-contact tints above when set.
+const RECRUITING_FILL = {
+  watching: { type: "pattern", pattern: "solid", fgColor: { argb: "FFEAF1FC" } },
+  offered: { type: "pattern", pattern: "solid", fgColor: { argb: "FFFDF6E8" } },
+  committed: { type: "pattern", pattern: "solid", fgColor: { argb: "FFEAF5EE" } },
+};
 
 function styleHeaderRow(row) {
   row.eachCell((cell) => {
@@ -64,9 +73,10 @@ export async function GET(req) {
     let lastContactBySchool = {};
     let territories = [];
     let territoryCoverage = [];
+    let recruitingStatusByProspect = {};
 
     if (collegeId) {
-      const [{ data: watchlist }, { data: contacts }, { data: terrs }] = await Promise.all([
+      const [{ data: watchlist }, { data: contacts }, { data: terrs }, { data: recruitingRows }] = await Promise.all([
         supabase.from("watchlist_items").select("school_id").eq("college_id", collegeId),
         supabase
           .from("contact_logs")
@@ -74,6 +84,7 @@ export async function GET(req) {
           .eq("college_id", collegeId)
           .order("contact_date", { ascending: false }),
         supabase.from("territories").select("id,name,states").eq("college_id", collegeId).order("created_at", { ascending: true }),
+        supabase.from("prospect_recruiting_status").select("prospect_id,status").eq("college_id", collegeId),
       ]);
       watchlistSet = new Set((watchlist || []).map((w) => w.school_id));
       contactLogs = contacts || [];
@@ -81,6 +92,9 @@ export async function GET(req) {
         if (!lastContactBySchool[c.school_id]) lastContactBySchool[c.school_id] = c;
       });
       territories = terrs || [];
+      (recruitingRows || []).forEach((r) => {
+        recruitingStatusByProspect[r.prospect_id] = r.status;
+      });
 
       if (territories.length) {
         const contactedIdsByState = {};
@@ -131,15 +145,17 @@ export async function GET(req) {
       { header: "On Watchlist", key: "watchlisted", width: 12 },
       { header: "Last Contact Date", key: "last_contact_date", width: 14 },
       { header: "Last Contact Type", key: "last_contact_type", width: 14 },
-      { header: "Prospect Status", key: "status", width: 14 },
+      { header: "Submission Status", key: "status", width: 14 },
+      { header: "Recruiting Status", key: "recruiting_status", width: 16 },
       { header: "Submitted", key: "submitted", width: 12 },
     ];
     styleHeaderRow(boardSheet.getRow(1));
-    boardSheet.autoFilter = { from: "A1", to: "X1" };
+    boardSheet.autoFilter = { from: "A1", to: "Y1" };
 
     (prospects || []).forEach((p) => {
       const watchlisted = p.school_id ? watchlistSet.has(p.school_id) : false;
       const lastContact = p.school_id ? lastContactBySchool[p.school_id] : null;
+      const recruitingStatus = recruitingStatusByProspect[p.id] || "";
       const row = boardSheet.addRow({
         athlete: p.athlete_name,
         grad_year: p.grad_year || "",
@@ -164,9 +180,11 @@ export async function GET(req) {
         last_contact_date: lastContact?.contact_date || "",
         last_contact_type: lastContact?.contact_type || "",
         status: STATUS_LABEL[p.status] || p.status || "",
+        recruiting_status: RECRUITING_LABEL[recruitingStatus] || "",
         submitted: p.created_at ? new Date(p.created_at).toISOString().slice(0, 10) : "",
       });
-      if (watchlisted) row.fill = WATCHLIST_FILL;
+      if (recruitingStatus && RECRUITING_FILL[recruitingStatus]) row.fill = RECRUITING_FILL[recruitingStatus];
+      else if (watchlisted) row.fill = WATCHLIST_FILL;
       else if (!lastContact) row.fill = NO_CONTACT_FILL;
     });
 

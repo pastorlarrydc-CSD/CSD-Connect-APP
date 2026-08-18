@@ -7,13 +7,20 @@ import { useAuth } from "@/lib/auth-context";
 const STATUS_LABEL = { submitted: "Submitted", reviewed: "Reviewed", contacted: "Contacted" };
 const LEVELS = ["FBS", "FCS", "D2", "D3", "NAIA", "JUCO", "Prep/Post-Grad"];
 
+// This college's own recruiting-board status per prospect -- separate from
+// the shared intake `status` above. See prospect_recruiting_status table.
+const RECRUITING_STATUSES = ["watching", "offered", "committed"];
+const RECRUITING_LABEL = { watching: "Watching", offered: "Offered", committed: "Committed" };
+const RECRUITING_BADGE_CLASS = { watching: "badge-watching", offered: "badge-offered", committed: "badge-committed" };
+const RECRUITING_ROW_TINT = { watching: "#eaf1fc", offered: "#fdf6e8", committed: "#eaf5ee" };
+
 function fmtPhone(v) {
   if (!v) return "";
   const digits = String(v).replace(/\D/g, "");
   return digits.length === 10 ? `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}` : v;
 }
 
-const EMPTY_FILTERS = { gradYear: "", position: "", state: "", levelOfPlay: "", status: "", watchlistOnly: false, notContactedOnly: false };
+const EMPTY_FILTERS = { gradYear: "", position: "", state: "", levelOfPlay: "", status: "", recruitingStatus: "", watchlistOnly: false, notContactedOnly: false };
 
 export default function RecruitingBoardPage() {
   const supabase = getSupabaseBrowserClient();
@@ -27,6 +34,10 @@ export default function RecruitingBoardPage() {
   const [flaggedSchoolIds, setFlaggedSchoolIds] = useState(new Set());
   const [flaggingId, setFlaggingId] = useState(null);
   const [flagError, setFlagError] = useState("");
+
+  const [recruitingStatusById, setRecruitingStatusById] = useState({});
+  const [recruitingSavingId, setRecruitingSavingId] = useState(null);
+  const [recruitingError, setRecruitingError] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -44,18 +55,26 @@ export default function RecruitingBoardPage() {
       let watchlistSet = new Set();
       let lastContactBySchool = {};
       if (college?.id) {
-        const [{ data: watchlist }, { data: contacts }] = await Promise.all([
+        const [{ data: watchlist }, { data: contacts }, { data: statuses }] = await Promise.all([
           supabase.from("watchlist_items").select("school_id").eq("college_id", college.id),
           supabase
             .from("contact_logs")
             .select("school_id,contact_date,contact_type")
             .eq("college_id", college.id)
             .order("created_at", { ascending: false }),
+          supabase.from("prospect_recruiting_status").select("prospect_id,status").eq("college_id", college.id),
         ]);
         watchlistSet = new Set((watchlist || []).map((w) => w.school_id));
         (contacts || []).forEach((c) => {
           if (!lastContactBySchool[c.school_id]) lastContactBySchool[c.school_id] = c;
         });
+        const statusMap = {};
+        (statuses || []).forEach((s) => {
+          statusMap[s.prospect_id] = s.status;
+        });
+        setRecruitingStatusById(statusMap);
+      } else {
+        setRecruitingStatusById({});
       }
 
       if (user?.id) {
@@ -104,13 +123,37 @@ export default function RecruitingBoardPage() {
       if (filters.position && r.position !== filters.position) return false;
       if (filters.levelOfPlay && r.level_of_play !== filters.levelOfPlay) return false;
       if (filters.status && r.status !== filters.status) return false;
+      if (filters.recruitingStatus) {
+        const current = recruitingStatusById[r.id] || "";
+        if (filters.recruitingStatus === "untracked" ? current : current !== filters.recruitingStatus) return false;
+      }
       const st = r.state || r.schools?.state;
       if (filters.state && st !== filters.state) return false;
       if (filters.watchlistOnly && !r.watchlisted) return false;
       if (filters.notContactedOnly && r.lastContact) return false;
       return true;
     });
-  }, [rows, filters]);
+  }, [rows, filters, recruitingStatusById]);
+
+  async function setRecruitingStatus(prospectId, status) {
+    if (!college?.id) return;
+    setRecruitingError("");
+    setRecruitingSavingId(prospectId);
+    try {
+      const { error } = await supabase
+        .from("prospect_recruiting_status")
+        .upsert(
+          { college_id: college.id, prospect_id: prospectId, status, updated_by: user.id, updated_at: new Date().toISOString() },
+          { onConflict: "college_id,prospect_id" }
+        );
+      if (error) throw error;
+      setRecruitingStatusById((prev) => ({ ...prev, [prospectId]: status }));
+    } catch (err) {
+      setRecruitingError(err.message || "Could not update recruiting status.");
+    } finally {
+      setRecruitingSavingId(null);
+    }
+  }
 
   function updateFilter(key, value) {
     setFilters((prev) => ({ ...prev, [key]: value }));
@@ -182,6 +225,7 @@ export default function RecruitingBoardPage() {
       {exportError && <div className="notice danger" style={{ marginBottom: 14 }}>{exportError}</div>}
       {loadError && <div className="notice danger" style={{ marginBottom: 14 }}>{loadError}</div>}
       {flagError && <div className="notice danger" style={{ marginBottom: 14 }}>{flagError}</div>}
+      {recruitingError && <div className="notice danger" style={{ marginBottom: 14 }}>{recruitingError}</div>}
 
       <div className="card" style={{ marginBottom: 14 }}>
         <div className="grid grid-4" style={{ marginBottom: 10 }}>
@@ -224,7 +268,7 @@ export default function RecruitingBoardPage() {
         </div>
         <div style={{ display: "flex", gap: 16, flexWrap: "wrap", alignItems: "center" }}>
           <div className="form-field" style={{ marginBottom: 0, minWidth: 160 }}>
-            <label>Status</label>
+            <label>Submission Status</label>
             <select value={filters.status} onChange={(e) => updateFilter("status", e.target.value)}>
               <option value="">All</option>
               {Object.entries(STATUS_LABEL).map(([k, v]) => (
@@ -232,6 +276,18 @@ export default function RecruitingBoardPage() {
               ))}
             </select>
           </div>
+          {college?.id && (
+            <div className="form-field" style={{ marginBottom: 0, minWidth: 160 }}>
+              <label>Recruiting Status</label>
+              <select value={filters.recruitingStatus} onChange={(e) => updateFilter("recruitingStatus", e.target.value)}>
+                <option value="">All</option>
+                {RECRUITING_STATUSES.map((s) => (
+                  <option key={s} value={s}>{RECRUITING_LABEL[s]}</option>
+                ))}
+                <option value="untracked">Not tracked yet</option>
+              </select>
+            </div>
+          )}
           <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12.5 }}>
             <input type="checkbox" checked={filters.watchlistOnly} onChange={(e) => updateFilter("watchlistOnly", e.target.checked)} />
             Watchlisted schools only
@@ -240,7 +296,7 @@ export default function RecruitingBoardPage() {
             <input type="checkbox" checked={filters.notContactedOnly} onChange={(e) => updateFilter("notContactedOnly", e.target.checked)} />
             No contact logged yet
           </label>
-          {(filters.gradYear || filters.position || filters.state || filters.levelOfPlay || filters.status || filters.watchlistOnly || filters.notContactedOnly) && (
+          {(filters.gradYear || filters.position || filters.state || filters.levelOfPlay || filters.status || filters.recruitingStatus || filters.watchlistOnly || filters.notContactedOnly) && (
             <button className="btn btn-sm" onClick={() => setFilters(EMPTY_FILTERS)}>Clear filters</button>
           )}
         </div>
@@ -265,14 +321,16 @@ export default function RecruitingBoardPage() {
                   <th>HS Head Coach</th>
                   <th>Territory</th>
                   <th>Last Contact</th>
-                  <th>Status</th>
+                  <th>Submission Status</th>
+                  {college?.id && <th>Recruiting Status</th>}
                 </tr>
               </thead>
               <tbody>
                 {visible.map((r) => {
                   const coachName = [r.schools?.hc_first_name, r.schools?.hc_last_name].filter(Boolean).join(" ");
+                  const recruiting = recruitingStatusById[r.id] || "";
                   return (
-                    <tr key={r.id}>
+                    <tr key={r.id} style={recruiting ? { background: RECRUITING_ROW_TINT[recruiting] } : undefined}>
                       <td>
                         <Link href={`/prospects/${r.id}`}>{r.athlete_name}</Link>
                         {r.athlete_email || r.athlete_cell ? (
@@ -317,6 +375,22 @@ export default function RecruitingBoardPage() {
                         {r.lastContact ? `${r.lastContact.contact_date} — ${r.lastContact.contact_type}` : <span className="badge badge-not-contacted">None logged</span>}
                       </td>
                       <td><span className="badge badge-contacted">{STATUS_LABEL[r.status] || r.status}</span></td>
+                      {college?.id && (
+                        <td>
+                          <select
+                            value={recruiting}
+                            onChange={(e) => e.target.value && setRecruitingStatus(r.id, e.target.value)}
+                            disabled={recruitingSavingId === r.id}
+                            className={recruiting ? `badge ${RECRUITING_BADGE_CLASS[recruiting]}` : ""}
+                            style={{ border: "1px solid #dde1e7", borderRadius: 6, padding: "3px 6px", fontSize: 11.5 }}
+                          >
+                            <option value="">Not tracked</option>
+                            {RECRUITING_STATUSES.map((s) => (
+                              <option key={s} value={s}>{RECRUITING_LABEL[s]}</option>
+                            ))}
+                          </select>
+                        </td>
+                      )}
                     </tr>
                   );
                 })}
