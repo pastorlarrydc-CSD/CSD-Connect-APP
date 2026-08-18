@@ -9,9 +9,12 @@ export default function ResetPasswordPage() {
   const router = useRouter();
 
   // The Supabase client parses the recovery link's token out of the URL on
-  // load and exchanges it for a real (but narrowly-scoped) session -- that's
-  // what PASSWORD_RECOVERY fires for. Until that resolves (or we confirm
-  // there's no session at all), show a loading state rather than either form.
+  // load and exchanges it for a session -- that's what PASSWORD_RECOVERY
+  // fires for. This is deliberately the ONLY thing that unlocks the form:
+  // an already-signed-in visitor who just navigates here (e.g. an unlocked
+  // shared device) must not be able to set a new password without going
+  // through the emailed link -- that's what /account's Change Password
+  // card is for, which re-verifies the current password first.
   const [checking, setChecking] = useState(true);
   const [ready, setReady] = useState(false);
 
@@ -31,15 +34,15 @@ export default function ResetPasswordPage() {
       }
     });
 
-    // If the link already resolved before this listener attached (or this
-    // is a plain page refresh on an already-recovered session), fall back to
-    // checking for an existing session directly.
-    supabase.auth.getSession().then(({ data }) => {
-      if (data?.session) setReady(true);
-      setChecking(false);
-    });
+    // Give the client a few seconds to parse the link and fire the event
+    // above; if it never does (broken/expired/missing link), fall through
+    // to the invalid-link state instead of hanging on "Verifying…" forever.
+    const timeout = setTimeout(() => setChecking(false), 4000);
 
-    return () => subscription.unsubscribe();
+    return () => {
+      subscription.unsubscribe();
+      clearTimeout(timeout);
+    };
   }, [supabase]);
 
   async function handleSubmit(e) {
