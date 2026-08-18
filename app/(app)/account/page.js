@@ -7,6 +7,51 @@ export default function AccountSecurityPage() {
   const supabase = getSupabaseBrowserClient();
   const { user, profile, college } = useAuth();
 
+  // Change-password form -- re-verifies the current password via a fresh
+  // signInWithPassword before calling updateUser, so a session left open on
+  // a shared/unlocked device can't be used to lock the real owner out.
+  const [currentPassword, setCurrentPassword] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [confirmPassword, setConfirmPassword] = useState("");
+  const [pwSubmitting, setPwSubmitting] = useState(false);
+  const [pwError, setPwError] = useState("");
+  const [pwSuccess, setPwSuccess] = useState("");
+
+  async function handleChangePassword(e) {
+    e.preventDefault();
+    setPwError("");
+    setPwSuccess("");
+    if (newPassword.length < 6) {
+      setPwError("New password must be at least 6 characters.");
+      return;
+    }
+    if (newPassword !== confirmPassword) {
+      setPwError("New passwords don't match.");
+      return;
+    }
+    setPwSubmitting(true);
+    try {
+      const { error: reauthError } = await supabase.auth.signInWithPassword({
+        email: user.email,
+        password: currentPassword,
+      });
+      if (reauthError) {
+        setPwError("Current password is incorrect.");
+        return;
+      }
+      const { error: updateError } = await supabase.auth.updateUser({ password: newPassword });
+      if (updateError) throw updateError;
+      setPwSuccess("Password updated.");
+      setCurrentPassword("");
+      setNewPassword("");
+      setConfirmPassword("");
+    } catch (err) {
+      setPwError(err.message || "Could not update your password.");
+    } finally {
+      setPwSubmitting(false);
+    }
+  }
+
   const [factors, setFactors] = useState([]);
   const [loading, setLoading] = useState(true);
   const [listError, setListError] = useState("");
@@ -111,6 +156,29 @@ export default function AccountSecurityPage() {
           <h1>Account Security</h1>
           <p>{profile?.full_name || user?.email} — {college?.name || "no college linked"}</p>
         </div>
+      </div>
+
+      <div className="card" style={{ maxWidth: 640, marginBottom: 16 }}>
+        <h3>Change Password</h3>
+        {pwError && <div className="notice danger" style={{ marginBottom: 10 }}>{pwError}</div>}
+        {pwSuccess && <div className="notice info" style={{ marginBottom: 10 }}>{pwSuccess}</div>}
+        <form onSubmit={handleChangePassword}>
+          <div className="form-field">
+            <label>Current password</label>
+            <input type="password" required value={currentPassword} onChange={(e) => setCurrentPassword(e.target.value)} placeholder="••••••••" />
+          </div>
+          <div className="form-field">
+            <label>New password</label>
+            <input type="password" required minLength={6} value={newPassword} onChange={(e) => setNewPassword(e.target.value)} placeholder="••••••••" />
+          </div>
+          <div className="form-field">
+            <label>Confirm new password</label>
+            <input type="password" required minLength={6} value={confirmPassword} onChange={(e) => setConfirmPassword(e.target.value)} placeholder="••••••••" />
+          </div>
+          <button className="btn btn-primary btn-sm" disabled={pwSubmitting}>
+            {pwSubmitting ? "Updating…" : "Update Password"}
+          </button>
+        </form>
       </div>
 
       <div className="card" style={{ maxWidth: 640 }}>
