@@ -17,13 +17,16 @@ const EMPTY_FILTERS = { gradYear: "", position: "", state: "", levelOfPlay: "", 
 
 export default function RecruitingBoardPage() {
   const supabase = getSupabaseBrowserClient();
-  const { session, college } = useAuth();
+  const { session, user, college } = useAuth();
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const [filters, setFilters] = useState(EMPTY_FILTERS);
   const [exporting, setExporting] = useState(false);
   const [exportError, setExportError] = useState("");
+  const [flaggedSchoolIds, setFlaggedSchoolIds] = useState(new Set());
+  const [flaggingId, setFlaggingId] = useState(null);
+  const [flagError, setFlagError] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -53,6 +56,11 @@ export default function RecruitingBoardPage() {
         (contacts || []).forEach((c) => {
           if (!lastContactBySchool[c.school_id]) lastContactBySchool[c.school_id] = c;
         });
+      }
+
+      if (user?.id) {
+        const { data: flags } = await supabase.from("school_flags").select("school_id").eq("flagged_by", user.id).eq("status", "pending");
+        setFlaggedSchoolIds(new Set((flags || []).map((f) => f.school_id)));
       }
 
       setRows(
@@ -108,6 +116,25 @@ export default function RecruitingBoardPage() {
     setFilters((prev) => ({ ...prev, [key]: value }));
   }
 
+  async function flagSchool(schoolId) {
+    if (!schoolId || flaggedSchoolIds.has(schoolId)) return;
+    setFlagError("");
+    setFlaggingId(schoolId);
+    try {
+      const { error } = await supabase.from("school_flags").insert({
+        school_id: schoolId,
+        flagged_by: user.id,
+        flagged_by_college_id: college?.id || null,
+      });
+      if (error) throw error;
+      setFlaggedSchoolIds((prev) => new Set(prev).add(schoolId));
+    } catch (err) {
+      setFlagError(err.message || "Could not flag this school.");
+    } finally {
+      setFlaggingId(null);
+    }
+  }
+
   async function exportExcel() {
     setExporting(true);
     setExportError("");
@@ -154,6 +181,7 @@ export default function RecruitingBoardPage() {
 
       {exportError && <div className="notice danger" style={{ marginBottom: 14 }}>{exportError}</div>}
       {loadError && <div className="notice danger" style={{ marginBottom: 14 }}>{loadError}</div>}
+      {flagError && <div className="notice danger" style={{ marginBottom: 14 }}>{flagError}</div>}
 
       <div className="card" style={{ marginBottom: 14 }}>
         <div className="grid grid-4" style={{ marginBottom: 10 }}>
@@ -269,6 +297,20 @@ export default function RecruitingBoardPage() {
                         <div style={{ fontSize: 11, color: "#697386" }}>
                           {r.schools?.hc_email || ""}{r.schools?.hc_email && r.schools?.hc_cell ? " · " : ""}{fmtPhone(r.schools?.hc_cell)}
                         </div>
+                        {r.schools?.id && (
+                          flaggedSchoolIds.has(r.schools.id) ? (
+                            <span style={{ fontSize: 10.5, color: "#9a6b00" }}>Flagged outdated</span>
+                          ) : (
+                            <button
+                              className="btn btn-sm"
+                              style={{ marginTop: 4, padding: "2px 7px", fontSize: 10.5 }}
+                              disabled={flaggingId === r.schools.id}
+                              onClick={() => flagSchool(r.schools.id)}
+                            >
+                              {flaggingId === r.schools.id ? "Flagging…" : "Flag outdated"}
+                            </button>
+                          )
+                        )}
                       </td>
                       <td>{r.watchlisted ? <span className="badge badge-contacted">Watchlisted</span> : <span className="empty-state">—</span>}</td>
                       <td style={{ fontSize: 12 }}>

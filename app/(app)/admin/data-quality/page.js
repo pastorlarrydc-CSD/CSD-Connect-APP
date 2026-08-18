@@ -1,5 +1,5 @@
 "use client";
-import { useState, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import Link from "next/link";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
@@ -36,6 +36,14 @@ export default function DataQualityPage() {
   const { user, profile } = useAuth();
   const canReview = profile?.role === "verifier" || profile?.role === "sysadmin";
 
+  // Flagged-as-outdated queue -- loads automatically (unlike the full scan
+  // below, which is opt-in) so stale records surface the moment someone
+  // reports one, rather than waiting for the next manual scan.
+  const [flaggedQueue, setFlaggedQueue] = useState([]);
+  const [loadingFlags, setLoadingFlags] = useState(true);
+  const [flagActionId, setFlagActionId] = useState(null);
+  const [flagActionError, setFlagActionError] = useState("");
+
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState("");
   const [result, setResult] = useState(null); // { flagged, counts, totalFlagged, totalScanned }
@@ -46,6 +54,25 @@ export default function DataQualityPage() {
   const [saving, setSaving] = useState(null);
   const [saveError, setSaveError] = useState("");
   const scannedAt = useRef(null);
+
+  const loadFlags = useCallback(async () => {
+    if (!canReview) {
+      setLoadingFlags(false);
+      return;
+    }
+    setLoadingFlags(true);
+    const { data } = await supabase
+      .from("school_flags")
+      .select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office), colleges:flagged_by_college_id(name)")
+      .eq("status", "pending")
+      .order("created_at", { ascending: true });
+    setFlaggedQueue(data || []);
+    setLoadingFlags(false);
+  }, [supabase, canReview]);
+
+  useEffect(() => {
+    loadFlags();
+  }, [loadFlags]);
 
   const fetchAllSchools = useCallback(async () => {
     const rows = [];
@@ -78,15 +105,15 @@ export default function DataQualityPage() {
     }
   }, [fetchAllSchools]);
 
-  function startEdit(row) {
-    setEditingId(row.school.id);
+  function startEdit(school) {
+    setEditingId(school.id);
     setSaveError("");
     setEditValues({
-      hc_first_name: row.school.hc_first_name || "",
-      hc_last_name: row.school.hc_last_name || "",
-      hc_email: row.school.hc_email || "",
-      hc_cell: row.school.hc_cell || "",
-      hc_office: row.school.hc_office || "",
+      hc_first_name: school.hc_first_name || "",
+      hc_last_name: school.hc_last_name || "",
+      hc_email: school.hc_email || "",
+      hc_cell: school.hc_cell || "",
+      hc_office: school.hc_office || "",
     });
   }
 
@@ -95,16 +122,26 @@ export default function DataQualityPage() {
     setSaveError("");
   }
 
+  async function resolvePendingFlags(schoolId) {
+    await supabase
+      .from("school_flags")
+      .update({ status: "resolved", resolved_by: user.id, resolved_at: new Date().toISOString() })
+      .eq("school_id", schoolId)
+      .eq("status", "pending");
+    setFlaggedQueue((prev) => prev.filter((f) => f.school_id !== schoolId));
+  }
+
   // Saves the quick-fix directly to schools (verifier/sysadmin have direct
   // write access via RLS -- this doesn't go through the coach-suggestion
   // review queue, since the reviewer IS the one making the fix here) and
   // marks the record verified, same bookkeeping as the bulk-update tool:
-  // a school_change_log row per changed field.
-  async function saveEdit(row) {
-    setSaving(row.school.id);
+  // a school_change_log row per changed field. Also clears any pending
+  // "possibly outdated" flags on this school, since a human just fixed it.
+  async function saveEdit(school) {
+    setSaving(school.id);
     setSaveError("");
     try {
-      const before = row.school;
+      const before = school;
       const changes = [];
       const update = { verification_status: "verified", last_verified_at: new Date().toISOString() };
       EDIT_FIELDS.forEach(([field]) => {
@@ -129,6 +166,7 @@ export default function DataQualityPage() {
         const { error: logError } = await supabase.from("school_change_log").insert(changes);
         if (logError) throw logError;
       }
+      await resolvePendingFlags(before.id);
 
       // Reflect the fix locally without a full re-scan: drop the row from
       // the queue if it's no longer actionable, otherwise re-classify it.
@@ -147,6 +185,28 @@ export default function DataQualityPage() {
       setSaveError(err.message || "Could not save this fix.");
     } finally {
       setSaving(null);
+    }
+  }
+
+  async function confirmAccurate(flag) {
+    setFlagActionError("");
+    setFlagActionId(flag.id);
+    try {
+      const { error } = await supabase
+        .from("school_flags")
+        .update({ status: "resolved", resolved_by: user.id, resolved_at: new Date().toISOString() })
+        .eq("id", flag.id);
+      if (error) throw error;
+      const { error: schoolError } = await supabase
+        .from("schools")
+        .update({ verification_status: "verified", last_verified_at: new Date().toISOString() })
+        .eq("id", flag.school_id);
+      if (schoolError) throw schoolError;
+      setFlaggedQueue((prev) => prev.filter((f) => f.id !== flag.id));
+    } catch (err) {
+      setFlagActionError(err.message || "Could not dismiss this flag.");
+    } finally {
+      setFlagActionId(null);
     }
   }
 
@@ -176,6 +236,73 @@ export default function DataQualityPage() {
         <button className="btn btn-gold" onClick={runScan} disabled={scanning}>
           {scanning ? "Scanning…" : result ? "Re-scan Database" : "Scan Database"}
         </button>
+      </div>
+
+      <div className="card" style={{ marginBottom: 14 }}>
+        <h3 style={{ marginBottom: 4 }}>Flagged as Possibly Outdated ({flaggedQueue.length})</h3>
+        <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
+          Reported by coaches browsing the database — surfaces here immediately, no scan needed.
+        </p>
+        {flagActionError && <div className="notice danger" style={{ marginBottom: 10 }}>{flagActionError}</div>}
+        {loadingFlags ? (
+          <div className="empty-state">Loading…</div>
+        ) : flaggedQueue.length === 0 ? (
+          <div className="empty-state">Nothing flagged right now. Coaches can flag a listing from any school profile page.</div>
+        ) : (
+          flaggedQueue.map((flag) => {
+            const s = flag.schools;
+            const isEditing = editingId === s?.id;
+            return (
+              <div className="log-item" key={flag.id} style={{ paddingBottom: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+                  <div>
+                    <strong>{s?.name}</strong> — {s?.city}, {s?.state}
+                    <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
+                      Flagged {new Date(flag.created_at).toLocaleDateString()} by {flag.colleges?.name || "an HS coach account"}
+                      {flag.reason ? ` — "${flag.reason}"` : ""}
+                    </div>
+                    <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
+                      Currently: {[s?.hc_first_name, s?.hc_last_name].filter(Boolean).join(" ") || "no name"}
+                      {s?.hc_email ? ` · ${s.hc_email}` : ""}
+                      {s?.hc_cell ? ` · ${fmtPhone(s.hc_cell)}` : ""}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <Link href={`/schools/${flag.school_id}`} className="btn btn-sm">Open Profile</Link>
+                    {!isEditing && s && (
+                      <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
+                    )}
+                    <button className="btn btn-sm" disabled={flagActionId === flag.id} onClick={() => confirmAccurate(flag)}>
+                      {flagActionId === flag.id ? "Saving…" : "Confirm accurate"}
+                    </button>
+                  </div>
+                </div>
+
+                {isEditing && s && (
+                  <div style={{ background: "#f7f8fa", border: "1px solid #dde1e7", borderRadius: 8, padding: 10, marginTop: 8 }}>
+                    <div className="grid grid-2" style={{ marginBottom: 8 }}>
+                      {EDIT_FIELDS.map(([field, label]) => (
+                        <div className="form-field" key={field} style={{ marginBottom: 0 }}>
+                          <label>{label}</label>
+                          <input value={editValues[field]} onChange={(e) => setEditValues((prev) => ({ ...prev, [field]: e.target.value }))} />
+                        </div>
+                      ))}
+                    </div>
+                    {saveError && <div className="notice danger" style={{ marginBottom: 8 }}>{saveError}</div>}
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
+                        {saving === s.id ? "Saving…" : "Save & Mark Verified"}
+                      </button>
+                      <button type="button" className="btn btn-sm" onClick={cancelEdit} disabled={saving === s.id}>
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })
+        )}
       </div>
 
       {scanError && <div className="notice danger" style={{ marginBottom: 14 }}>{scanError}</div>}
@@ -254,7 +381,7 @@ export default function DataQualityPage() {
                       <div style={{ display: "flex", gap: 6 }}>
                         <Link href={`/schools/${s.id}`} className="btn btn-sm">Open Profile</Link>
                         {!isEditing && (
-                          <button className="btn btn-sm btn-primary" onClick={() => startEdit(row)}>Quick Fix</button>
+                          <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
                         )}
                       </div>
                     </div>
@@ -273,7 +400,7 @@ export default function DataQualityPage() {
                           ))}
                         </div>
                         <div style={{ display: "flex", gap: 8 }}>
-                          <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(row)}>
+                          <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
                             {saving === s.id ? "Saving…" : "Save & Mark Verified"}
                           </button>
                           <button type="button" className="btn btn-sm" onClick={cancelEdit} disabled={saving === s.id}>
