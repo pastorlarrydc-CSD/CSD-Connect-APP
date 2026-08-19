@@ -1,361 +1,634 @@
 "use client";
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useEffect, useState, useCallback } from "react";
+import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 
-const STATUS_LABEL = { submitted: "Submitted", reviewed: "Reviewed", contacted: "Contacted" };
-const LEVELS_OF_PLAY = ["", "FBS", "FCS", "D2", "D3", "NAIA", "JUCO", "Prep/Post-Grad"];
+function fmtPhone(v) {
+  if (!v) return "";
+  const digits = String(v).replace(/\D/g, "");
+  return digits.length === 10 ? `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}` : v;
+}
 
-const EMPTY_FORM = {
-  athlete_name: "",
-  grad_year: "",
-  position: "",
-  jersey_number: "",
-  height: "",
-  weight: "",
-  gpa: "",
-  athlete_email: "",
-  athlete_cell: "",
-  city: "",
-  state: "",
-  hudl_url: "",
-  x_url: "",
-  coach_evaluation: "",
-  guardian_authorized: false,
-  guardian_first_name: "",
-  guardian_last_name: "",
-  guardian_email: "",
-  guardian_cell: "",
-  offers_received: "",
-  committed_to: "",
-  level_of_play: "",
-};
+const INTAKE_STATUSES = ["submitted", "reviewed", "contacted"];
 
-export default function ProspectsPage() {
+// Per-college recruiting interest -- separate from the intake status above.
+// Intake status ("submitted/reviewed/contacted") tracks whether college
+// staff have processed an HS coach's submission; recruiting status tracks
+// where THIS college actually stands with the athlete, same idea as a
+// physical recruiting board. Every college sees/sets its own value on the
+// same shared prospect record (see prospect_recruiting_status table).
+const RECRUITING_STATUSES = ["watching", "offered", "committed"];
+const RECRUITING_LABEL = { watching: "Watching", offered: "Offered", committed: "Committed" };
+const RECRUITING_BADGE_CLASS = { watching: "badge-watching", offered: "badge-offered", committed: "badge-committed" };
+
+export default function ProspectDetailPage() {
+  const { id } = useParams();
+  const router = useRouter();
   const supabase = getSupabaseBrowserClient();
-  const { college, user, profile } = useAuth();
+  const { user, profile, college } = useAuth();
 
-  const [watchlist, setWatchlist] = useState([]);
-  const [prospects, setProspects] = useState([]);
-  const [form, setForm] = useState(EMPTY_FORM);
+  const [prospect, setProspect] = useState(null);
+  const [loading, setLoading] = useState(true);
 
-  const [schoolQuery, setSchoolQuery] = useState("");
-  const [schoolResults, setSchoolResults] = useState([]);
-  const [selectedSchool, setSelectedSchool] = useState(null);
-  const debounceRef = useRef(null);
+  const [statusSaving, setStatusSaving] = useState(false);
+  const [statusError, setStatusError] = useState("");
 
-  const [submitted, setSubmitted] = useState(false);
-  const [submitError, setSubmitError] = useState("");
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState("");
 
-  const canBulkAdd = profile?.role === "verifier" || profile?.role === "sysadmin";
-  const isHsCoach = profile?.role === "hs_coach";
+  const [editingContact, setEditingContact] = useState(false);
+  const [contactForm, setContactForm] = useState({
+    athlete_email: "",
+    athlete_cell: "",
+    guardian_authorized: false,
+    guardian_first_name: "",
+    guardian_last_name: "",
+    guardian_email: "",
+    guardian_cell: "",
+  });
+  const [contactSaving, setContactSaving] = useState(false);
+  const [contactError, setContactError] = useState("");
+
+  const [editingOutcome, setEditingOutcome] = useState(false);
+  const [outcomeForm, setOutcomeForm] = useState({ offers_received: "", committed_to: "" });
+  const [outcomeSaving, setOutcomeSaving] = useState(false);
+  const [outcomeError, setOutcomeError] = useState("");
+
+  const [editingLinks, setEditingLinks] = useState(false);
+  const [linksForm, setLinksForm] = useState({ hudl_url: "", x_url: "" });
+  const [linksSaving, setLinksSaving] = useState(false);
+  const [linksError, setLinksError] = useState("");
+
+  // Recruiting interest (this college's own watching/offered/committed mark).
+  const [recruitingStatus, setRecruitingStatus] = useState(null); // null = not tracked yet
+  const [recruitingLoading, setRecruitingLoading] = useState(true);
+  const [recruitingSaving, setRecruitingSaving] = useState(false);
+  const [recruitingError, setRecruitingError] = useState("");
+
+  const canManageIntake = profile?.role === "verifier" || profile?.role === "sysadmin" || prospect?.submitted_by === user?.id;
+  const canSetRecruitingStatus = !!college?.id;
 
   const load = useCallback(async () => {
-    if (college?.id) {
-      const { data } = await supabase.from("watchlist_items").select("*, schools(id,name,city,state)").eq("college_id", college.id);
-      setWatchlist(data || []);
-    }
-    const { data: prospectRows } = await supabase
+    const { data } = await supabase
       .from("prospects")
-      .select("*, schools(id,name,city,state)")
-      .order("created_at", { ascending: false })
-      .limit(50);
-    setProspects(prospectRows || []);
-  }, [supabase, college]);
+      .select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office)")
+      .eq("id", id)
+      .maybeSingle();
+    setProspect(data || null);
+    setLoading(false);
+  }, [supabase, id]);
 
   useEffect(() => {
     load();
   }, [load]);
 
-  async function removeFromWatchlist(schoolId) {
-    await supabase.from("watchlist_items").delete().eq("college_id", college.id).eq("school_id", schoolId);
-    load();
-  }
+  // On Watchlist / Last Contact -- same data the Recruiting Board shows,
+  // sourced from the linked school so it stays in sync with one source of
+  // truth. Read-only here; managed from the school profile page.
+  const [schoolContext, setSchoolContext] = useState({ watchlisted: false, lastContact: null });
+  const [schoolContextLoading, setSchoolContextLoading] = useState(true);
 
-  function searchSchools(value) {
-    setSchoolQuery(value);
-    setSelectedSchool(null);
-    if (debounceRef.current) clearTimeout(debounceRef.current);
-    if (value.trim().length < 2) {
-      setSchoolResults([]);
+  const loadSchoolContext = useCallback(async () => {
+    if (!college?.id || !prospect?.school_id) {
+      setSchoolContext({ watchlisted: false, lastContact: null });
+      setSchoolContextLoading(false);
       return;
     }
-    debounceRef.current = setTimeout(async () => {
-      const { data } = await supabase
-        .from("schools")
-        .select("id,name,city,state")
-        .ilike("name", `%${value.trim()}%`)
-        .order("name", { ascending: true })
-        .limit(8);
-      setSchoolResults(data || []);
-    }, 250);
-  }
+    setSchoolContextLoading(true);
+    const [{ data: watch }, { data: contacts }] = await Promise.all([
+      supabase.from("watchlist_items").select("id").eq("college_id", college.id).eq("school_id", prospect.school_id).maybeSingle(),
+      supabase
+        .from("contact_logs")
+        .select("contact_date,contact_type")
+        .eq("college_id", college.id)
+        .eq("school_id", prospect.school_id)
+        .order("contact_date", { ascending: false })
+        .limit(1),
+    ]);
+    setSchoolContext({ watchlisted: !!watch, lastContact: contacts?.[0] || null });
+    setSchoolContextLoading(false);
+  }, [supabase, college, prospect]);
 
-  function pickSchool(school) {
-    setSelectedSchool(school);
-    setSchoolQuery(`${school.name} — ${school.city}, ${school.state}`);
-    setSchoolResults([]);
-  }
+  useEffect(() => {
+    loadSchoolContext();
+  }, [loadSchoolContext]);
 
-  async function submitProspect(e) {
-    e.preventDefault();
-    setSubmitError("");
-    if (!form.athlete_name.trim()) return;
+  const loadRecruitingStatus = useCallback(async () => {
+    if (!college?.id) {
+      setRecruitingLoading(false);
+      return;
+    }
+    setRecruitingLoading(true);
+    const { data } = await supabase
+      .from("prospect_recruiting_status")
+      .select("status")
+      .eq("college_id", college.id)
+      .eq("prospect_id", id)
+      .maybeSingle();
+    setRecruitingStatus(data?.status || null);
+    setRecruitingLoading(false);
+  }, [supabase, college, id]);
 
-    const { error } = await supabase.from("prospects").insert({
-      submitted_by: user.id,
-      athlete_name: form.athlete_name,
-      grad_year: form.grad_year ? parseInt(form.grad_year, 10) : null,
-      position: form.position || null,
-      jersey_number: form.jersey_number || null,
-      height: form.height || null,
-      weight: form.weight || null,
-      gpa: form.gpa ? parseFloat(form.gpa) : null,
-      athlete_email: form.athlete_email || null,
-      athlete_cell: form.athlete_cell || null,
-      city: form.city || null,
-      state: form.state || null,
-      school_id: selectedSchool?.id || null,
-      level_of_play: form.level_of_play || null,
-      hudl_url: form.hudl_url || null,
-      x_url: form.x_url || null,
-      coach_evaluation: form.coach_evaluation || null,
-      guardian_authorized: form.guardian_authorized,
-      guardian_first_name: form.guardian_first_name || null,
-      guardian_last_name: form.guardian_last_name || null,
-      guardian_email: form.guardian_email || null,
-      guardian_cell: form.guardian_cell || null,
-      offers_received: form.offers_received || null,
-      committed_to: form.committed_to || null,
-    });
+  useEffect(() => {
+    loadRecruitingStatus();
+  }, [loadRecruitingStatus]);
 
+  async function setIntakeStatus(next) {
+    setStatusError("");
+    setStatusSaving(true);
+    const { error } = await supabase.from("prospects").update({ status: next }).eq("id", id);
+    setStatusSaving(false);
     if (error) {
-      setSubmitError(error.message);
+      setStatusError(error.message);
       return;
     }
-
-    setForm(EMPTY_FORM);
-    setSchoolQuery("");
-    setSelectedSchool(null);
-    setSubmitted(true);
     load();
   }
 
-  async function deleteProspect(id) {
-    if (!confirm("Delete this prospect? This cannot be undone.")) return;
-    await supabase.from("prospects").delete().eq("id", id);
+  async function setRecruiting(next) {
+    if (!college?.id) return;
+    setRecruitingError("");
+    setRecruitingSaving(true);
+    const { error } = await supabase
+      .from("prospect_recruiting_status")
+      .upsert(
+        { college_id: college.id, prospect_id: Number(id), status: next, updated_by: user.id, updated_at: new Date().toISOString() },
+        { onConflict: "college_id,prospect_id" }
+      );
+    setRecruitingSaving(false);
+    if (error) {
+      setRecruitingError(error.message || "Could not update recruiting status.");
+      return;
+    }
+    setRecruitingStatus(next);
+  }
+
+  function startEditContact() {
+    setContactForm({
+      athlete_email: prospect.athlete_email || "",
+      athlete_cell: prospect.athlete_cell || "",
+      guardian_authorized: !!prospect.guardian_authorized,
+      guardian_first_name: prospect.guardian_first_name || "",
+      guardian_last_name: prospect.guardian_last_name || "",
+      guardian_email: prospect.guardian_email || "",
+      guardian_cell: prospect.guardian_cell || "",
+    });
+    setContactError("");
+    setEditingContact(true);
+  }
+
+  async function saveContact(e) {
+    e.preventDefault();
+    setContactError("");
+    setContactSaving(true);
+    const { error } = await supabase
+      .from("prospects")
+      .update({
+        athlete_email: contactForm.athlete_email.trim() || null,
+        athlete_cell: contactForm.athlete_cell.trim() || null,
+        guardian_authorized: contactForm.guardian_authorized,
+        guardian_first_name: contactForm.guardian_first_name.trim() || null,
+        guardian_last_name: contactForm.guardian_last_name.trim() || null,
+        guardian_email: contactForm.guardian_email.trim() || null,
+        guardian_cell: contactForm.guardian_cell.trim() || null,
+      })
+      .eq("id", id);
+    setContactSaving(false);
+    if (error) {
+      setContactError(error.message);
+      return;
+    }
+    setEditingContact(false);
     load();
+  }
+
+  function startEditOutcome() {
+    setOutcomeForm({ offers_received: prospect.offers_received || "", committed_to: prospect.committed_to || "" });
+    setOutcomeError("");
+    setEditingOutcome(true);
+  }
+
+  async function saveOutcome(e) {
+    e.preventDefault();
+    setOutcomeError("");
+    setOutcomeSaving(true);
+    const { error } = await supabase
+      .from("prospects")
+      .update({
+        offers_received: outcomeForm.offers_received.trim() || null,
+        committed_to: outcomeForm.committed_to.trim() || null,
+      })
+      .eq("id", id);
+    setOutcomeSaving(false);
+    if (error) {
+      setOutcomeError(error.message);
+      return;
+    }
+    setEditingOutcome(false);
+    load();
+  }
+
+  function startEditLinks() {
+    setLinksForm({ hudl_url: prospect.hudl_url || "", x_url: prospect.x_url || "" });
+    setLinksError("");
+    setEditingLinks(true);
+  }
+
+  async function saveLinks(e) {
+    e.preventDefault();
+    setLinksError("");
+    setLinksSaving(true);
+    const { error } = await supabase
+      .from("prospects")
+      .update({ hudl_url: linksForm.hudl_url.trim() || null, x_url: linksForm.x_url.trim() || null })
+      .eq("id", id);
+    setLinksSaving(false);
+    if (error) {
+      setLinksError(error.message);
+      return;
+    }
+    setEditingLinks(false);
+    load();
+  }
+
+  async function deleteProspect() {
+    if (!confirm(`Delete ${prospect.athlete_name}? This cannot be undone.`)) return;
+    setDeleteError("");
+    setDeleting(true);
+    const { error } = await supabase.from("prospects").delete().eq("id", id);
+    setDeleting(false);
+    if (error) {
+      setDeleteError(error.message);
+      return;
+    }
+    router.push("/prospects");
+  }
+
+  if (loading) {
+    return (
+      <div className="view">
+        <div className="empty-state">Loading prospect…</div>
+      </div>
+    );
+  }
+
+  if (!prospect) {
+    return (
+      <div className="view">
+        <div className="notice danger">Prospect not found.</div>
+      </div>
+    );
   }
 
   return (
     <div className="view">
+      <button className="btn btn-sm" style={{ marginBottom: 12 }} onClick={() => router.back()}>
+        ← Back
+      </button>
       <div className="view-header">
         <div>
-          <h1>Prospect Management</h1>
-          <p>Submission portal for high-school coaches, and watchlist tools for college staff</p>
+          <h1>{prospect.athlete_name}</h1>
+          <p>
+            {prospect.grad_year ? `Class of ${prospect.grad_year}` : "Grad year not on file"}
+            {prospect.position ? ` · ${prospect.position}` : ""}
+            {prospect.jersey_number ? ` · #${prospect.jersey_number}` : ""}
+            {prospect.level_of_play ? ` · ${prospect.level_of_play}` : ""}
+          </p>
         </div>
-        {canBulkAdd && (
-          <Link href="/prospects/bulk-add" className="btn btn-sm btn-primary">
-            Bulk Add Prospects (CSV)
-          </Link>
-        )}
+        <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+          {prospect.committed_to && <span className="badge badge-committed">Committed — {prospect.committed_to}</span>}
+          {recruitingStatus && <span className={`badge ${RECRUITING_BADGE_CLASS[recruitingStatus]}`}>{RECRUITING_LABEL[recruitingStatus]}</span>}
+          <span className="badge badge-contacted">{prospect.status}</span>
+        </div>
       </div>
 
       <div className="grid grid-2">
-        <div className="card">
-          <h3>
-            Submit a Prospect {isHsCoach ? "" : <span style={{ fontWeight: 400, color: "#697386", fontSize: 12 }}>— typically used by HS coaches</span>}
-          </h3>
-          {submitted && <div className="notice info" style={{ marginBottom: 10 }}>Prospect submitted — it&apos;s now visible to college coaches below.</div>}
-          {submitError && <div className="notice danger" style={{ marginBottom: 10 }}>{submitError}</div>}
-
-          <form onSubmit={submitProspect}>
-            <div className="grid grid-2" style={{ marginBottom: 10 }}>
-              <div className="form-field">
-                <label>Athlete Name</label>
-                <input required value={form.athlete_name} onChange={(e) => setForm((f) => ({ ...f, athlete_name: e.target.value }))} />
-              </div>
-              <div className="form-field">
-                <label>Graduation Year</label>
-                <input value={form.grad_year} onChange={(e) => setForm((f) => ({ ...f, grad_year: e.target.value }))} placeholder="2027" />
-              </div>
-              <div className="form-field" style={{ position: "relative" }}>
-                <label>School</label>
-                <input value={schoolQuery} onChange={(e) => searchSchools(e.target.value)} placeholder="Start typing a school name…" autoComplete="off" />
-                {schoolResults.length > 0 && (
-                  <div
-                    style={{
-                      position: "absolute",
-                      top: "100%",
-                      left: 0,
-                      right: 0,
-                      zIndex: 10,
-                      background: "#fff",
-                      border: "1px solid #dde1e7",
-                      borderRadius: 8,
-                      boxShadow: "0 4px 14px rgba(11,31,58,.12)",
-                      maxHeight: 180,
-                      overflow: "auto",
-                    }}
-                  >
-                    {schoolResults.map((s) => (
-                      <div key={s.id} onClick={() => pickSchool(s)} style={{ padding: "7px 10px", fontSize: 13, cursor: "pointer", borderBottom: "1px solid #f2f3f5" }}>
-                        <strong>{s.name}</strong> <span style={{ color: "#697386" }}>— {s.city}, {s.state}</span>
-                      </div>
-                    ))}
-                  </div>
-                )}
-                {!selectedSchool && schoolQuery.trim().length >= 2 && schoolResults.length === 0 && (
-                  <div style={{ fontSize: 11, color: "#697386", marginTop: 3 }}>No match yet — keep typing or leave unlinked.</div>
-                )}
-              </div>
-              <div className="form-field">
-                <label>Level of Play</label>
-                <select value={form.level_of_play} onChange={(e) => setForm((f) => ({ ...f, level_of_play: e.target.value }))}>
-                  {LEVELS_OF_PLAY.map((l) => (
-                    <option key={l} value={l}>{l || "Not specified"}</option>
-                  ))}
-                </select>
-              </div>
-              <div className="form-field">
-                <label>Position</label>
-                <input value={form.position} onChange={(e) => setForm((f) => ({ ...f, position: e.target.value }))} placeholder="WR" />
-              </div>
-              <div className="form-field">
-                <label>Jersey #</label>
-                <input value={form.jersey_number} onChange={(e) => setForm((f) => ({ ...f, jersey_number: e.target.value }))} />
-              </div>
-              <div className="form-field">
-                <label>Height</label>
-                <input value={form.height} onChange={(e) => setForm((f) => ({ ...f, height: e.target.value }))} placeholder="6'1&quot;" />
-              </div>
-              <div className="form-field">
-                <label>Weight</label>
-                <input value={form.weight} onChange={(e) => setForm((f) => ({ ...f, weight: e.target.value }))} placeholder="185 lbs" />
-              </div>
-              <div className="form-field">
-                <label>GPA</label>
-                <input value={form.gpa} onChange={(e) => setForm((f) => ({ ...f, gpa: e.target.value }))} placeholder="3.4" />
-              </div>
-              <div className="form-field">
-                <label>Hudl URL</label>
-                <input value={form.hudl_url} onChange={(e) => setForm((f) => ({ ...f, hudl_url: e.target.value }))} />
-              </div>
-              <div className="form-field">
-                <label>X (Twitter) URL</label>
-                <input value={form.x_url} onChange={(e) => setForm((f) => ({ ...f, x_url: e.target.value }))} placeholder="https://x.com/username" />
-              </div>
-              <div className="form-field">
-                <label>Athlete Email</label>
-                <input type="email" value={form.athlete_email} onChange={(e) => setForm((f) => ({ ...f, athlete_email: e.target.value }))} placeholder="athlete@email.com" />
-              </div>
-              <div className="form-field">
-                <label>Athlete Cell</label>
-                <input value={form.athlete_cell} onChange={(e) => setForm((f) => ({ ...f, athlete_cell: e.target.value }))} placeholder="(555) 555-5555" />
-              </div>
-              <div className="form-field">
-                <label>City</label>
-                <input value={form.city} onChange={(e) => setForm((f) => ({ ...f, city: e.target.value }))} />
-              </div>
-              <div className="form-field">
-                <label>State</label>
-                <input value={form.state} maxLength={2} onChange={(e) => setForm((f) => ({ ...f, state: e.target.value.toUpperCase() }))} placeholder="TX" />
-              </div>
-            </div>
-
-            <div className="form-field">
-              <label>Coach Evaluation</label>
-              <input value={form.coach_evaluation} onChange={(e) => setForm((f) => ({ ...f, coach_evaluation: e.target.value }))} placeholder="Athletic upside, coachability…" />
-            </div>
-
-            <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12.5, margin: "10px 0" }}>
-              <input type="checkbox" checked={form.guardian_authorized} onChange={(e) => setForm((f) => ({ ...f, guardian_authorized: e.target.checked }))} />
-              I have authorization from a parent/guardian to submit this athlete&apos;s information, including contact details (required if under 18)
-            </label>
-
-            <div style={{ borderTop: "1px solid #eef0f3", paddingTop: 10, marginBottom: 10 }}>
-              <div style={{ fontSize: 12.5, fontWeight: 600, color: "#3a4557", marginBottom: 6 }}>Parent / Guardian Contact (optional)</div>
-              <div className="grid grid-2">
-                <div className="form-field">
-                  <label>Guardian First Name</label>
-                  <input value={form.guardian_first_name} onChange={(e) => setForm((f) => ({ ...f, guardian_first_name: e.target.value }))} />
-                </div>
-                <div className="form-field">
-                  <label>Guardian Last Name</label>
-                  <input value={form.guardian_last_name} onChange={(e) => setForm((f) => ({ ...f, guardian_last_name: e.target.value }))} />
-                </div>
-                <div className="form-field">
-                  <label>Guardian Email</label>
-                  <input type="email" value={form.guardian_email} onChange={(e) => setForm((f) => ({ ...f, guardian_email: e.target.value }))} placeholder="parent@email.com" />
-                </div>
-                <div className="form-field">
-                  <label>Guardian Cell</label>
-                  <input value={form.guardian_cell} onChange={(e) => setForm((f) => ({ ...f, guardian_cell: e.target.value }))} placeholder="(555) 555-5555" />
-                </div>
-              </div>
-            </div>
-
-            <div className="grid grid-2" style={{ marginBottom: 10 }}>
-              <div className="form-field">
-                <label>Offers Received (optional)</label>
-                <input value={form.offers_received} onChange={(e) => setForm((f) => ({ ...f, offers_received: e.target.value }))} placeholder="Texas A&amp;M, Ole Miss, Duke" />
-              </div>
-              <div className="form-field">
-                <label>Committed To (optional)</label>
-                <input value={form.committed_to} onChange={(e) => setForm((f) => ({ ...f, committed_to: e.target.value }))} placeholder="Leave blank if uncommitted" />
-              </div>
-            </div>
-
-            <button className="btn btn-primary">Submit for Review</button>
-          </form>
-        </div>
-
         <div>
           <div className="card" style={{ marginBottom: 14 }}>
-            <h3>Your Watchlist</h3>
-            {watchlist.length ? (
-              watchlist.map((w) => (
-                <div className="log-item" key={w.id}>
-                  <strong>{w.schools?.name}</strong> — {w.schools?.city}, {w.schools?.state}
-                  <button className="btn btn-sm" style={{ float: "right" }} onClick={() => removeFromWatchlist(w.school_id)}>
-                    Remove
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+              <h3 style={{ margin: 0 }}>Athlete Info</h3>
+              {canManageIntake && !editingLinks && (
+                <button className="btn btn-sm" onClick={startEditLinks}>
+                  Edit links
+                </button>
+              )}
+            </div>
+            <div className="kv" style={{ marginTop: 10 }}>
+              <div className="k">Height / Weight</div>
+              <div className="v">{prospect.height || "—"} {prospect.weight ? `/ ${prospect.weight}` : ""}</div>
+              <div className="k">GPA</div>
+              <div className="v">{prospect.gpa ?? "—"}</div>
+              <div className="k">Level of Play</div>
+              <div className="v">{prospect.level_of_play || "—"}</div>
+              <div className="k">City / State</div>
+              <div className="v">
+                {prospect.city || prospect.schools?.city || "—"}
+                {prospect.state || prospect.schools?.state ? `, ${prospect.state || prospect.schools?.state}` : ""}
+              </div>
+              <div className="k">High School</div>
+              <div className="v">
+                {prospect.schools ? (
+                  <Link href={`/schools/${prospect.schools.id}`}>{prospect.schools.name}</Link>
+                ) : (
+                  <span className="empty-state">not linked to a school</span>
+                )}
+              </div>
+              <div className="k">HS Head Coach</div>
+              <div className="v">
+                {prospect.schools?.hc_first_name || prospect.schools?.hc_last_name ? (
+                  `${prospect.schools?.hc_first_name || ""} ${prospect.schools?.hc_last_name || ""}`.trim()
+                ) : (
+                  <span className="empty-state">not on file</span>
+                )}
+              </div>
+              <div className="k">HC Email</div>
+              <div className="v">{prospect.schools?.hc_email || <span className="empty-state">not on file</span>}</div>
+              <div className="k">HC Cell</div>
+              <div className="v">{fmtPhone(prospect.schools?.hc_cell) || <span className="empty-state">not on file</span>}</div>
+              <div className="k">HC Office</div>
+              <div className="v">{fmtPhone(prospect.schools?.hc_office) || <span className="empty-state">not on file</span>}</div>
+              {!editingLinks && (
+                <>
+                  <div className="k">Hudl</div>
+                  <div className="v">
+                    {prospect.hudl_url ? (
+                      <a href={prospect.hudl_url} target="_blank" rel="noopener noreferrer">
+                        {prospect.hudl_url}
+                      </a>
+                    ) : (
+                      "—"
+                    )}
+                  </div>
+                  <div className="k">X (Twitter)</div>
+                  <div className="v">
+                    {prospect.x_url ? (
+                      <a href={prospect.x_url} target="_blank" rel="noopener noreferrer">
+                        {prospect.x_url}
+                      </a>
+                    ) : (
+                      "—"
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+
+            {editingLinks && (
+              <form onSubmit={saveLinks} style={{ marginTop: 10, borderTop: "1px solid #eef0f3", paddingTop: 12 }}>
+                {linksError && <div className="notice danger" style={{ marginBottom: 10 }}>{linksError}</div>}
+                <div className="form-field">
+                  <label>Hudl URL</label>
+                  <input value={linksForm.hudl_url} onChange={(e) => setLinksForm((f) => ({ ...f, hudl_url: e.target.value }))} placeholder="https://www.hudl.com/profile/…" />
+                </div>
+                <div className="form-field">
+                  <label>X (Twitter) URL</label>
+                  <input value={linksForm.x_url} onChange={(e) => setLinksForm((f) => ({ ...f, x_url: e.target.value }))} placeholder="https://x.com/username" />
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button className="btn btn-sm btn-primary" disabled={linksSaving}>
+                    {linksSaving ? "Saving…" : "Save"}
+                  </button>
+                  <button type="button" className="btn btn-sm" onClick={() => setEditingLinks(false)} disabled={linksSaving}>
+                    Cancel
                   </button>
                 </div>
-              ))
-            ) : (
-              <div className="empty-state">No schools on your watchlist yet. Add from a school profile or the map.</div>
+              </form>
             )}
           </div>
 
           <div className="card">
-            <h3>Recently Submitted Prospects ({prospects.length})</h3>
-            {prospects.length ? (
-              prospects.map((p) => {
-                const canManage = canBulkAdd || p.submitted_by === user?.id;
-                return (
-                  <div className="log-item" key={p.id} style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start" }}>
-                    <Link href={`/prospects/${p.id}`} style={{ textDecoration: "none", color: "inherit", flex: 1 }}>
-                      <span className="when">{STATUS_LABEL[p.status] || p.status}</span>
-                      <strong>{p.athlete_name}</strong> {p.grad_year ? `· Class of ${p.grad_year}` : ""} {p.position ? `· ${p.position}` : ""} {p.level_of_play ? `· ${p.level_of_play}` : ""}
-                      <div style={{ fontSize: 11.5, color: "#697386", marginTop: 2 }}>
-                        {p.schools?.name ? `${p.schools.name} · ` : ""}{p.city || p.schools?.city}{p.state || p.schools?.state ? `, ${p.state || p.schools?.state}` : ""}
-                        {p.athlete_email ? ` · ${p.athlete_email}` : ""}{p.athlete_cell ? ` · ${p.athlete_cell}` : ""}
-                        {p.committed_to ? ` · Committed to ${p.committed_to}` : ""}
-                      </div>
-                    </Link>
-                    {canManage && (
-                      <button className="btn btn-sm btn-danger" onClick={() => deleteProspect(p.id)}>
-                        Delete
-                      </button>
-                    )}
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+              <h3 style={{ margin: 0 }}>Contact Info</h3>
+              {canManageIntake && !editingContact && (
+                <button className="btn btn-sm" onClick={startEditContact}>
+                  {prospect.athlete_email || prospect.athlete_cell ? "Edit" : "Add email / cell"}
+                </button>
+              )}
+            </div>
+
+            {!editingContact && !prospect.guardian_authorized && (
+              <div className="notice" style={{ marginBottom: 10 }}>
+                Guardian authorization not confirmed for this submission — contact carefully and verify eligibility to be reached directly.
+              </div>
+            )}
+
+            {editingContact ? (
+              <form onSubmit={saveContact} style={{ marginTop: 8 }}>
+                {contactError && <div className="notice danger" style={{ marginBottom: 10 }}>{contactError}</div>}
+                <div className="form-field">
+                  <label>Email</label>
+                  <input type="email" value={contactForm.athlete_email} onChange={(e) => setContactForm((f) => ({ ...f, athlete_email: e.target.value }))} placeholder="athlete@email.com" />
+                </div>
+                <div className="form-field">
+                  <label>Cell</label>
+                  <input value={contactForm.athlete_cell} onChange={(e) => setContactForm((f) => ({ ...f, athlete_cell: e.target.value }))} placeholder="(555) 555-5555" />
+                </div>
+                <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12.5, margin: "10px 0" }}>
+                  <input type="checkbox" checked={contactForm.guardian_authorized} onChange={(e) => setContactForm((f) => ({ ...f, guardian_authorized: e.target.checked }))} />
+                  Guardian authorization confirmed for contacting this athlete directly (required if under 18)
+                </label>
+                <div style={{ borderTop: "1px solid #eef0f3", paddingTop: 10, marginBottom: 10 }}>
+                  <div style={{ fontSize: 12.5, fontWeight: 600, color: "#3a4557", marginBottom: 6 }}>Parent / Guardian Contact</div>
+                  <div className="grid grid-2">
+                    <div className="form-field">
+                      <label>Guardian First Name</label>
+                      <input value={contactForm.guardian_first_name} onChange={(e) => setContactForm((f) => ({ ...f, guardian_first_name: e.target.value }))} />
+                    </div>
+                    <div className="form-field">
+                      <label>Guardian Last Name</label>
+                      <input value={contactForm.guardian_last_name} onChange={(e) => setContactForm((f) => ({ ...f, guardian_last_name: e.target.value }))} />
+                    </div>
+                    <div className="form-field">
+                      <label>Guardian Email</label>
+                      <input type="email" value={contactForm.guardian_email} onChange={(e) => setContactForm((f) => ({ ...f, guardian_email: e.target.value }))} placeholder="parent@email.com" />
+                    </div>
+                    <div className="form-field">
+                      <label>Guardian Cell</label>
+                      <input value={contactForm.guardian_cell} onChange={(e) => setContactForm((f) => ({ ...f, guardian_cell: e.target.value }))} placeholder="(555) 555-5555" />
+                    </div>
                   </div>
-                );
-              })
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button className="btn btn-sm btn-primary" disabled={contactSaving}>
+                    {contactSaving ? "Saving…" : "Save"}
+                  </button>
+                  <button type="button" className="btn btn-sm" onClick={() => setEditingContact(false)} disabled={contactSaving}>
+                    Cancel
+                  </button>
+                </div>
+              </form>
             ) : (
-              <div className="empty-state">No prospects submitted yet.</div>
+              <div className="kv">
+                <div className="k">Email</div>
+                <div className="v">{prospect.athlete_email || <span className="empty-state">not on file</span>}</div>
+                <div className="k">Cell</div>
+                <div className="v">{fmtPhone(prospect.athlete_cell) || <span className="empty-state">not on file</span>}</div>
+                <div className="k">Guardian Auth.</div>
+                <div className="v">{prospect.guardian_authorized ? "Confirmed" : "Not confirmed"}</div>
+                <div className="k">Guardian Name</div>
+                <div className="v">
+                  {prospect.guardian_first_name || prospect.guardian_last_name ? (
+                    `${prospect.guardian_first_name || ""} ${prospect.guardian_last_name || ""}`.trim()
+                  ) : (
+                    <span className="empty-state">not on file</span>
+                  )}
+                </div>
+                <div className="k">Guardian Email</div>
+                <div className="v">{prospect.guardian_email || <span className="empty-state">not on file</span>}</div>
+                <div className="k">Guardian Cell</div>
+                <div className="v">{fmtPhone(prospect.guardian_cell) || <span className="empty-state">not on file</span>}</div>
+              </div>
             )}
           </div>
+        </div>
+
+        <div>
+          <div className="card" style={{ marginBottom: 14 }}>
+            <h3>Coach Evaluation</h3>
+            <p style={{ margin: 0, fontSize: 13.5 }}>{prospect.coach_evaluation || <span className="empty-state">No evaluation submitted.</span>}</p>
+          </div>
+
+          <div className="card" style={{ marginBottom: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+              <h3 style={{ margin: 0 }}>Offers &amp; Commitment</h3>
+              {canManageIntake && !editingOutcome && (
+                <button className="btn btn-sm" onClick={startEditOutcome}>
+                  Edit
+                </button>
+              )}
+            </div>
+            <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
+              Self- or coach-reported, independent of any one college&apos;s own Recruiting Interest above.
+            </p>
+            {editingOutcome ? (
+              <form onSubmit={saveOutcome} style={{ marginTop: 8 }}>
+                {outcomeError && <div className="notice danger" style={{ marginBottom: 10 }}>{outcomeError}</div>}
+                <div className="form-field">
+                  <label>Offers Received</label>
+                  <input value={outcomeForm.offers_received} onChange={(e) => setOutcomeForm((f) => ({ ...f, offers_received: e.target.value }))} placeholder="Texas A&amp;M, Ole Miss, Duke" />
+                </div>
+                <div className="form-field">
+                  <label>Committed To</label>
+                  <input value={outcomeForm.committed_to} onChange={(e) => setOutcomeForm((f) => ({ ...f, committed_to: e.target.value }))} placeholder="Leave blank if uncommitted" />
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button className="btn btn-sm btn-primary" disabled={outcomeSaving}>
+                    {outcomeSaving ? "Saving…" : "Save"}
+                  </button>
+                  <button type="button" className="btn btn-sm" onClick={() => setEditingOutcome(false)} disabled={outcomeSaving}>
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <div className="kv">
+                <div className="k">Offers Received</div>
+                <div className="v">{prospect.offers_received || <span className="empty-state">none on file</span>}</div>
+                <div className="k">Committed To</div>
+                <div className="v">{prospect.committed_to || <span className="empty-state">not yet committed</span>}</div>
+              </div>
+            )}
+          </div>
+
+          {canSetRecruitingStatus && (
+            <div className="card" style={{ marginBottom: 14 }}>
+              <h3>Watchlist &amp; Contact ({college?.name || "your college"})</h3>
+              <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
+                Same data shown on the Recruiting Board, tied to this athlete&apos;s high school.
+              </p>
+              {schoolContextLoading ? (
+                <div className="empty-state">Loading…</div>
+              ) : !prospect.school_id ? (
+                <div className="empty-state">Not linked to a school yet.</div>
+              ) : (
+                <div className="kv">
+                  <div className="k">On Watchlist</div>
+                  <div className="v">
+                    {schoolContext.watchlisted ? <span className="badge badge-contacted">Watchlisted</span> : "No"}
+                  </div>
+                  <div className="k">Last Contact</div>
+                  <div className="v">
+                    {schoolContext.lastContact ? (
+                      `${schoolContext.lastContact.contact_date} — ${schoolContext.lastContact.contact_type}`
+                    ) : (
+                      <span className="badge badge-not-contacted">None logged</span>
+                    )}
+                  </div>
+                </div>
+              )}
+              {prospect.schools?.id && (
+                <Link href={`/schools/${prospect.schools.id}`} className="btn btn-sm" style={{ marginTop: 10, display: "inline-flex" }}>
+                  Manage on school profile →
+                </Link>
+              )}
+            </div>
+          )}
+
+          {canSetRecruitingStatus && (
+            <div className="card" style={{ marginBottom: 14 }}>
+              <h3>Recruiting Interest</h3>
+              <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
+                Your college&apos;s own board status for this athlete — separate from the submission status below, and not visible to other colleges.
+              </p>
+              {recruitingError && <div className="notice danger" style={{ marginBottom: 10 }}>{recruitingError}</div>}
+              {recruitingLoading ? (
+                <div className="empty-state">Loading…</div>
+              ) : (
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {RECRUITING_STATUSES.map((s) => (
+                    <button
+                      key={s}
+                      className={`btn btn-sm ${recruitingStatus === s ? "btn-gold" : ""}`}
+                      disabled={recruitingSaving || recruitingStatus === s}
+                      onClick={() => setRecruiting(s)}
+                    >
+                      {RECRUITING_LABEL[s]}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {canManageIntake && (
+            <div className="card" style={{ marginBottom: 14 }}>
+              <h3>Submission Status</h3>
+              <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>Where this submission stands in the intake/review pipeline.</p>
+              {statusError && <div className="notice danger" style={{ marginBottom: 10 }}>{statusError}</div>}
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {INTAKE_STATUSES.map((s) => (
+                  <button
+                    key={s}
+                    className={`btn btn-sm ${prospect.status === s ? "btn-primary" : ""}`}
+                    disabled={statusSaving || prospect.status === s}
+                    onClick={() => setIntakeStatus(s)}
+                  >
+                    {s.charAt(0).toUpperCase() + s.slice(1)}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="card" style={{ marginBottom: 14 }}>
+            <h3>Submission Info</h3>
+            <div className="kv">
+              <div className="k">Submitted</div>
+              <div className="v">{new Date(prospect.created_at).toLocaleDateString()}</div>
+            </div>
+          </div>
+
+          {canManageIntake && (
+            <div className="card">
+              <h3>Danger Zone</h3>
+              {deleteError && <div className="notice danger" style={{ marginBottom: 10 }}>{deleteError}</div>}
+              <button className="btn btn-sm btn-danger" onClick={deleteProspect} disabled={deleting}>
+                {deleting ? "Deleting…" : "Delete Prospect"}
+              </button>
+            </div>
+          )}
         </div>
       </div>
     </div>
