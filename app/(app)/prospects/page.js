@@ -1,74 +1,363 @@
-"use client";import{useEffect as B,useState as o,useCallback as T,useRef as D}from"react";import C from"next/link";import{getSupabaseBrowserClient as E}from"@/lib/supabase/client";import{useAuth as j}from"@/lib/auth-context";const q={submitted:"Submitted",reviewed:"Reviewed",contacted:"Contacted"},I=["","FBS","FCS","D2","D3","NAIA","JUCO","Prep/Post-Grad"];export default function W(){const i=E(),{college:n,user:g,profile:r}=j(),[p,S]=o([]),[c,w]=o([]),[a,l]=o({athlete_name:"",grad_year:"",position:"",jersey_number:"",height:"",weight:"",gpa:"",athlete_email:"",athlete_cell:"",city:"",state:"",hudl_url:"",x_url:"",coach_evaluation:"",guardian_authorized:!1,level_of_play:""}),[f,d]=o(""),[u,h]=o([]),[b,m]=o(null),v=D(null),[x,k]=o(!1),[_,y]=o(""),N=r?.role==="verifier"||r?.role==="sysadmin",s=T(async()=>{if(n?.id){const{data:t}=await i.from("watchlist_items").select("*, schools(id,name,city,state)").eq("college_id",n.id);S(t||[])}const{data:e}=await i.from("prospects").select("*, schools(id,name,city,state)").order("created_at",{ascending:!1}).limit(50);w(e||[])},[i,n]);B(()=>{s()},[s]);async function P(e){await i.from("watchlist_items").delete().eq("college_id",n.id).eq("school_id",e),s()}function z(e){if(d(e),m(null),v.current&&clearTimeout(v.current),e.trim().length<2){h([]);return}v.current=setTimeout(async()=>{const{data:t}=await i.from("schools").select("id,name,city,state").ilike("name",`%${e.trim()}%`).order("name",{ascending:!0}).limit(8);h(t||[])},250)}function A(e){m(e),d(`${e.name} — ${e.city}, ${e.state}`),h([])}async function $(e){if(e.preventDefault(),y(""),!a.athlete_name.trim())return;const{error:t}=await i.from("prospects").insert({submitted_by:g.id,athlete_name:a.athlete_name,grad_year:a.grad_year?parseInt(a.grad_year,10):null,position:a.position||null,jersey_number:a.jersey_number||null,height:a.height||null,weight:a.weight||null,gpa:a.gpa?parseFloat(a.gpa):null,athlete_email:a.athlete_email||null,athlete_cell:a.athlete_cell||null,city:a.city||null,state:a.state||null,school_id:b?.id||null,level_of_play:a.level_of_play||null,hudl_url:a.hudl_url||null,x_url:a.x_url||null,coach_evaluation:a.coach_evaluation||null,guardian_authorized:a.guardian_authorized});if(t){y(t.message);return}l({athlete_name:"",grad_year:"",position:"",jersey_number:"",height:"",weight:"",gpa:"",athlete_email:"",athlete_cell:"",city:"",state:"",hudl_url:"",x_url:"",coach_evaluation:"",guardian_authorized:!1,level_of_play:""}),d(""),m(null),k(!0),s()}async function L(e){confirm("Delete this prospect? This cannot be undone.")&&(await i.from("prospects").delete().eq("id",e),s())}const R=r?.role==="hs_coach";return<div className="view">
+"use client";
+import { useEffect, useState, useCallback, useRef } from "react";
+import Link from "next/link";
+import { getSupabaseBrowserClient } from "@/lib/supabase/client";
+import { useAuth } from "@/lib/auth-context";
+
+const STATUS_LABEL = { submitted: "Submitted", reviewed: "Reviewed", contacted: "Contacted" };
+const LEVELS_OF_PLAY = ["", "FBS", "FCS", "D2", "D3", "NAIA", "JUCO", "Prep/Post-Grad"];
+
+const EMPTY_FORM = {
+  athlete_name: "",
+  grad_year: "",
+  position: "",
+  jersey_number: "",
+  height: "",
+  weight: "",
+  gpa: "",
+  athlete_email: "",
+  athlete_cell: "",
+  city: "",
+  state: "",
+  hudl_url: "",
+  x_url: "",
+  coach_evaluation: "",
+  guardian_authorized: false,
+  guardian_first_name: "",
+  guardian_last_name: "",
+  guardian_email: "",
+  guardian_cell: "",
+  offers_received: "",
+  committed_to: "",
+  level_of_play: "",
+};
+
+export default function ProspectsPage() {
+  const supabase = getSupabaseBrowserClient();
+  const { college, user, profile } = useAuth();
+
+  const [watchlist, setWatchlist] = useState([]);
+  const [prospects, setProspects] = useState([]);
+  const [form, setForm] = useState(EMPTY_FORM);
+
+  const [schoolQuery, setSchoolQuery] = useState("");
+  const [schoolResults, setSchoolResults] = useState([]);
+  const [selectedSchool, setSelectedSchool] = useState(null);
+  const debounceRef = useRef(null);
+
+  const [submitted, setSubmitted] = useState(false);
+  const [submitError, setSubmitError] = useState("");
+
+  const canBulkAdd = profile?.role === "verifier" || profile?.role === "sysadmin";
+  const isHsCoach = profile?.role === "hs_coach";
+
+  const load = useCallback(async () => {
+    if (college?.id) {
+      const { data } = await supabase.from("watchlist_items").select("*, schools(id,name,city,state)").eq("college_id", college.id);
+      setWatchlist(data || []);
+    }
+    const { data: prospectRows } = await supabase
+      .from("prospects")
+      .select("*, schools(id,name,city,state)")
+      .order("created_at", { ascending: false })
+      .limit(50);
+    setProspects(prospectRows || []);
+  }, [supabase, college]);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  async function removeFromWatchlist(schoolId) {
+    await supabase.from("watchlist_items").delete().eq("college_id", college.id).eq("school_id", schoolId);
+    load();
+  }
+
+  function searchSchools(value) {
+    setSchoolQuery(value);
+    setSelectedSchool(null);
+    if (debounceRef.current) clearTimeout(debounceRef.current);
+    if (value.trim().length < 2) {
+      setSchoolResults([]);
+      return;
+    }
+    debounceRef.current = setTimeout(async () => {
+      const { data } = await supabase
+        .from("schools")
+        .select("id,name,city,state")
+        .ilike("name", `%${value.trim()}%`)
+        .order("name", { ascending: true })
+        .limit(8);
+      setSchoolResults(data || []);
+    }, 250);
+  }
+
+  function pickSchool(school) {
+    setSelectedSchool(school);
+    setSchoolQuery(`${school.name} — ${school.city}, ${school.state}`);
+    setSchoolResults([]);
+  }
+
+  async function submitProspect(e) {
+    e.preventDefault();
+    setSubmitError("");
+    if (!form.athlete_name.trim()) return;
+
+    const { error } = await supabase.from("prospects").insert({
+      submitted_by: user.id,
+      athlete_name: form.athlete_name,
+      grad_year: form.grad_year ? parseInt(form.grad_year, 10) : null,
+      position: form.position || null,
+      jersey_number: form.jersey_number || null,
+      height: form.height || null,
+      weight: form.weight || null,
+      gpa: form.gpa ? parseFloat(form.gpa) : null,
+      athlete_email: form.athlete_email || null,
+      athlete_cell: form.athlete_cell || null,
+      city: form.city || null,
+      state: form.state || null,
+      school_id: selectedSchool?.id || null,
+      level_of_play: form.level_of_play || null,
+      hudl_url: form.hudl_url || null,
+      x_url: form.x_url || null,
+      coach_evaluation: form.coach_evaluation || null,
+      guardian_authorized: form.guardian_authorized,
+      guardian_first_name: form.guardian_first_name || null,
+      guardian_last_name: form.guardian_last_name || null,
+      guardian_email: form.guardian_email || null,
+      guardian_cell: form.guardian_cell || null,
+      offers_received: form.offers_received || null,
+      committed_to: form.committed_to || null,
+    });
+
+    if (error) {
+      setSubmitError(error.message);
+      return;
+    }
+
+    setForm(EMPTY_FORM);
+    setSchoolQuery("");
+    setSelectedSchool(null);
+    setSubmitted(true);
+    load();
+  }
+
+  async function deleteProspect(id) {
+    if (!confirm("Delete this prospect? This cannot be undone.")) return;
+    await supabase.from("prospects").delete().eq("id", id);
+    load();
+  }
+
+  return (
+    <div className="view">
       <div className="view-header">
-        <div><h1>Prospect Management</h1><p>Submission portal for high-school coaches, and watchlist tools for college staff</p></div>
-        {N&&<C href="/prospects/bulk-add"className="btn btn-sm btn-primary">Bulk Add Prospects (CSV)</C>}
+        <div>
+          <h1>Prospect Management</h1>
+          <p>Submission portal for high-school coaches, and watchlist tools for college staff</p>
+        </div>
+        {canBulkAdd && (
+          <Link href="/prospects/bulk-add" className="btn btn-sm btn-primary">
+            Bulk Add Prospects (CSV)
+          </Link>
+        )}
       </div>
+
       <div className="grid grid-2">
         <div className="card">
-          <h3>Submit a Prospect {R?"":<span style={{fontWeight:400,color:"#697386",fontSize:12}}>— typically used by HS coaches</span>}</h3>
-          {x&&<div className="notice info"style={{marginBottom:10}}>Prospect submitted — it&apos;s now visible to college coaches below.</div>}
-          {_&&<div className="notice danger"style={{marginBottom:10}}>{_}</div>}
-          <form onSubmit={$}>
-            <div className="grid grid-2"style={{marginBottom:10}}>
-              <div className="form-field"><label>Athlete Name</label><input required value={a.athlete_name}onChange={e=>l(t=>({...t,athlete_name:e.target.value}))}/></div>
-              <div className="form-field"><label>Graduation Year</label><input value={a.grad_year}onChange={e=>l(t=>({...t,grad_year:e.target.value}))}placeholder="2027"/></div>
-              <div className="form-field"style={{position:"relative"}}>
+          <h3>
+            Submit a Prospect {isHsCoach ? "" : <span style={{ fontWeight: 400, color: "#697386", fontSize: 12 }}>— typically used by HS coaches</span>}
+          </h3>
+          {submitted && <div className="notice info" style={{ marginBottom: 10 }}>Prospect submitted — it&apos;s now visible to college coaches below.</div>}
+          {submitError && <div className="notice danger" style={{ marginBottom: 10 }}>{submitError}</div>}
+
+          <form onSubmit={submitProspect}>
+            <div className="grid grid-2" style={{ marginBottom: 10 }}>
+              <div className="form-field">
+                <label>Athlete Name</label>
+                <input required value={form.athlete_name} onChange={(e) => setForm((f) => ({ ...f, athlete_name: e.target.value }))} />
+              </div>
+              <div className="form-field">
+                <label>Graduation Year</label>
+                <input value={form.grad_year} onChange={(e) => setForm((f) => ({ ...f, grad_year: e.target.value }))} placeholder="2027" />
+              </div>
+              <div className="form-field" style={{ position: "relative" }}>
                 <label>School</label>
-                <input value={f}onChange={e=>z(e.target.value)}placeholder="Start typing a school name…"autoComplete="off"/>
-                {u.length>0&&<div style={{position:"absolute",top:"100%",left:0,right:0,zIndex:10,background:"#fff",border:"1px solid #dde1e7",borderRadius:8,boxShadow:"0 4px 14px rgba(11,31,58,.12)",maxHeight:180,overflow:"auto"}}>
-                    {u.map(e=><div key={e.id}onClick={()=>A(e)}style={{padding:"7px 10px",fontSize:13,cursor:"pointer",borderBottom:"1px solid #f2f3f5"}}>
-                        <strong>{e.name}</strong> <span style={{color:"#697386"}}>— {e.city}, {e.state}</span>
-                      </div>)}
-                  </div>}
-                {!b&&f.trim().length>=2&&u.length===0&&<div style={{fontSize:11,color:"#697386",marginTop:3}}>No match yet — keep typing or leave unlinked.</div>}
+                <input value={schoolQuery} onChange={(e) => searchSchools(e.target.value)} placeholder="Start typing a school name…" autoComplete="off" />
+                {schoolResults.length > 0 && (
+                  <div
+                    style={{
+                      position: "absolute",
+                      top: "100%",
+                      left: 0,
+                      right: 0,
+                      zIndex: 10,
+                      background: "#fff",
+                      border: "1px solid #dde1e7",
+                      borderRadius: 8,
+                      boxShadow: "0 4px 14px rgba(11,31,58,.12)",
+                      maxHeight: 180,
+                      overflow: "auto",
+                    }}
+                  >
+                    {schoolResults.map((s) => (
+                      <div key={s.id} onClick={() => pickSchool(s)} style={{ padding: "7px 10px", fontSize: 13, cursor: "pointer", borderBottom: "1px solid #f2f3f5" }}>
+                        <strong>{s.name}</strong> <span style={{ color: "#697386" }}>— {s.city}, {s.state}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                {!selectedSchool && schoolQuery.trim().length >= 2 && schoolResults.length === 0 && (
+                  <div style={{ fontSize: 11, color: "#697386", marginTop: 3 }}>No match yet — keep typing or leave unlinked.</div>
+                )}
               </div>
               <div className="form-field">
                 <label>Level of Play</label>
-                <select value={a.level_of_play}onChange={e=>l(t=>({...t,level_of_play:e.target.value}))}>
-                  {I.map(e=><option key={e}value={e}>{e||"Not specified"}</option>)}
+                <select value={form.level_of_play} onChange={(e) => setForm((f) => ({ ...f, level_of_play: e.target.value }))}>
+                  {LEVELS_OF_PLAY.map((l) => (
+                    <option key={l} value={l}>{l || "Not specified"}</option>
+                  ))}
                 </select>
               </div>
-              <div className="form-field"><label>Position</label><input value={a.position}onChange={e=>l(t=>({...t,position:e.target.value}))}placeholder="WR"/></div>
-              <div className="form-field"><label>Jersey #</label><input value={a.jersey_number}onChange={e=>l(t=>({...t,jersey_number:e.target.value}))}/></div>
-              <div className="form-field"><label>Height</label><input value={a.height}onChange={e=>l(t=>({...t,height:e.target.value}))}placeholder="6'1&quot;"/></div>
-              <div className="form-field"><label>Weight</label><input value={a.weight}onChange={e=>l(t=>({...t,weight:e.target.value}))}placeholder="185 lbs"/></div>
-              <div className="form-field"><label>GPA</label><input value={a.gpa}onChange={e=>l(t=>({...t,gpa:e.target.value}))}placeholder="3.4"/></div>
-              <div className="form-field"><label>Hudl URL</label><input value={a.hudl_url}onChange={e=>l(t=>({...t,hudl_url:e.target.value}))}/></div>
-              <div className="form-field"><label>X (Twitter) URL</label><input value={a.x_url}onChange={e=>l(t=>({...t,x_url:e.target.value}))}placeholder="https://x.com/username"/></div>
-              <div className="form-field"><label>Athlete Email</label><input type="email"value={a.athlete_email}onChange={e=>l(t=>({...t,athlete_email:e.target.value}))}placeholder="athlete@email.com"/></div>
-              <div className="form-field"><label>Athlete Cell</label><input value={a.athlete_cell}onChange={e=>l(t=>({...t,athlete_cell:e.target.value}))}placeholder="(555) 555-5555"/></div>
-              <div className="form-field"><label>City</label><input value={a.city}onChange={e=>l(t=>({...t,city:e.target.value}))}/></div>
-              <div className="form-field"><label>State</label><input value={a.state}maxLength={2}onChange={e=>l(t=>({...t,state:e.target.value.toUpperCase()}))}placeholder="TX"/></div>
+              <div className="form-field">
+                <label>Position</label>
+                <input value={form.position} onChange={(e) => setForm((f) => ({ ...f, position: e.target.value }))} placeholder="WR" />
+              </div>
+              <div className="form-field">
+                <label>Jersey #</label>
+                <input value={form.jersey_number} onChange={(e) => setForm((f) => ({ ...f, jersey_number: e.target.value }))} />
+              </div>
+              <div className="form-field">
+                <label>Height</label>
+                <input value={form.height} onChange={(e) => setForm((f) => ({ ...f, height: e.target.value }))} placeholder="6'1&quot;" />
+              </div>
+              <div className="form-field">
+                <label>Weight</label>
+                <input value={form.weight} onChange={(e) => setForm((f) => ({ ...f, weight: e.target.value }))} placeholder="185 lbs" />
+              </div>
+              <div className="form-field">
+                <label>GPA</label>
+                <input value={form.gpa} onChange={(e) => setForm((f) => ({ ...f, gpa: e.target.value }))} placeholder="3.4" />
+              </div>
+              <div className="form-field">
+                <label>Hudl URL</label>
+                <input value={form.hudl_url} onChange={(e) => setForm((f) => ({ ...f, hudl_url: e.target.value }))} />
+              </div>
+              <div className="form-field">
+                <label>X (Twitter) URL</label>
+                <input value={form.x_url} onChange={(e) => setForm((f) => ({ ...f, x_url: e.target.value }))} placeholder="https://x.com/username" />
+              </div>
+              <div className="form-field">
+                <label>Athlete Email</label>
+                <input type="email" value={form.athlete_email} onChange={(e) => setForm((f) => ({ ...f, athlete_email: e.target.value }))} placeholder="athlete@email.com" />
+              </div>
+              <div className="form-field">
+                <label>Athlete Cell</label>
+                <input value={form.athlete_cell} onChange={(e) => setForm((f) => ({ ...f, athlete_cell: e.target.value }))} placeholder="(555) 555-5555" />
+              </div>
+              <div className="form-field">
+                <label>City</label>
+                <input value={form.city} onChange={(e) => setForm((f) => ({ ...f, city: e.target.value }))} />
+              </div>
+              <div className="form-field">
+                <label>State</label>
+                <input value={form.state} maxLength={2} onChange={(e) => setForm((f) => ({ ...f, state: e.target.value.toUpperCase() }))} placeholder="TX" />
+              </div>
             </div>
-            <div className="form-field"><label>Coach Evaluation</label><input value={a.coach_evaluation}onChange={e=>l(t=>({...t,coach_evaluation:e.target.value}))}placeholder="Athletic upside, coachability…"/></div>
-            <label style={{display:"flex",gap:6,alignItems:"center",fontSize:12.5,margin:"10px 0"}}>
-              <input type="checkbox"checked={a.guardian_authorized}onChange={e=>l(t=>({...t,guardian_authorized:e.target.checked}))}/>
+
+            <div className="form-field">
+              <label>Coach Evaluation</label>
+              <input value={form.coach_evaluation} onChange={(e) => setForm((f) => ({ ...f, coach_evaluation: e.target.value }))} placeholder="Athletic upside, coachability…" />
+            </div>
+
+            <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12.5, margin: "10px 0" }}>
+              <input type="checkbox" checked={form.guardian_authorized} onChange={(e) => setForm((f) => ({ ...f, guardian_authorized: e.target.checked }))} />
               I have authorization from a parent/guardian to submit this athlete&apos;s information, including contact details (required if under 18)
             </label>
+
+            <div style={{ borderTop: "1px solid #eef0f3", paddingTop: 10, marginBottom: 10 }}>
+              <div style={{ fontSize: 12.5, fontWeight: 600, color: "#3a4557", marginBottom: 6 }}>Parent / Guardian Contact (optional)</div>
+              <div className="grid grid-2">
+                <div className="form-field">
+                  <label>Guardian First Name</label>
+                  <input value={form.guardian_first_name} onChange={(e) => setForm((f) => ({ ...f, guardian_first_name: e.target.value }))} />
+                </div>
+                <div className="form-field">
+                  <label>Guardian Last Name</label>
+                  <input value={form.guardian_last_name} onChange={(e) => setForm((f) => ({ ...f, guardian_last_name: e.target.value }))} />
+                </div>
+                <div className="form-field">
+                  <label>Guardian Email</label>
+                  <input type="email" value={form.guardian_email} onChange={(e) => setForm((f) => ({ ...f, guardian_email: e.target.value }))} placeholder="parent@email.com" />
+                </div>
+                <div className="form-field">
+                  <label>Guardian Cell</label>
+                  <input value={form.guardian_cell} onChange={(e) => setForm((f) => ({ ...f, guardian_cell: e.target.value }))} placeholder="(555) 555-5555" />
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-2" style={{ marginBottom: 10 }}>
+              <div className="form-field">
+                <label>Offers Received (optional)</label>
+                <input value={form.offers_received} onChange={(e) => setForm((f) => ({ ...f, offers_received: e.target.value }))} placeholder="Texas A&amp;M, Ole Miss, Duke" />
+              </div>
+              <div className="form-field">
+                <label>Committed To (optional)</label>
+                <input value={form.committed_to} onChange={(e) => setForm((f) => ({ ...f, committed_to: e.target.value }))} placeholder="Leave blank if uncommitted" />
+              </div>
+            </div>
+
             <button className="btn btn-primary">Submit for Review</button>
           </form>
         </div>
+
         <div>
-          <div className="card"style={{marginBottom:14}}>
+          <div className="card" style={{ marginBottom: 14 }}>
             <h3>Your Watchlist</h3>
-            {p.length?p.map(e=><div className="log-item"key={e.id}><strong>{e.schools?.name}</strong> — {e.schools?.city}, {e.schools?.state}
-                <button className="btn btn-sm"style={{float:"right"}}onClick={()=>P(e.school_id)}>Remove</button>
-              </div>):<div className="empty-state">No schools on your watchlist yet. Add from a school profile or the map.</div>}
+            {watchlist.length ? (
+              watchlist.map((w) => (
+                <div className="log-item" key={w.id}>
+                  <strong>{w.schools?.name}</strong> — {w.schools?.city}, {w.schools?.state}
+                  <button className="btn btn-sm" style={{ float: "right" }} onClick={() => removeFromWatchlist(w.school_id)}>
+                    Remove
+                  </button>
+                </div>
+              ))
+            ) : (
+              <div className="empty-state">No schools on your watchlist yet. Add from a school profile or the map.</div>
+            )}
           </div>
+
           <div className="card">
-            <h3>Recently Submitted Prospects ({c.length})</h3>
-            {c.length?c.map(e=>{const t=N||e.submitted_by===g?.id;return<div className="log-item"key={e.id}style={{display:"flex",justifyContent:"space-between",gap:8,alignItems:"flex-start"}}>
-                  <C href={`/prospects/${e.id}`}style={{textDecoration:"none",color:"inherit",flex:1}}>
-                    <span className="when">{q[e.status]||e.status}</span>
-                    <strong>{e.athlete_name}</strong> {e.grad_year?`· Class of ${e.grad_year}`:""} {e.position?`· ${e.position}`:""} {e.level_of_play?`· ${e.level_of_play}`:""}
-                    <div style={{fontSize:11.5,color:"#697386",marginTop:2}}>
-                      {e.schools?.name?`${e.schools.name} · `:""}{e.city||e.schools?.city}{e.state||e.schools?.state?`, ${e.state||e.schools?.state}`:""}
-                      {e.athlete_email?` · ${e.athlete_email}`:""}{e.athlete_cell?` · ${e.athlete_cell}`:""}
-                    </div>
-                  </C>
-                  {t&&<button className="btn btn-sm btn-danger"onClick={()=>L(e.id)}>Delete</button>}
-                </div>}):<div className="empty-state">No prospects submitted yet.</div>}
+            <h3>Recently Submitted Prospects ({prospects.length})</h3>
+            {prospects.length ? (
+              prospects.map((p) => {
+                const canManage = canBulkAdd || p.submitted_by === user?.id;
+                return (
+                  <div className="log-item" key={p.id} style={{ display: "flex", justifyContent: "space-between", gap: 8, alignItems: "flex-start" }}>
+                    <Link href={`/prospects/${p.id}`} style={{ textDecoration: "none", color: "inherit", flex: 1 }}>
+                      <span className="when">{STATUS_LABEL[p.status] || p.status}</span>
+                      <strong>{p.athlete_name}</strong> {p.grad_year ? `· Class of ${p.grad_year}` : ""} {p.position ? `· ${p.position}` : ""} {p.level_of_play ? `· ${p.level_of_play}` : ""}
+                      <div style={{ fontSize: 11.5, color: "#697386", marginTop: 2 }}>
+                        {p.schools?.name ? `${p.schools.name} · ` : ""}{p.city || p.schools?.city}{p.state || p.schools?.state ? `, ${p.state || p.schools?.state}` : ""}
+                        {p.athlete_email ? ` · ${p.athlete_email}` : ""}{p.athlete_cell ? ` · ${p.athlete_cell}` : ""}
+                        {p.committed_to ? ` · Committed to ${p.committed_to}` : ""}
+                      </div>
+                    </Link>
+                    {canManage && (
+                      <button className="btn btn-sm btn-danger" onClick={() => deleteProspect(p.id)}>
+                        Delete
+                      </button>
+                    )}
+                  </div>
+                );
+              })
+            ) : (
+              <div className="empty-state">No prospects submitted yet.</div>
+            )}
           </div>
         </div>
       </div>
-    </div>}
+    </div>
+  );
+}
