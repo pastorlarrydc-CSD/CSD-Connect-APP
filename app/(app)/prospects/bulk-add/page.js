@@ -1,91 +1,599 @@
-"use client";import{useState as h,useCallback as ne,useRef as Re}from"react";import _e from"next/link";import I from"papaparse";import{getSupabaseBrowserClient as $e}from"@/lib/supabase/client";import{useAuth as je}from"@/lib/auth-context";const Be=["athlete_name","grad_year","position","jersey_number","height","weight","gpa","athlete_email","athlete_cell","city","state","school_id","school_name","level_of_play","hudl_url","x_url","coach_evaluation","guardian_authorized"],U=300,Te=new Set(["true","yes","y","1"]),Ae={athlete_name:["athlete name","name","player name","prospect name"],grad_year:["graduation year","grad year","class of","class","grad"],school_id:["school id"],school_name:["school","school name","high school","hs","hs name"],level_of_play:["level of play","level","division","lop"],position:["position","pos"],jersey_number:["jersey","jersey number","jersey no","number","no","jersey #"],height:["height","ht"],weight:["weight","wt"],gpa:["gpa"],hudl_url:["hudl url","hudl","hudl link","film","film link"],x_url:["x url","x","twitter","twitter url","twitter link","x link","x (twitter) url"],athlete_email:["athlete email","email","email address"],athlete_cell:["athlete cell","cell","phone","mobile","cell phone","phone number"],city:["city"],state:["state","st"],coach_evaluation:["coach evaluation","evaluation","notes","comments","coach notes"],guardian_authorized:["guardian authorized","guardian_authorized","parent authorized","guardian auth","authorized"]};function P(n){return String(n||"").trim().toLowerCase().replace(/[^a-z0-9]+/g," ").trim()}const ve=(()=>{const n={};return Object.entries(Ae).forEach(([r,g])=>{n[P(r)]=r,g.forEach(w=>{n[P(w)]=r})}),n})();function Ie(n){const r=P(n);return ve[r]?ve[r]:r.replace(/\s+/g,"_")}function l(n){return n==null?"":String(n).trim()}const Ue=["junior senior high school","jr sr high school","senior high school","junior high school","middle high school","high school","senior high","junior high","high","hs"];function be(n){let r=String(n||"").toLowerCase().replace(/['’.]/g,"").replace(/[^a-z0-9]+/g," ").trim();for(const g of Ue){if(r===g){r="";break}if(r.endsWith(" "+g)){r=r.slice(0,r.length-g.length-1).trim();break}}return r.replace(/\s+/g," ").trim()}export default function Pe(){const n=$e(),{user:r,profile:g}=je(),w=Re(null),[O,H]=h(!1),[M,R]=h(""),[D,V]=h(""),[d,$]=h([]),[S,q]=h([]),[N,F]=h([]),[K,W]=h(!1),[we,Y]=h(""),[G,j]=h(""),[k,B]=h(null),Se=g?.role==="verifier"||g?.role==="sysadmin",[X,J]=h(!1),[Q,Z]=h(""),Ne=ne(async()=>{const t=[];let i=0;for(;;){const{data:o,error:c}=await n.from("prospects").select("athlete_name,grad_year,position,jersey_number,height,weight,gpa,athlete_email,athlete_cell,city,state,level_of_play,hudl_url,x_url,coach_evaluation,guardian_authorized,status,created_at,schools(name,city,state)").order("created_at",{ascending:!1}).range(i,i+1e3-1);if(c)throw c;if(t.push(...o||[]),!o||o.length<1e3)break;i+=1e3}return t},[n]);async function ke(){Z(""),J(!0);try{const t=await Ne(),s=I.unparse({fields:["athlete_name","grad_year","school_name","city","state","level_of_play","position","jersey_number","height","weight","gpa","athlete_email","athlete_cell","hudl_url","x_url","coach_evaluation","guardian_authorized","status","submitted_date"],data:t.map(a=>[a.athlete_name,a.grad_year||"",a.schools?.name||"",a.city||a.schools?.city||"",a.state||a.schools?.state||"",a.level_of_play||"",a.position||"",a.jersey_number||"",a.height||"",a.weight||"",a.gpa??"",a.athlete_email||"",a.athlete_cell||"",a.hudl_url||"",a.x_url||"",a.coach_evaluation||"",a.guardian_authorized?"TRUE":"FALSE",a.status||"",a.created_at?new Date(a.created_at).toISOString().slice(0,10):""])}),i=new Blob([s],{type:"text/csv;charset=utf-8;"}),o=URL.createObjectURL(i),c=document.createElement("a");c.href=o,c.download=`csd_prospects_export_${new Date().toISOString().slice(0,10)}.csv`,document.body.appendChild(c),c.click(),c.remove(),URL.revokeObjectURL(o)}catch(t){Z(t.message||"Could not export prospects.")}finally{J(!1)}}function Ee(){const t=I.unparse({fields:Be,data:[["Jordan Smith","2027","WR","8",`6'1"`,"185","3.4","jordan@email.com","5555551234","Austin","TX","","Austin High School","FBS","","https://x.com/username","Great hands, top-end speed","TRUE"]]}),s=new Blob([t],{type:"text/csv;charset=utf-8;"}),i=URL.createObjectURL(s),o=document.createElement("a");o.href=i,o.download="csd_prospect_template.csv",document.body.appendChild(o),o.click(),o.remove(),URL.revokeObjectURL(i)}function xe(){$([]),q([]),F([]),R(""),B(null),j(""),V(""),w.current&&(w.current.value="")}const ze=ne(async()=>{const t=[];let i=0;for(;;){const{data:o,error:c}=await n.from("schools").select("id,name,city,state").order("id",{ascending:!0}).range(i,i+1e3-1);if(c)throw c;if(t.push(...o||[]),!o||o.length<1e3)break;i+=1e3}return t},[n]);async function Ce(t){const s=t.target.files?.[0];if(s){xe(),V(s.name),H(!0),R("");try{const i=await s.text(),o=I.parse(i,{header:!0,skipEmptyLines:!0});if(o.errors?.length)throw new Error(o.errors[0].message);const c=(o.data||[]).map(e=>{const u={};return Object.keys(e).forEach(m=>{u[Ie(m)]=e[m]}),u});if(!c.length)throw new Error("The file has no data rows.");const a=await ze(),ee=new Map(a.map(e=>[String(e.id),e])),E=new Map,x=new Map,z=new Map,C=new Map;a.forEach(e=>{const u=l(e.name).toLowerCase(),m=l(e.state).toUpperCase(),_=`${u}|${m}`;E.has(_)||E.set(_,[]),E.get(_).push(e),x.has(u)||x.set(u,[]),x.get(u).push(e);const f=be(e.name),y=`${f}|${m}`;z.has(y)||z.set(y,[]),z.get(y).push(e),C.has(f)||C.set(f,[]),C.get(f).push(e)});const te=[],ae=[],L=[];c.forEach((e,u)=>{const m=e.athlete_name||`Row ${u+2}`,_=l(e.athlete_name);if(!_){ae.push({row:m,reason:"Missing athlete_name."});return}let f=null;const y=l(e.school_id),v=l(e.school_name),b=l(e.state).toUpperCase();if(y&&ee.has(y))f=ee.get(y).id;else if(v){const se=be(v);let p=[];b?(p=E.get(`${v.toLowerCase()}|${b}`)||[],p.length||(p=z.get(`${se}|${b}`)||[])):(p=x.get(v.toLowerCase())||[],p.length||(p=C.get(se)||[]));const le=b?`${v}, ${b}`:v;p.length===1?f=p[0].id:p.length===0?L.push(`${m}: no school matched "${le}" — prospect will import without a linked school.`):L.push(`${m}: multiple schools matched "${le}" — prospect will import without a linked school.`)}const oe=Te.has(l(e.guardian_authorized).toLowerCase());let T=l(e.athlete_email)||null,A=l(e.athlete_cell)||null;(T||A)&&!oe&&(L.push(`${m}: contact info removed — guardian_authorized was not marked TRUE.`),T=null,A=null),te.push({submitted_by:r.id,athlete_name:_,grad_year:e.grad_year&&parseInt(l(e.grad_year),10)||null,position:l(e.position)||null,jersey_number:l(e.jersey_number)||null,height:l(e.height)||null,weight:l(e.weight)||null,gpa:e.gpa&&parseFloat(l(e.gpa))||null,athlete_email:T,athlete_cell:A,city:l(e.city)||null,state:b||null,school_id:f,level_of_play:l(e.level_of_play)||null,hudl_url:l(e.hudl_url)||null,x_url:l(e.x_url)||null,coach_evaluation:l(e.coach_evaluation)||null,guardian_authorized:oe,_label:m})}),$(te),q(ae),F(L)}catch(i){R(i.message||"Could not read this file.")}finally{H(!1)}}}async function Le(){W(!0),j(""),$(null);try{let t=0;for(let s=0;s<d.length;s+=U){const i=d.slice(s,s+U).map(({_label:c,...a})=>a);Y(`Importing ${s+1}–${Math.min(s+U,d.length)} of ${d.length}…`);const{error:o}=await n.from("prospects").insert(i);if(o)throw o;t+=i.length}B({count:t}),$([])}catch(t){j(t.message||"Something went wrong importing these prospects.")}finally{W(!1),Y("")}}return Se?<div className="view">
-      <_e href="/prospects"className="btn btn-sm"style={{marginBottom:12,display:"inline-flex"}}>← Back to Prospects</_e>
+"use client";
+import { useState, useCallback, useRef } from "react";
+import Link from "next/link";
+import Papa from "papaparse";
+import { getSupabaseBrowserClient } from "@/lib/supabase/client";
+import { useAuth } from "@/lib/auth-context";
+
+const ALLOWED_FIELDS = [
+  "athlete_name",
+  "grad_year",
+  "position",
+  "jersey_number",
+  "height",
+  "weight",
+  "gpa",
+  "athlete_email",
+  "athlete_cell",
+  "city",
+  "state",
+  "school_id",
+  "school_name",
+  "level_of_play",
+  "hudl_url",
+  "x_url",
+  "coach_evaluation",
+  "guardian_authorized",
+  "guardian_first_name",
+  "guardian_last_name",
+  "guardian_email",
+  "guardian_cell",
+  "offers_received",
+  "committed_to",
+];
+
+const IMPORT_BATCH_SIZE = 300;
+const TRUE_VALUES = new Set(["true", "yes", "y", "1"]);
+
+const HEADER_ALIASES = {
+  athlete_name: ["athlete name", "name", "player name", "prospect name"],
+  school_id: ["school id"],
+  school_name: ["school", "school name", "high school", "hs", "hs name"],
+  level_of_play: ["level of play", "level", "division", "lop"],
+  position: ["position", "pos"],
+  jersey_number: ["jersey", "jersey number", "jersey no", "number", "no", "jersey #"],
+  height: ["height", "ht"],
+  weight: ["weight", "wt"],
+  gpa: ["gpa"],
+  hudl_url: ["hudl url", "hudl", "hudl link", "film", "film link"],
+  x_url: ["x url", "x", "twitter", "twitter url", "twitter link", "x link", "x (twitter) url"],
+  athlete_email: ["athlete email", "email", "email address"],
+  athlete_cell: ["athlete cell", "cell", "phone", "mobile", "cell phone", "phone number"],
+  city: ["city"],
+  state: ["state", "st"],
+  coach_evaluation: ["coach evaluation", "evaluation", "notes", "comments", "coach notes"],
+  guardian_authorized: ["guardian authorized", "guardian_authorized", "parent authorized", "guardian auth", "authorized"],
+  guardian_first_name: ["guardian first name", "parent first name", "guardian_first_name"],
+  guardian_last_name: ["guardian last name", "parent last name", "guardian_last_name"],
+  guardian_email: ["guardian email", "parent email", "guardian_email"],
+  guardian_cell: ["guardian cell", "guardian phone", "parent cell", "parent phone", "guardian_cell"],
+  offers_received: ["offers received", "offers", "offer list"],
+  committed_to: ["committed to", "commitment", "committed", "commit"],
+  grad_year: ["graduation year", "grad year", "class of", "class", "grad"],
+};
+
+function normalizeHeaderText(v) {
+  return String(v || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+}
+
+const ALIAS_LOOKUP = (() => {
+  const map = {};
+  Object.entries(HEADER_ALIASES).forEach(([field, aliases]) => {
+    map[normalizeHeaderText(field)] = field;
+    aliases.forEach((alias) => {
+      map[normalizeHeaderText(alias)] = field;
+    });
+  });
+  return map;
+})();
+
+function resolveHeader(raw) {
+  const normalized = normalizeHeaderText(raw);
+  return ALIAS_LOOKUP[normalized] || normalized.replace(/\s+/g, "_");
+}
+
+function trimStr(v) {
+  return v == null ? "" : String(v).trim();
+}
+
+const HIGH_SCHOOL_SUFFIXES = [
+  "junior senior high school",
+  "jr sr high school",
+  "senior high school",
+  "junior high school",
+  "middle high school",
+  "high school",
+  "senior high",
+  "junior high",
+  "high",
+  "hs",
+];
+
+function normalizeSchoolName(v) {
+  let s = String(v || "").toLowerCase().replace(/['’.]/g, "").replace(/[^a-z0-9]+/g, " ").trim();
+  for (const suffix of HIGH_SCHOOL_SUFFIXES) {
+    if (s === suffix) {
+      s = "";
+      break;
+    }
+    if (s.endsWith(" " + suffix)) {
+      s = s.slice(0, s.length - suffix.length - 1).trim();
+      break;
+    }
+  }
+  return s.replace(/\s+/g, " ").trim();
+}
+
+export default function BulkAddProspectsPage() {
+  const supabase = getSupabaseBrowserClient();
+  const { user, profile } = useAuth();
+  const fileInputRef = useRef(null);
+
+  const [uploading, setUploading] = useState(false);
+  const [uploadError, setUploadError] = useState("");
+  const [fileName, setFileName] = useState("");
+
+  const [readyRows, setReadyRows] = useState([]);
+  const [skippedRows, setSkippedRows] = useState([]);
+  const [warnings, setWarnings] = useState([]);
+
+  const [importing, setImporting] = useState(false);
+  const [importProgress, setImportProgress] = useState("");
+  const [importError, setImportError] = useState("");
+  const [importResult, setImportResult] = useState(null);
+
+  const [exportingCurrent, setExportingCurrent] = useState(false);
+  const [exportError, setExportError] = useState("");
+
+  const canBulkAdd = profile?.role === "verifier" || profile?.role === "sysadmin";
+
+  const fetchAllProspects = useCallback(async () => {
+    const rows = [];
+    let offset = 0;
+    for (;;) {
+      const { data, error } = await supabase
+        .from("prospects")
+        .select(
+          "athlete_name,grad_year,position,jersey_number,height,weight,gpa,athlete_email,athlete_cell,city,state,level_of_play,hudl_url,x_url,coach_evaluation,guardian_authorized,guardian_first_name,guardian_last_name,guardian_email,guardian_cell,offers_received,committed_to,status,created_at,schools(name,city,state)"
+        )
+        .order("created_at", { ascending: false })
+        .range(offset, offset + 999);
+      if (error) throw error;
+      rows.push(...(data || []));
+      if (!data || data.length < 1000) break;
+      offset += 1000;
+    }
+    return rows;
+  }, [supabase]);
+
+  async function exportCurrentProspects() {
+    setExportError("");
+    setExportingCurrent(true);
+    try {
+      const rows = await fetchAllProspects();
+      const csv = Papa.unparse({
+        fields: [
+          "athlete_name",
+          "grad_year",
+          "school_name",
+          "city",
+          "state",
+          "level_of_play",
+          "position",
+          "jersey_number",
+          "height",
+          "weight",
+          "gpa",
+          "athlete_email",
+          "athlete_cell",
+          "guardian_authorized",
+          "guardian_first_name",
+          "guardian_last_name",
+          "guardian_email",
+          "guardian_cell",
+          "hudl_url",
+          "x_url",
+          "coach_evaluation",
+          "offers_received",
+          "committed_to",
+          "status",
+          "submitted_date",
+        ],
+        data: rows.map((r) => [
+          r.athlete_name,
+          r.grad_year || "",
+          r.schools?.name || "",
+          r.city || r.schools?.city || "",
+          r.state || r.schools?.state || "",
+          r.level_of_play || "",
+          r.position || "",
+          r.jersey_number || "",
+          r.height || "",
+          r.weight || "",
+          r.gpa ?? "",
+          r.athlete_email || "",
+          r.athlete_cell || "",
+          r.guardian_authorized ? "TRUE" : "FALSE",
+          r.guardian_first_name || "",
+          r.guardian_last_name || "",
+          r.guardian_email || "",
+          r.guardian_cell || "",
+          r.hudl_url || "",
+          r.x_url || "",
+          r.coach_evaluation || "",
+          r.offers_received || "",
+          r.committed_to || "",
+          r.status || "",
+          r.created_at ? new Date(r.created_at).toISOString().slice(0, 10) : "",
+        ]),
+      });
+      downloadBlob(csv, `csd_prospects_export_${new Date().toISOString().slice(0, 10)}.csv`);
+    } catch (err) {
+      setExportError(err.message || "Could not export prospects.");
+    } finally {
+      setExportingCurrent(false);
+    }
+  }
+
+  function downloadTemplate() {
+    const csv = Papa.unparse({
+      fields: ALLOWED_FIELDS,
+      data: [
+        [
+          "Jordan Smith",
+          "2027",
+          "WR",
+          "8",
+          `6'1"`,
+          "185",
+          "3.4",
+          "jordan@email.com",
+          "5555551234",
+          "Austin",
+          "TX",
+          "",
+          "Austin High School",
+          "FBS",
+          "https://www.hudl.com/profile/…",
+          "https://x.com/username",
+          "Great hands, top-end speed",
+          "TRUE",
+          "Pat",
+          "Smith",
+          "pat.smith@email.com",
+          "5555559876",
+          "",
+          "",
+        ],
+      ],
+    });
+    downloadBlob(csv, "csd_prospect_template.csv");
+  }
+
+  function downloadBlob(csv, filename) {
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function resetPreview() {
+    setReadyRows([]);
+    setSkippedRows([]);
+    setWarnings([]);
+    setUploadError("");
+    setImportResult(null);
+    setImportError("");
+    setFileName("");
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
+  const fetchAllSchools = useCallback(async () => {
+    const rows = [];
+    let offset = 0;
+    for (;;) {
+      const { data, error } = await supabase.from("schools").select("id,name,city,state").order("id", { ascending: true }).range(offset, offset + 999);
+      if (error) throw error;
+      rows.push(...(data || []));
+      if (!data || data.length < 1000) break;
+      offset += 1000;
+    }
+    return rows;
+  }, [supabase]);
+
+  async function handleFileChange(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    resetPreview();
+    setFileName(file.name);
+    setUploading(true);
+    setUploadError("");
+    try {
+      const text = await file.text();
+      const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+      if (parsed.errors?.length) throw new Error(parsed.errors[0].message);
+
+      const mappedRows = (parsed.data || []).map((row) => {
+        const mapped = {};
+        Object.keys(row).forEach((header) => {
+          mapped[resolveHeader(header)] = row[header];
+        });
+        return mapped;
+      });
+      if (!mappedRows.length) throw new Error("The file has no data rows.");
+
+      const schools = await fetchAllSchools();
+      const byId = new Map(schools.map((s) => [String(s.id), s]));
+      const byExactNameState = new Map();
+      const byExactName = new Map();
+      const byNormalizedNameState = new Map();
+      const byNormalizedName = new Map();
+      schools.forEach((s) => {
+        const name = trimStr(s.name).toLowerCase();
+        const state = trimStr(s.state).toUpperCase();
+        const key = `${name}|${state}`;
+        (byExactNameState.get(key) || byExactNameState.set(key, []).get(key)).push(s);
+        (byExactName.get(name) || byExactName.set(name, []).get(name)).push(s);
+        const normalized = normalizeSchoolName(s.name);
+        const normKey = `${normalized}|${state}`;
+        (byNormalizedNameState.get(normKey) || byNormalizedNameState.set(normKey, []).get(normKey)).push(s);
+        (byNormalizedName.get(normalized) || byNormalizedName.set(normalized, []).get(normalized)).push(s);
+      });
+
+      const ready = [];
+      const skipped = [];
+      const rowWarnings = [];
+
+      mappedRows.forEach((row, i) => {
+        const label = row.athlete_name || `Row ${i + 2}`;
+        const athleteName = trimStr(row.athlete_name);
+        if (!athleteName) {
+          skipped.push({ row: label, reason: "Missing athlete_name." });
+          return;
+        }
+
+        let schoolId = null;
+        const rowSchoolId = trimStr(row.school_id);
+        const rowSchoolName = trimStr(row.school_name);
+        const rowState = trimStr(row.state).toUpperCase();
+
+        if (rowSchoolId && byId.has(rowSchoolId)) {
+          schoolId = byId.get(rowSchoolId).id;
+        } else if (rowSchoolName) {
+          const normalized = normalizeSchoolName(rowSchoolName);
+          let matches = [];
+          if (rowState) {
+            matches = byExactNameState.get(`${rowSchoolName.toLowerCase()}|${rowState}`) || [];
+            if (!matches.length) matches = byNormalizedNameState.get(`${normalized}|${rowState}`) || [];
+          } else {
+            matches = byExactName.get(rowSchoolName.toLowerCase()) || [];
+            if (!matches.length) matches = byNormalizedName.get(normalized) || [];
+          }
+          const displayName = rowState ? `${rowSchoolName}, ${rowState}` : rowSchoolName;
+          if (matches.length === 1) {
+            schoolId = matches[0].id;
+          } else if (matches.length === 0) {
+            rowWarnings.push(`${label}: no school matched "${displayName}" — prospect will import without a linked school.`);
+          } else {
+            rowWarnings.push(`${label}: multiple schools matched "${displayName}" — prospect will import without a linked school.`);
+          }
+        }
+
+        const guardianAuthorized = TRUE_VALUES.has(trimStr(row.guardian_authorized).toLowerCase());
+        let athleteEmail = trimStr(row.athlete_email) || null;
+        let athleteCell = trimStr(row.athlete_cell) || null;
+        let guardianEmail = trimStr(row.guardian_email) || null;
+        let guardianCell = trimStr(row.guardian_cell) || null;
+        if ((athleteEmail || athleteCell || guardianEmail || guardianCell) && !guardianAuthorized) {
+          rowWarnings.push(`${label}: contact info removed — guardian_authorized was not marked TRUE.`);
+          athleteEmail = null;
+          athleteCell = null;
+          guardianEmail = null;
+          guardianCell = null;
+        }
+
+        ready.push({
+          submitted_by: user.id,
+          athlete_name: athleteName,
+          grad_year: (row.grad_year && parseInt(trimStr(row.grad_year), 10)) || null,
+          position: trimStr(row.position) || null,
+          jersey_number: trimStr(row.jersey_number) || null,
+          height: trimStr(row.height) || null,
+          weight: trimStr(row.weight) || null,
+          gpa: (row.gpa && parseFloat(trimStr(row.gpa))) || null,
+          athlete_email: athleteEmail,
+          athlete_cell: athleteCell,
+          city: trimStr(row.city) || null,
+          state: rowState || null,
+          school_id: schoolId,
+          level_of_play: trimStr(row.level_of_play) || null,
+          hudl_url: trimStr(row.hudl_url) || null,
+          x_url: trimStr(row.x_url) || null,
+          coach_evaluation: trimStr(row.coach_evaluation) || null,
+          guardian_authorized: guardianAuthorized,
+          guardian_first_name: trimStr(row.guardian_first_name) || null,
+          guardian_last_name: trimStr(row.guardian_last_name) || null,
+          guardian_email: guardianEmail,
+          guardian_cell: guardianCell,
+          offers_received: trimStr(row.offers_received) || null,
+          committed_to: trimStr(row.committed_to) || null,
+          _label: label,
+        });
+      });
+
+      setReadyRows(ready);
+      setSkippedRows(skipped);
+      setWarnings(rowWarnings);
+    } catch (err) {
+      setUploadError(err.message || "Could not read this file.");
+    } finally {
+      setUploading(false);
+    }
+  }
+
+  async function runImport() {
+    setImporting(true);
+    setImportError("");
+    setImportResult(null);
+    try {
+      let count = 0;
+      for (let i = 0; i < readyRows.length; i += IMPORT_BATCH_SIZE) {
+        const batch = readyRows.slice(i, i + IMPORT_BATCH_SIZE).map(({ _label, ...rest }) => rest);
+        setImportProgress(`Importing ${i + 1}–${Math.min(i + IMPORT_BATCH_SIZE, readyRows.length)} of ${readyRows.length}…`);
+        const { error } = await supabase.from("prospects").insert(batch);
+        if (error) throw error;
+        count += batch.length;
+      }
+      setImportResult({ count });
+      setReadyRows([]);
+    } catch (err) {
+      setImportError(err.message || "Something went wrong importing these prospects.");
+    } finally {
+      setImporting(false);
+      setImportProgress("");
+    }
+  }
+
+  if (!canBulkAdd) {
+    return (
+      <div className="view">
+        <div className="notice danger">Bulk prospect import is limited to Verification Staff and System Admins.</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="view">
+      <Link href="/prospects" className="btn btn-sm" style={{ marginBottom: 12, display: "inline-flex" }}>
+        ← Back to Prospects
+      </Link>
       <div className="view-header">
-        <div><h1>Bulk Add Prospects</h1><p>Upload a CSV of prospect sheets from HS coaches to add many athletes at once.</p></div>
+        <div>
+          <h1>Bulk Add Prospects</h1>
+          <p>Upload a CSV of prospect sheets from HS coaches to add many athletes at once.</p>
+        </div>
       </div>
 
-      <div className="card"style={{marginBottom:14}}>
+      <div className="card" style={{ marginBottom: 14 }}>
         <h3>Export Current Prospects</h3>
-        <p style={{fontSize:12.5,color:"#697386",marginTop:-4}}>
-          Download every prospect currently in the database as a CSV — school, level of play, contact info, Hudl/X links, and coach evaluation notes included.
+        <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
+          Download every prospect currently in the database as a CSV — school, level of play, contact info, guardian contact, offers/commitment, Hudl/X links, and coach evaluation notes included.
         </p>
-        {Q&&<div className="notice danger"style={{marginBottom:10}}>{Q}</div>}
-        <button className="btn btn-primary btn-sm"onClick={ke}disabled={X}>
-          {X?"Exporting…":"Download Prospects CSV"}
+        {exportError && <div className="notice danger" style={{ marginBottom: 10 }}>{exportError}</div>}
+        <button className="btn btn-primary btn-sm" onClick={exportCurrentProspects} disabled={exportingCurrent}>
+          {exportingCurrent ? "Exporting…" : "Download Prospects CSV"}
         </button>
       </div>
 
-      <div className="grid grid-2"style={{marginBottom:14}}>
+      <div className="grid grid-2" style={{ marginBottom: 14 }}>
         <div className="card">
           <h3>Step 1 — Download the template</h3>
-          <p style={{fontSize:12.5,color:"#697386",marginTop:-4}}>
-            <code>athlete_name</code> is required. To link a prospect to a school, fill in <code>school_id</code> (preferred) or <code>school_name</code> + <code>state</code>. Set <code>guardian_authorized</code> to TRUE for any row that includes an email or cell — otherwise contact info is dropped on import. Column headers are flexible — plain-language headers like &quot;Athlete Name&quot;, &quot;School&quot;, or &quot;Level of Play&quot; are recognized automatically, so coaches can send their own sheets as-is.
+          <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
+            <code>athlete_name</code> is required. To link a prospect to a school, fill in <code>school_id</code> (preferred) or <code>school_name</code> + <code>state</code>. Set{" "}
+            <code>guardian_authorized</code> to TRUE for any row that includes athlete or guardian contact info — otherwise that contact info is dropped on import. Column headers are
+            flexible — plain-language headers like &quot;Athlete Name&quot;, &quot;School&quot;, or &quot;Level of Play&quot; are recognized automatically, so coaches can send their own
+            sheets as-is.
           </p>
-          <button className="btn btn-primary btn-sm"onClick={Ee}>Download CSV Template</button>
+          <button className="btn btn-primary btn-sm" onClick={downloadTemplate}>
+            Download CSV Template
+          </button>
         </div>
         <div className="card">
           <h3>Step 2 — Upload your prospect list</h3>
-          <p style={{fontSize:12.5,color:"#697386",marginTop:-4}}>
+          <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
             Any extra columns are ignored. You can re-upload as many times as you like — nothing is saved until you click Import.
           </p>
-          {M&&<div className="notice danger"style={{marginBottom:10}}>{M}</div>}
-          <input ref={w}type="file"accept=".csv"onChange={Ce}disabled={O}/>
-          {O&&<div className="empty-state"style={{marginTop:8}}>Reading {D}…</div>}
+          {uploadError && <div className="notice danger" style={{ marginBottom: 10 }}>{uploadError}</div>}
+          <input ref={fileInputRef} type="file" accept=".csv" onChange={handleFileChange} disabled={uploading} />
+          {uploading && <div className="empty-state" style={{ marginTop: 8 }}>Reading {fileName}…</div>}
         </div>
       </div>
 
-      {(d.length>0||S.length>0)&&!k&&<div className="card"style={{marginBottom:14}}>
-          <h3>Preview — {D}</h3>
-          <div className="grid grid-3"style={{marginBottom:12}}>
-            <div className="stat-card"><div className="label">Ready to import</div><div className="num">{d.length}</div></div>
-            <div className="stat-card"><div className="label">Skipped (errors)</div><div className="num">{S.length}</div><div className="sub">missing athlete_name</div></div>
-            <div className="stat-card"><div className="label">Warnings</div><div className="num">{N.length}</div><div className="sub">school/contact info notes</div></div>
+      {(readyRows.length > 0 || skippedRows.length > 0) && !importResult && (
+        <div className="card" style={{ marginBottom: 14 }}>
+          <h3>Preview — {fileName}</h3>
+          <div className="grid grid-3" style={{ marginBottom: 12 }}>
+            <div className="stat-card">
+              <div className="label">Ready to import</div>
+              <div className="num">{readyRows.length}</div>
+            </div>
+            <div className="stat-card">
+              <div className="label">Skipped (errors)</div>
+              <div className="num">{skippedRows.length}</div>
+              <div className="sub">missing athlete_name</div>
+            </div>
+            <div className="stat-card">
+              <div className="label">Warnings</div>
+              <div className="num">{warnings.length}</div>
+              <div className="sub">school/contact info notes</div>
+            </div>
           </div>
 
-          {G&&<div className="notice danger"style={{marginBottom:10}}>{G}</div>}
+          {importError && <div className="notice danger" style={{ marginBottom: 10 }}>{importError}</div>}
 
-          {S.length>0&&<div className="notice danger"style={{marginBottom:12}}>
-              <strong>{S.length} row(s) skipped:</strong>
-              <div style={{maxHeight:120,overflow:"auto",marginTop:6}}>
-                {S.slice(0,50).map((t,s)=><div key={s}style={{fontSize:12,padding:"3px 0"}}>{t.row}: {t.reason}</div>)}
+          {skippedRows.length > 0 && (
+            <div className="notice danger" style={{ marginBottom: 12 }}>
+              <strong>{skippedRows.length} row(s) skipped:</strong>
+              <div style={{ maxHeight: 120, overflow: "auto", marginTop: 6 }}>
+                {skippedRows.slice(0, 50).map((s, i) => (
+                  <div key={i} style={{ fontSize: 12, padding: "3px 0" }}>{s.row}: {s.reason}</div>
+                ))}
               </div>
-            </div>}
+            </div>
+          )}
 
-          {N.length>0&&<div className="notice"style={{marginBottom:12}}>
-              <strong>{N.length} note(s):</strong>
-              <div style={{maxHeight:120,overflow:"auto",marginTop:6}}>
-                {N.slice(0,50).map((t,s)=><div key={s}style={{fontSize:12,padding:"3px 0"}}>{t}</div>)}
+          {warnings.length > 0 && (
+            <div className="notice" style={{ marginBottom: 12 }}>
+              <strong>{warnings.length} note(s):</strong>
+              <div style={{ maxHeight: 120, overflow: "auto", marginTop: 6 }}>
+                {warnings.slice(0, 50).map((w, i) => (
+                  <div key={i} style={{ fontSize: 12, padding: "3px 0" }}>{w}</div>
+                ))}
               </div>
-            </div>}
+            </div>
+          )}
 
-          {d.length>0&&<>
-              <div className="table-wrap"style={{marginBottom:12,maxHeight:360,overflow:"auto"}}>
+          {readyRows.length > 0 && (
+            <>
+              <div className="table-wrap" style={{ marginBottom: 12, maxHeight: 360, overflow: "auto" }}>
                 <table>
-                  <thead><tr><th>Athlete</th><th>Grad Yr</th><th>Level</th><th>Position</th><th>City/State</th><th>Email</th><th>Cell</th><th>Guardian Auth.</th></tr></thead>
+                  <thead>
+                    <tr>
+                      <th>Athlete</th>
+                      <th>Grad Yr</th>
+                      <th>Level</th>
+                      <th>Position</th>
+                      <th>City/State</th>
+                      <th>Email</th>
+                      <th>Cell</th>
+                      <th>Guardian Auth.</th>
+                    </tr>
+                  </thead>
                   <tbody>
-                    {d.slice(0,500).map((t,s)=><tr key={s}>
-                        <td><strong>{t.athlete_name}</strong></td>
-                        <td>{t.grad_year||"—"}</td>
-                        <td>{t.level_of_play||"—"}</td>
-                        <td>{t.position||"—"}</td>
-                        <td>{t.city||"—"}{t.state?`, ${t.state}`:""}</td>
-                        <td>{t.athlete_email||"—"}</td>
-                        <td>{t.athlete_cell||"—"}</td>
-                        <td>{t.guardian_authorized?"Yes":"No"}</td>
-                      </tr>)}
+                    {readyRows.slice(0, 500).map((r, i) => (
+                      <tr key={i}>
+                        <td><strong>{r.athlete_name}</strong></td>
+                        <td>{r.grad_year || "—"}</td>
+                        <td>{r.level_of_play || "—"}</td>
+                        <td>{r.position || "—"}</td>
+                        <td>{r.city || "—"}{r.state ? `, ${r.state}` : ""}</td>
+                        <td>{r.athlete_email || "—"}</td>
+                        <td>{r.athlete_cell || "—"}</td>
+                        <td>{r.guardian_authorized ? "Yes" : "No"}</td>
+                      </tr>
+                    ))}
                   </tbody>
                 </table>
               </div>
-              {d.length>500&&<div className="notice"style={{marginBottom:12}}>Showing the first 500 of {d.length}. All {d.length} will be imported.</div>}
-              <button className="btn btn-gold"onClick={Le}disabled={K}>
-                {K?we||"Importing…":`Import ${d.length} prospect${d.length===1?"":"s"}`}
+              {readyRows.length > 500 && <div className="notice" style={{ marginBottom: 12 }}>Showing the first 500 of {readyRows.length}. All {readyRows.length} will be imported.</div>}
+              <button className="btn btn-gold" onClick={runImport} disabled={importing}>
+                {importing ? importProgress || "Importing…" : `Import ${readyRows.length} prospect${readyRows.length === 1 ? "" : "s"}`}
               </button>
-            </>}
-        </div>}
+            </>
+          )}
+        </div>
+      )}
 
-      {k&&<div className="notice info"style={{marginBottom:14}}>
-          Imported {k.count} prospect{k.count===1?"":"s"}. <_e href="/prospects">View the Prospects list</_e>.
-        </div>}
-    </div>:<div className="view">
-        <div className="notice danger">Bulk prospect import is limited to Verification Staff and System Admins.</div>
-      </div>}
+      {importResult && (
+        <div className="notice info" style={{ marginBottom: 14 }}>
+          Imported {importResult.count} prospect{importResult.count === 1 ? "" : "s"}. <Link href="/prospects">View the Prospects list</Link>.
+        </div>
+      )}
+    </div>
+  );
+}
