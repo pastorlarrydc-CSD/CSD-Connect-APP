@@ -58,7 +58,11 @@ export default function ProspectDetailPage() {
   const canSetRecruitingStatus = !!college?.id;
 
   const load = useCallback(async () => {
-    const { data } = await supabase.from("prospects").select("*, schools(id,name,city,state)").eq("id", id).maybeSingle();
+    const { data } = await supabase
+      .from("prospects")
+      .select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office)")
+      .eq("id", id)
+      .maybeSingle();
     setProspect(data || null);
     setLoading(false);
   }, [supabase, id]);
@@ -66,6 +70,37 @@ export default function ProspectDetailPage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // On Watchlist / Last Contact -- same data the Recruiting Board shows,
+  // sourced from the linked school so it stays in sync with one source of
+  // truth. Read-only here; managed from the school profile page.
+  const [schoolContext, setSchoolContext] = useState({ watchlisted: false, lastContact: null });
+  const [schoolContextLoading, setSchoolContextLoading] = useState(true);
+
+  const loadSchoolContext = useCallback(async () => {
+    if (!college?.id || !prospect?.school_id) {
+      setSchoolContext({ watchlisted: false, lastContact: null });
+      setSchoolContextLoading(false);
+      return;
+    }
+    setSchoolContextLoading(true);
+    const [{ data: watch }, { data: contacts }] = await Promise.all([
+      supabase.from("watchlist_items").select("id").eq("college_id", college.id).eq("school_id", prospect.school_id).maybeSingle(),
+      supabase
+        .from("contact_logs")
+        .select("contact_date,contact_type")
+        .eq("college_id", college.id)
+        .eq("school_id", prospect.school_id)
+        .order("contact_date", { ascending: false })
+        .limit(1),
+    ]);
+    setSchoolContext({ watchlisted: !!watch, lastContact: contacts?.[0] || null });
+    setSchoolContextLoading(false);
+  }, [supabase, college, prospect]);
+
+  useEffect(() => {
+    loadSchoolContext();
+  }, [loadSchoolContext]);
 
   const loadRecruitingStatus = useCallback(async () => {
     if (!college?.id) {
@@ -252,6 +287,20 @@ export default function ProspectDetailPage() {
                   <span className="empty-state">not linked to a school</span>
                 )}
               </div>
+              <div className="k">HS Head Coach</div>
+              <div className="v">
+                {prospect.schools?.hc_first_name || prospect.schools?.hc_last_name ? (
+                  `${prospect.schools?.hc_first_name || ""} ${prospect.schools?.hc_last_name || ""}`.trim()
+                ) : (
+                  <span className="empty-state">not on file</span>
+                )}
+              </div>
+              <div className="k">HC Email</div>
+              <div className="v">{prospect.schools?.hc_email || <span className="empty-state">not on file</span>}</div>
+              <div className="k">HC Cell</div>
+              <div className="v">{fmtPhone(prospect.schools?.hc_cell) || <span className="empty-state">not on file</span>}</div>
+              <div className="k">HC Office</div>
+              <div className="v">{fmtPhone(prospect.schools?.hc_office) || <span className="empty-state">not on file</span>}</div>
               {!editingLinks && (
                 <>
                   <div className="k">Hudl</div>
@@ -359,6 +408,40 @@ export default function ProspectDetailPage() {
             <h3>Coach Evaluation</h3>
             <p style={{ margin: 0, fontSize: 13.5 }}>{prospect.coach_evaluation || <span className="empty-state">No evaluation submitted.</span>}</p>
           </div>
+
+          {canSetRecruitingStatus && (
+            <div className="card" style={{ marginBottom: 14 }}>
+              <h3>Watchlist &amp; Contact ({college?.name || "your college"})</h3>
+              <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
+                Same data shown on the Recruiting Board, tied to this athlete&apos;s high school.
+              </p>
+              {schoolContextLoading ? (
+                <div className="empty-state">Loading…</div>
+              ) : !prospect.school_id ? (
+                <div className="empty-state">Not linked to a school yet.</div>
+              ) : (
+                <div className="kv">
+                  <div className="k">On Watchlist</div>
+                  <div className="v">
+                    {schoolContext.watchlisted ? <span className="badge badge-contacted">Watchlisted</span> : "No"}
+                  </div>
+                  <div className="k">Last Contact</div>
+                  <div className="v">
+                    {schoolContext.lastContact ? (
+                      `${schoolContext.lastContact.contact_date} — ${schoolContext.lastContact.contact_type}`
+                    ) : (
+                      <span className="badge badge-not-contacted">None logged</span>
+                    )}
+                  </div>
+                </div>
+              )}
+              {prospect.schools?.id && (
+                <Link href={`/schools/${prospect.schools.id}`} className="btn btn-sm" style={{ marginTop: 10, display: "inline-flex" }}>
+                  Manage on school profile →
+                </Link>
+              )}
+            </div>
+          )}
 
           {canSetRecruitingStatus && (
             <div className="card" style={{ marginBottom: 14 }}>
