@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/recheck-schools",
+      "schedule": "0 9 * * *"
+    }
+  ]
+}
