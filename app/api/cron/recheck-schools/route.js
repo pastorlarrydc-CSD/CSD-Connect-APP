@@ -14,11 +14,17 @@ export const maxDuration = 60;
 // variable, and this route rejects anything that doesn't match.
 //
 // Deliberately conservative, same as the manual route: never writes to the
-// schools table itself. A miss just opens a flag in the existing verifier
-// queue. Since school_flags.flagged_by is NOT NULL and there's no human to
-// attribute it to, automated flags/log rows are attributed to CSD's own
-// sysadmin account -- every reason/detail string makes clear it was an
-// automated check, not a person.
+// schools table itself. Every check is logged to school_recheck_log so the
+// data is there to review (attributed to CSD's own sysadmin account, since
+// there's no human to credit an automated check to) -- but this route does
+// NOT auto-open verifier flags the way the manual "Check for updates"
+// button does. In practice most school websites are the school's homepage,
+// not a staff/roster page, so a "not found" here is very often just the
+// coach's name not being on the homepage rather than the listing actually
+// being stale. Auto-flagging on every miss would flood the verifier queue
+// with false positives. Logging still builds up a real signal over time
+// (repeated misses across nights) that a future pass can act on more
+// precisely -- e.g. only flag after N consecutive misses.
 //
 // Processes up to BATCH_SIZE candidates per run, but stops picking up new
 // work once TIME_BUDGET_MS has elapsed so it always finishes comfortably
@@ -81,14 +87,8 @@ export async function GET(req) {
         result,
         detail: `[Automated nightly sweep] ${detail}`,
       });
-
-      if (result === "not_found") {
-        await supabase.from("school_flags").insert({
-          school_id: c.school_id,
-          flagged_by: SYSTEM_USER_ID,
-          reason: `Automated nightly recheck: "${c.hc_last_name}" was not found on ${c.website}. May be outdated -- please verify.`,
-        });
-      }
+      // Intentionally no school_flags insert here -- see the header comment
+      // above. Logging only until the matching signal is proven reliable.
     }
   }
 
