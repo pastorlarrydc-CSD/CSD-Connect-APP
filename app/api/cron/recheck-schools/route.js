@@ -16,15 +16,18 @@ export const maxDuration = 60;
 // Deliberately conservative, same as the manual route: never writes to the
 // schools table itself. Every check is logged to school_recheck_log so the
 // data is there to review (attributed to CSD's own sysadmin account, since
-// there's no human to credit an automated check to) -- but this route does
-// NOT auto-open verifier flags the way the manual "Check for updates"
-// button does. In practice most school websites are the school's homepage,
-// not a staff/roster page, so a "not found" here is very often just the
-// coach's name not being on the homepage rather than the listing actually
-// being stale. Auto-flagging on every miss would flood the verifier queue
-// with false positives. Logging still builds up a real signal over time
-// (repeated misses across nights) that a future pass can act on more
-// precisely -- e.g. only flag after N consecutive misses.
+// there's no human to credit an automated check to).
+//
+// In practice most school websites are the school's homepage, not a
+// staff/roster page, so a single "not found" is very often just the coach's
+// name not being on the homepage rather than the listing actually being
+// stale -- flagging on every miss would flood the verifier queue with false
+// positives. So this route only opens a flag once a school has come back
+// "not found" on MISS_THRESHOLD separate nightly checks IN A ROW (looking
+// at the most recent log rows for that school). A "confirmed" check in
+// between resets the streak. Once a flag is opened for a streak, it won't
+// open a second one on top of a still-pending automated flag for the same
+// school.
 //
 // Processes up to BATCH_SIZE candidates per run, but stops picking up new
 // work once TIME_BUDGET_MS has elapsed so it always finishes comfortably
@@ -33,6 +36,7 @@ export const maxDuration = 60;
 const BATCH_SIZE = 500;
 const CONCURRENCY = 8;
 const TIME_BUDGET_MS = 50_000;
+const MISS_THRESHOLD = 2; // consecutive nightly "not_found" results before opening a flag
 
 const SYSTEM_USER_ID = "d24ad753-f759-479d-8958-fae8f995faa1"; // CSD sysadmin account (Larry)
 
@@ -66,6 +70,7 @@ export async function GET(req) {
 
   const summary = { confirmed: 0, not_found: 0, no_website: 0, no_coach_on_file: 0, fetch_error: 0 };
   let processed = 0;
+  let flagsOpened = 0;
   let cursor = 0;
 
   async function worker() {
@@ -87,8 +92,36 @@ export async function GET(req) {
         result,
         detail: `[Automated nightly sweep] ${detail}`,
       });
-      // Intentionally no school_flags insert here -- see the header comment
-      // above. Logging only until the matching signal is proven reliable.
+
+      if (result === "not_found") {
+        const { data: recentChecks } = await supabase
+          .from("school_recheck_log")
+          .select("result, checked_at")
+          .eq("school_id", c.school_id)
+          .order("checked_at", { ascending: false })
+          .limit(MISS_THRESHOLD);
+
+        const streak = recentChecks?.length === MISS_THRESHOLD && recentChecks.every((row) => row.result === "not_found");
+
+        if (streak) {
+          const { data: existingFlag } = await supabase
+            .from("school_flags")
+            .select("id")
+            .eq("school_id", c.school_id)
+            .eq("status", "pending")
+            .ilike("reason", "Automated nightly recheck%")
+            .maybeSingle();
+
+          if (!existingFlag) {
+            await supabase.from("school_flags").insert({
+              school_id: c.school_id,
+              flagged_by: SYSTEM_USER_ID,
+              reason: `Automated nightly recheck: "${c.hc_last_name}" was not found on ${c.website} on ${MISS_THRESHOLD} checks in a row. May be outdated -- please verify.`,
+            });
+            flagsOpened++;
+          }
+        }
+      }
     }
   }
 
@@ -99,6 +132,7 @@ export async function GET(req) {
     candidates_available: candidates.length,
     stopped_early: cursor < candidates.length,
     duration_ms: Date.now() - startedAt,
+    flags_opened: flagsOpened,
     summary,
   };
   console.log("cron recheck-schools:", JSON.stringify(result));
