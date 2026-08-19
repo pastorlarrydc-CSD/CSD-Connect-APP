@@ -12,6 +12,7 @@ function fmtPhone(v) {
 }
 
 const INTAKE_STATUSES = ["submitted", "reviewed", "contacted"];
+const LEVELS_OF_PLAY = ["", "FBS", "FCS", "D2", "D3", "NAIA", "JUCO", "Prep/Post-Grad"];
 
 // Per-college recruiting interest -- separate from the intake status above.
 // Intake status ("submitted/reviewed/contacted") tracks whether college
@@ -57,7 +58,7 @@ export default function ProspectDetailPage() {
   const [outcomeError, setOutcomeError] = useState("");
 
   const [editingLinks, setEditingLinks] = useState(false);
-  const [linksForm, setLinksForm] = useState({ hudl_url: "", x_url: "" });
+  const [linksForm, setLinksForm] = useState({ hudl_url: "", x_url: "", level_of_play: "" });
   const [linksSaving, setLinksSaving] = useState(false);
   const [linksError, setLinksError] = useState("");
 
@@ -231,7 +232,7 @@ export default function ProspectDetailPage() {
   }
 
   function startEditLinks() {
-    setLinksForm({ hudl_url: prospect.hudl_url || "", x_url: prospect.x_url || "" });
+    setLinksForm({ hudl_url: prospect.hudl_url || "", x_url: prospect.x_url || "", level_of_play: prospect.level_of_play || "" });
     setLinksError("");
     setEditingLinks(true);
   }
@@ -242,7 +243,11 @@ export default function ProspectDetailPage() {
     setLinksSaving(true);
     const { error } = await supabase
       .from("prospects")
-      .update({ hudl_url: linksForm.hudl_url.trim() || null, x_url: linksForm.x_url.trim() || null })
+      .update({
+        hudl_url: linksForm.hudl_url.trim() || null,
+        x_url: linksForm.x_url.trim() || null,
+        level_of_play: linksForm.level_of_play || null,
+      })
       .eq("id", id);
     setLinksSaving(false);
     if (error) {
@@ -311,7 +316,7 @@ export default function ProspectDetailPage() {
               <h3 style={{ margin: 0 }}>Athlete Info</h3>
               {canManageIntake && !editingLinks && (
                 <button className="btn btn-sm" onClick={startEditLinks}>
-                  Edit links
+                  Edit
                 </button>
               )}
             </div>
@@ -320,8 +325,6 @@ export default function ProspectDetailPage() {
               <div className="v">{prospect.height || "—"} {prospect.weight ? `/ ${prospect.weight}` : ""}</div>
               <div className="k">GPA</div>
               <div className="v">{prospect.gpa ?? "—"}</div>
-              <div className="k">Level of Play</div>
-              <div className="v">{prospect.level_of_play || "—"}</div>
               <div className="k">City / State</div>
               <div className="v">
                 {prospect.city || prospect.schools?.city || "—"}
@@ -351,6 +354,8 @@ export default function ProspectDetailPage() {
               <div className="v">{fmtPhone(prospect.schools?.hc_office) || <span className="empty-state">not on file</span>}</div>
               {!editingLinks && (
                 <>
+                  <div className="k">Level of Play</div>
+                  <div className="v">{prospect.level_of_play || "—"}</div>
                   <div className="k">Hudl</div>
                   <div className="v">
                     {prospect.hudl_url ? (
@@ -378,6 +383,16 @@ export default function ProspectDetailPage() {
             {editingLinks && (
               <form onSubmit={saveLinks} style={{ marginTop: 10, borderTop: "1px solid #eef0f3", paddingTop: 12 }}>
                 {linksError && <div className="notice danger" style={{ marginBottom: 10 }}>{linksError}</div>}
+                <div className="form-field">
+                  <label>Level of Play</label>
+                  <select value={linksForm.level_of_play} onChange={(e) => setLinksForm((f) => ({ ...f, level_of_play: e.target.value }))}>
+                    {LEVELS_OF_PLAY.map((l) => (
+                      <option key={l} value={l}>
+                        {l || "— Select —"}
+                      </option>
+                    ))}
+                  </select>
+                </div>
                 <div className="form-field">
                   <label>Hudl URL</label>
                   <input value={linksForm.hudl_url} onChange={(e) => setLinksForm((f) => ({ ...f, hudl_url: e.target.value }))} placeholder="https://www.hudl.com/profile/…" />
