@@ -126,6 +126,8 @@ export default function BulkAddProspectsPage() {
   const [readyRows, setReadyRows] = useState([]);
   const [skippedRows, setSkippedRows] = useState([]);
   const [warnings, setWarnings] = useState([]);
+  const [checkingDuplicates, setCheckingDuplicates] = useState(false);
+  const [confirmDuplicates, setConfirmDuplicates] = useState(false);
 
   const [importing, setImporting] = useState(false);
   const [importProgress, setImportProgress] = useState("");
@@ -280,7 +282,37 @@ export default function BulkAddProspectsPage() {
     setImportResult(null);
     setImportError("");
     setFileName("");
+    setConfirmDuplicates(false);
     if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
+  // Duplicate-athlete check -- for every row that resolved to a real school,
+  // fuzzy-match it against prospects already on file there (see
+  // find_similar_prospects in Supabase). Run with a small concurrency cap so
+  // a few hundred rows don't fire a few hundred requests all at once.
+  async function annotateDuplicates(rows) {
+    const CONCURRENCY = 6;
+    const matches = new Array(rows.length).fill(null);
+    let next = 0;
+    async function worker() {
+      while (next < rows.length) {
+        const i = next++;
+        const row = rows[i];
+        if (!row.school_id) continue;
+        try {
+          const { data } = await supabase.rpc("find_similar_prospects", {
+            p_school_id: row.school_id,
+            p_athlete_name: row.athlete_name,
+            p_grad_year: row.grad_year || null,
+          });
+          if (data && data.length) matches[i] = data[0];
+        } catch (_) {
+          // best-effort -- a failed check shouldn't block the import preview
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(CONCURRENCY, rows.length) }, worker));
+    return rows.map((row, i) => ({ ...row, possibleDuplicate: matches[i] }));
   }
 
   const fetchAllSchools = useCallback(async () => {
@@ -416,9 +448,13 @@ export default function BulkAddProspectsPage() {
         });
       });
 
-      setReadyRows(ready);
       setSkippedRows(skipped);
       setWarnings(rowWarnings);
+
+      setCheckingDuplicates(true);
+      const readyWithDuplicates = await annotateDuplicates(ready);
+      setCheckingDuplicates(false);
+      setReadyRows(readyWithDuplicates);
     } catch (err) {
       setUploadError(err.message || "Could not read this file.");
     } finally {
@@ -433,7 +469,7 @@ export default function BulkAddProspectsPage() {
     try {
       let count = 0;
       for (let i = 0; i < readyRows.length; i += IMPORT_BATCH_SIZE) {
-        const batch = readyRows.slice(i, i + IMPORT_BATCH_SIZE).map(({ _label, ...rest }) => rest);
+        const batch = readyRows.slice(i, i + IMPORT_BATCH_SIZE).map(({ _label, possibleDuplicate, ...rest }) => rest);
         setImportProgress(`Importing ${i + 1}–${Math.min(i + IMPORT_BATCH_SIZE, readyRows.length)} of ${readyRows.length}…`);
         const { error } = await supabase.from("prospects").insert(batch);
         if (error) throw error;
@@ -456,6 +492,8 @@ export default function BulkAddProspectsPage() {
       </div>
     );
   }
+
+  const duplicateCount = readyRows.filter((r) => r.possibleDuplicate).length;
 
   return (
     <div className="view">
@@ -504,10 +542,16 @@ export default function BulkAddProspectsPage() {
         </div>
       </div>
 
-      {(readyRows.length > 0 || skippedRows.length > 0) && !importResult && (
+      {checkingDuplicates && (
+        <div className="card" style={{ marginBottom: 14 }}>
+          <div className="empty-state">Checking for possible duplicate athletes already on file…</div>
+        </div>
+      )}
+
+      {(readyRows.length > 0 || skippedRows.length > 0) && !importResult && !checkingDuplicates && (
         <div className="card" style={{ marginBottom: 14 }}>
           <h3>Preview — {fileName}</h3>
-          <div className="grid grid-3" style={{ marginBottom: 12 }}>
+          <div className="grid grid-4" style={{ marginBottom: 12 }}>
             <div className="stat-card">
               <div className="label">Ready to import</div>
               <div className="num">{readyRows.length}</div>
@@ -521,6 +565,11 @@ export default function BulkAddProspectsPage() {
               <div className="label">Warnings</div>
               <div className="num">{warnings.length}</div>
               <div className="sub">school/contact info notes</div>
+            </div>
+            <div className="stat-card">
+              <div className="label">Possible duplicates</div>
+              <div className="num">{duplicateCount}</div>
+              <div className="sub">already on file at that school</div>
             </div>
           </div>
 
@@ -562,6 +611,7 @@ export default function BulkAddProspectsPage() {
                       <th>Email</th>
                       <th>Cell</th>
                       <th>Guardian Auth.</th>
+                      <th>Duplicate?</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -575,13 +625,35 @@ export default function BulkAddProspectsPage() {
                         <td>{r.athlete_email || "—"}</td>
                         <td>{r.athlete_cell || "—"}</td>
                         <td>{r.guardian_authorized ? "Yes" : "No"}</td>
+                        <td>
+                          {r.possibleDuplicate ? (
+                            <span className="badge badge-not-contacted" title={`Similar to prospect #${r.possibleDuplicate.id}, submitted ${new Date(r.possibleDuplicate.created_at).toLocaleDateString()}`}>
+                              Possible dup — {r.possibleDuplicate.athlete_name}
+                              {r.possibleDuplicate.grad_year ? ` (${r.possibleDuplicate.grad_year})` : ""}
+                            </span>
+                          ) : (
+                            "—"
+                          )}
+                        </td>
                       </tr>
                     ))}
                   </tbody>
                 </table>
               </div>
               {readyRows.length > 500 && <div className="notice" style={{ marginBottom: 12 }}>Showing the first 500 of {readyRows.length}. All {readyRows.length} will be imported.</div>}
-              <button className="btn btn-gold" onClick={runImport} disabled={importing}>
+
+              {duplicateCount > 0 && (
+                <div className="notice" style={{ marginBottom: 12 }}>
+                  <strong>{duplicateCount} row{duplicateCount === 1 ? "" : "s"}</strong> look like they might already be on file — flagged &quot;Duplicate?&quot; above. Nothing is
+                  blocked automatically; review them, then confirm below to import everything anyway.
+                  <label style={{ display: "flex", gap: 6, alignItems: "center", fontSize: 12.5, marginTop: 8 }}>
+                    <input type="checkbox" checked={confirmDuplicates} onChange={(e) => setConfirmDuplicates(e.target.checked)} />
+                    I&apos;ve reviewed the flagged possible duplicates and want to import all {readyRows.length} rows anyway.
+                  </label>
+                </div>
+              )}
+
+              <button className="btn btn-gold" onClick={runImport} disabled={importing || (duplicateCount > 0 && !confirmDuplicates)}>
                 {importing ? importProgress || "Importing…" : `Import ${readyRows.length} prospect${readyRows.length === 1 ? "" : "s"}`}
               </button>
             </>
