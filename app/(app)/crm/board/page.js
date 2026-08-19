@@ -46,7 +46,7 @@ export default function RecruitingBoardPage() {
       const { data: prospects, error: prospectsErr } = await supabase
         .from("prospects")
         .select(
-          "id,athlete_name,grad_year,position,level_of_play,gpa,height,weight,hudl_url,x_url,athlete_email,athlete_cell,guardian_authorized,status,created_at,school_id,schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office)"
+          "id,athlete_name,grad_year,position,level_of_play,gpa,height,weight,hudl_url,x_url,athlete_email,athlete_cell,guardian_authorized,offers_received,committed_to,status,created_at,school_id,schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office)"
         )
         .order("created_at", { ascending: false })
         .limit(2000);
@@ -338,6 +338,7 @@ export default function RecruitingBoardPage() {
                             {r.athlete_email}{r.athlete_email && r.athlete_cell ? " · " : ""}{fmtPhone(r.athlete_cell)}
                           </div>
                         ) : null}
+                        {r.committed_to && <div style={{ fontSize: 11, color: "#1e7145", fontWeight: 600 }}>Committed — {r.committed_to}</div>}
                       </td>
                       <td>
                         {r.grad_year || "—"}{r.position ? ` · ${r.position}` : ""}{r.level_of_play ? ` · ${r.level_of_play}` : ""}
