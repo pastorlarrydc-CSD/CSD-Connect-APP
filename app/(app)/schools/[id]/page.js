@@ -21,6 +21,28 @@ const SUGGESTION_STATUS_LABEL = { pending: "Pending review", approved: "Approved
 const CLAIM_STATUS_LABEL = { pending: "Pending review", approved: "Approved", rejected: "Not approved" };
 const EMPTY_COACH_FORM = { hc_first_name: "", hc_last_name: "", hc_email: "", hc_cell: "", hc_office: "", note: "" };
 
+function confidenceColor(score) {
+  if (score >= 70) return "#1d7a4c";
+  if (score >= 40) return "#a17a00";
+  return "#b3312c";
+}
+
+const RECHECK_RESULT_LABEL = {
+  confirmed: "Head coach confirmed on the school's website.",
+  not_found: "Head coach was NOT found on the school's website — flagged for a verifier.",
+  no_website: "No website on file for this school, so nothing to check.",
+  no_coach_on_file: "No head coach on file to check against the website.",
+  fetch_error: "Couldn't reach the school's website.",
+};
+
+const RECHECK_RESULT_CLASS = {
+  confirmed: "notice",
+  not_found: "notice danger",
+  no_website: "notice",
+  no_coach_on_file: "notice",
+  fetch_error: "notice danger",
+};
+
 export default function SchoolProfilePage() {
   const { id } = useParams();
   const router = useRouter();
@@ -62,6 +84,13 @@ export default function SchoolProfilePage() {
   const [myFlag, setMyFlag] = useState(null);
   const [submittingFlag, setSubmittingFlag] = useState(false);
   const [flagError, setFlagError] = useState("");
+
+  // Automated "check for updates" -- pings the school's own website looking
+  // for the on-file head coach's name (see /api/schools/[id]/recheck).
+  const [lastRecheck, setLastRecheck] = useState(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [recheckResult, setRecheckResult] = useState(null);
+  const [recheckError, setRecheckError] = useState("");
 
   const isOwner = !!(profile?.school_id && school?.id && Number(profile.school_id) === Number(school.id));
   const canClaim = profile?.role === "hs_coach" && !profile?.school_id;
@@ -119,6 +148,14 @@ export default function SchoolProfilePage() {
       setMyClaim(claim || null);
       setMyFlag(flag || null);
     }
+
+    const { data: recheckRows } = await supabase
+      .from("school_recheck_log")
+      .select("*")
+      .eq("school_id", id)
+      .order("checked_at", { ascending: false })
+      .limit(1);
+    setLastRecheck((recheckRows && recheckRows[0]) || null);
 
     if (college?.id) {
       const [{ data: logs }, { data: assign }, { data: watch }, { data: noteRows }] = await Promise.all([
@@ -280,6 +317,29 @@ export default function SchoolProfilePage() {
     }
   }
 
+  async function checkForUpdates() {
+    setRecheckError("");
+    setRecheckResult(null);
+    setCheckingUpdate(true);
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const res = await fetch(`/api/schools/${id}/recheck`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session?.access_token}` },
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.error || "Could not run this check.");
+      setRecheckResult(body);
+      load();
+    } catch (err) {
+      setRecheckError(err.message || "Could not run this check.");
+    } finally {
+      setCheckingUpdate(false);
+    }
+  }
+
   if (loading) return <div className="view"><div className="empty-state">Loading school profile…</div></div>;
   if (!school) return <div className="view"><div className="notice danger">School not found.</div></div>;
 
@@ -305,10 +365,35 @@ export default function SchoolProfilePage() {
             <h3>Verification</h3>
             <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6, flexWrap: "wrap" }}>
               <span className="badge badge-unverified">{school.verification_status === "verified" ? "Verified" : "Not yet verified"}</span>
-              <span style={{ fontSize: 12, color: "#697386" }}>{school.confidence_score}% data completeness</span>
+              <span style={{ fontSize: 12, fontWeight: 600, color: confidenceColor(school.confidence_score ?? 0) }}>
+                Confidence score: {school.confidence_score ?? 0}%
+              </span>
               {school.claimed_by && <span className="badge badge-contacted">Coach-verified listing</span>}
             </div>
             <div className="notice">Source: {school.source || "CSD Master Coaches Database"}.</div>
+
+            <div style={{ marginTop: 10, borderTop: "1px solid #eef0f3", paddingTop: 10 }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+                <button className="btn btn-sm" onClick={checkForUpdates} disabled={checkingUpdate}>
+                  {checkingUpdate ? "Checking website…" : "Check for updates"}
+                </button>
+                {lastRecheck && (
+                  <span style={{ fontSize: 11.5, color: "#697386" }}>
+                    Last checked {new Date(lastRecheck.checked_at).toLocaleDateString()} — {RECHECK_RESULT_LABEL[lastRecheck.result] || lastRecheck.result}
+                  </span>
+                )}
+              </div>
+              <p style={{ fontSize: 11.5, color: "#9aa5b1", marginTop: 6 }}>
+                Checks this school&apos;s own website for the on-file head coach&apos;s name — an automated first pass, not a replacement for verifier review.
+              </p>
+              {recheckError && <div className="notice danger" style={{ marginTop: 8 }}>{recheckError}</div>}
+              {recheckResult && (
+                <div className={RECHECK_RESULT_CLASS[recheckResult.result] || "notice"} style={{ marginTop: 8 }}>
+                  {RECHECK_RESULT_LABEL[recheckResult.result] || recheckResult.result}
+                  {recheckResult.detail ? ` ${recheckResult.detail}` : ""}
+                </div>
+              )}
+            </div>
 
             {!showFlagForm && !(myFlag && myFlag.status === "pending") && (
               <button className="btn btn-sm" style={{ marginTop: 10 }} onClick={() => setShowFlagForm(true)}>
