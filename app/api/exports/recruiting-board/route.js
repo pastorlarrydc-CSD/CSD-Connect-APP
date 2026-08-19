@@ -62,7 +62,7 @@ export async function GET(req) {
     const { data: prospects, error: prospectsErr } = await supabase
       .from("prospects")
       .select(
-        "id,athlete_name,grad_year,position,level_of_play,gpa,height,weight,hudl_url,x_url,athlete_email,athlete_cell,guardian_authorized,status,created_at,school_id,schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office)"
+        "id,athlete_name,grad_year,position,level_of_play,gpa,height,weight,hudl_url,x_url,athlete_email,athlete_cell,guardian_authorized,guardian_first_name,guardian_last_name,guardian_email,guardian_cell,offers_received,committed_to,status,created_at,school_id,schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office)"
       )
       .order("created_at", { ascending: false })
       .limit(5000);
@@ -133,6 +133,11 @@ export async function GET(req) {
       { header: "Athlete Email", key: "athlete_email", width: 26 },
       { header: "Athlete Cell", key: "athlete_cell", width: 16 },
       { header: "Guardian Auth.", key: "guardian", width: 12 },
+      { header: "Guardian Name", key: "guardian_name", width: 20 },
+      { header: "Guardian Email", key: "guardian_email", width: 26 },
+      { header: "Guardian Cell", key: "guardian_cell", width: 16 },
+      { header: "Offers Received", key: "offers_received", width: 30 },
+      { header: "Committed To", key: "committed_to", width: 20 },
       { header: "Hudl", key: "hudl", width: 28 },
       { header: "X (Twitter)", key: "x_url", width: 24 },
       { header: "High School", key: "school", width: 26 },
@@ -150,7 +155,7 @@ export async function GET(req) {
       { header: "Submitted", key: "submitted", width: 12 },
     ];
     styleHeaderRow(boardSheet.getRow(1));
-    boardSheet.autoFilter = { from: "A1", to: "Y1" };
+    boardSheet.autoFilter = { from: "A1", to: "AD1" };
 
     (prospects || []).forEach((p) => {
       const watchlisted = p.school_id ? watchlistSet.has(p.school_id) : false;
@@ -167,6 +172,11 @@ export async function GET(req) {
         athlete_email: p.athlete_email || "",
         athlete_cell: fmtPhone(p.athlete_cell),
         guardian: p.guardian_authorized ? "Confirmed" : "Not confirmed",
+        guardian_name: [p.guardian_first_name, p.guardian_last_name].filter(Boolean).join(" "),
+        guardian_email: p.guardian_email || "",
+        guardian_cell: fmtPhone(p.guardian_cell),
+        offers_received: p.offers_received || "",
+        committed_to: p.committed_to || "",
         hudl: p.hudl_url || "",
         x_url: p.x_url || "",
         school: p.schools?.name || "",
