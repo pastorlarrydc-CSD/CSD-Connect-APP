@@ -31,8 +31,16 @@ const TIME_BUDGET_MS = 50_000;
 const SYSTEM_USER_ID = "d24ad753-f759-479d-8958-fae8f995faa1"; // CSD sysadmin account (Larry)
 
 export async function GET(req) {
+  // Vercel's real nightly invocation sends the secret as a Bearer header.
+  // Also accept it as a ?secret= query param so this can be smoke-tested
+  // from a plain browser/URL (e.g. right after setup, or spot-checking
+  // later) without needing a tool that can set custom headers.
   const authHeader = req.headers.get("authorization") || "";
-  if (!process.env.CRON_SECRET || authHeader !== `Bearer ${process.env.CRON_SECRET}`) {
+  const { searchParams } = new URL(req.url);
+  const querySecret = searchParams.get("secret") || "";
+  const expected = process.env.CRON_SECRET;
+  const authorized = !!expected && (authHeader === `Bearer ${expected}` || querySecret === expected);
+  if (!authorized) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
