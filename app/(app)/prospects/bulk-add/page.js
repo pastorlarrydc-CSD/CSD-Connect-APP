@@ -30,6 +30,11 @@ const ALLOWED_FIELDS = [
   "guardian_cell",
   "offers_received",
   "committed_to",
+  "forty_yard_dash",
+  "vertical_jump",
+  "broad_jump",
+  "bench_press_reps",
+  "shuttle_time",
 ];
 
 const IMPORT_BATCH_SIZE = 300;
@@ -60,6 +65,11 @@ const HEADER_ALIASES = {
   offers_received: ["offers received", "offers", "offer list"],
   committed_to: ["committed to", "commitment", "committed", "commit"],
   grad_year: ["graduation year", "grad year", "class of", "class", "grad"],
+  forty_yard_dash: ["40 yard dash", "40 time", "forty", "forty yard dash", "40yd", "40yd dash", "40"],
+  vertical_jump: ["vertical jump", "vertical", "vert"],
+  broad_jump: ["broad jump", "standing broad jump", "broad"],
+  bench_press_reps: ["bench press reps", "bench reps", "bench", "bench press"],
+  shuttle_time: ["shuttle time", "shuttle", "pro agility", "pro agility shuttle", "5-10-5", "5 10 5"],
 };
 
 function normalizeHeaderText(v) {
@@ -84,6 +94,20 @@ function resolveHeader(raw) {
 
 function trimStr(v) {
   return v == null ? "" : String(v).trim();
+}
+
+function parseNum(v) {
+  const s = trimStr(v);
+  if (!s) return null;
+  const n = parseFloat(s);
+  return Number.isFinite(n) ? n : null;
+}
+
+function parseIntOrNull(v) {
+  const s = trimStr(v);
+  if (!s) return null;
+  const n = parseInt(s, 10);
+  return Number.isFinite(n) ? n : null;
 }
 
 const HIGH_SCHOOL_SUFFIXES = [
@@ -146,7 +170,7 @@ export default function BulkAddProspectsPage() {
       const { data, error } = await supabase
         .from("prospects")
         .select(
-          "athlete_name,grad_year,position,jersey_number,height,weight,gpa,athlete_email,athlete_cell,city,state,level_of_play,hudl_url,x_url,coach_evaluation,guardian_authorized,guardian_first_name,guardian_last_name,guardian_email,guardian_cell,offers_received,committed_to,status,created_at,schools(name,city,state)"
+          "athlete_name,grad_year,position,jersey_number,height,weight,gpa,athlete_email,athlete_cell,city,state,level_of_play,hudl_url,x_url,coach_evaluation,guardian_authorized,guardian_first_name,guardian_last_name,guardian_email,guardian_cell,offers_received,committed_to,forty_yard_dash,vertical_jump,broad_jump,bench_press_reps,shuttle_time,is_underexposed,status,created_at,schools(name,city,state)"
         )
         .order("created_at", { ascending: false })
         .range(offset, offset + 999);
@@ -176,6 +200,11 @@ export default function BulkAddProspectsPage() {
           "height",
           "weight",
           "gpa",
+          "forty_yard_dash",
+          "vertical_jump",
+          "broad_jump",
+          "bench_press_reps",
+          "shuttle_time",
           "athlete_email",
           "athlete_cell",
           "guardian_authorized",
@@ -188,6 +217,7 @@ export default function BulkAddProspectsPage() {
           "coach_evaluation",
           "offers_received",
           "committed_to",
+          "underexposed_flag",
           "status",
           "submitted_date",
         ],
@@ -203,6 +233,11 @@ export default function BulkAddProspectsPage() {
           r.height || "",
           r.weight || "",
           r.gpa ?? "",
+          r.forty_yard_dash ?? "",
+          r.vertical_jump ?? "",
+          r.broad_jump ?? "",
+          r.bench_press_reps ?? "",
+          r.shuttle_time ?? "",
           r.athlete_email || "",
           r.athlete_cell || "",
           r.guardian_authorized ? "TRUE" : "FALSE",
@@ -215,6 +250,7 @@ export default function BulkAddProspectsPage() {
           r.coach_evaluation || "",
           r.offers_received || "",
           r.committed_to || "",
+          r.is_underexposed ? "Yes" : "No",
           r.status || "",
           r.created_at ? new Date(r.created_at).toISOString().slice(0, 10) : "",
         ]),
@@ -256,6 +292,11 @@ export default function BulkAddProspectsPage() {
           "5555559876",
           "",
           "",
+          "4.53",
+          "34.5",
+          "118",
+          "14",
+          "4.25",
         ],
       ],
     });
@@ -444,6 +485,11 @@ export default function BulkAddProspectsPage() {
           guardian_cell: guardianCell,
           offers_received: trimStr(row.offers_received) || null,
           committed_to: trimStr(row.committed_to) || null,
+          forty_yard_dash: parseNum(row.forty_yard_dash),
+          vertical_jump: parseNum(row.vertical_jump),
+          broad_jump: parseNum(row.broad_jump),
+          bench_press_reps: parseIntOrNull(row.bench_press_reps),
+          shuttle_time: parseNum(row.shuttle_time),
           _label: label,
         });
       });
@@ -510,7 +556,8 @@ export default function BulkAddProspectsPage() {
       <div className="card" style={{ marginBottom: 14 }}>
         <h3>Export Current Prospects</h3>
         <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
-          Download every prospect currently in the database as a CSV — school, level of play, contact info, guardian contact, offers/commitment, Hudl/X links, and coach evaluation notes included.
+          Download every prospect currently in the database as a CSV — school, level of play, measurables, contact info, guardian contact, offers/commitment, Hudl/X links, and coach
+          evaluation notes included.
         </p>
         {exportError && <div className="notice danger" style={{ marginBottom: 10 }}>{exportError}</div>}
         <button className="btn btn-primary btn-sm" onClick={exportCurrentProspects} disabled={exportingCurrent}>
@@ -524,8 +571,8 @@ export default function BulkAddProspectsPage() {
           <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
             <code>athlete_name</code> is required. To link a prospect to a school, fill in <code>school_id</code> (preferred) or <code>school_name</code> + <code>state</code>. Set{" "}
             <code>guardian_authorized</code> to TRUE for any row that includes athlete or guardian contact info — otherwise that contact info is dropped on import. Column headers are
-            flexible — plain-language headers like &quot;Athlete Name&quot;, &quot;School&quot;, or &quot;Level of Play&quot; are recognized automatically, so coaches can send their own
-            sheets as-is.
+            flexible — plain-language headers like &quot;Athlete Name&quot;, &quot;School&quot;, &quot;40 Time&quot;, or &quot;Vertical&quot; are recognized automatically, so coaches can
+            send their own sheets as-is.
           </p>
           <button className="btn btn-primary btn-sm" onClick={downloadTemplate}>
             Download CSV Template
