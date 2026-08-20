@@ -206,8 +206,14 @@ export default function AdminPage() {
               <Link href="/admin/data-quality" className="btn btn-sm btn-primary" style={{ marginRight: 8 }}>
                 Data Quality Review
               </Link>
+              <Link href="/schools/new" className="btn btn-sm btn-primary" style={{ marginRight: 8 }}>
+                Add School
+              </Link>
+              <Link href="/admin/bulk-add-schools" className="btn btn-sm btn-primary" style={{ marginRight: 8 }}>
+                Bulk Add Schools (CSV)
+              </Link>
               <Link href="/admin/bulk-update" className="btn btn-sm btn-primary">
-                Bulk Update Coaches (CSV)
+                Bulk Update Schools (CSV)
               </Link>
             </div>
           </div>
