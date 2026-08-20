@@ -15,6 +15,11 @@ const EMPTY_FORM = {
   height: "",
   weight: "",
   gpa: "",
+  forty_yard_dash: "",
+  vertical_jump: "",
+  broad_jump: "",
+  bench_press_reps: "",
+  shuttle_time: "",
   athlete_email: "",
   athlete_cell: "",
   city: "",
@@ -138,6 +143,11 @@ export default function ProspectsPage() {
       height: form.height || null,
       weight: form.weight || null,
       gpa: form.gpa ? parseFloat(form.gpa) : null,
+      forty_yard_dash: form.forty_yard_dash ? parseFloat(form.forty_yard_dash) : null,
+      vertical_jump: form.vertical_jump ? parseFloat(form.vertical_jump) : null,
+      broad_jump: form.broad_jump ? parseFloat(form.broad_jump) : null,
+      bench_press_reps: form.bench_press_reps ? parseInt(form.bench_press_reps, 10) : null,
+      shuttle_time: form.shuttle_time ? parseFloat(form.shuttle_time) : null,
       athlete_email: form.athlete_email || null,
       athlete_cell: form.athlete_cell || null,
       city: form.city || null,
@@ -191,11 +201,16 @@ export default function ProspectsPage() {
           <h1>Prospect Management</h1>
           <p>Submission portal for high-school coaches, and watchlist tools for college staff</p>
         </div>
-        {canBulkAdd && (
-          <Link href="/prospects/bulk-add" className="btn btn-sm btn-primary">
-            Bulk Add Prospects (CSV)
+        <div style={{ display: "flex", gap: 8 }}>
+          <Link href="/prospects/compare" className="btn btn-sm">
+            Compare Prospects
           </Link>
-        )}
+          {canBulkAdd && (
+            <Link href="/prospects/bulk-add" className="btn btn-sm btn-primary">
+              Bulk Add Prospects (CSV)
+            </Link>
+          )}
+        </div>
       </div>
 
       <div className="grid grid-2">
@@ -307,6 +322,32 @@ export default function ProspectsPage() {
               </div>
             </div>
 
+            <div style={{ borderTop: "1px solid #eef0f3", paddingTop: 10, marginBottom: 10 }}>
+              <div style={{ fontSize: 12.5, fontWeight: 600, color: "#3a4557", marginBottom: 6 }}>Measurables (optional)</div>
+              <div className="grid grid-2">
+                <div className="form-field">
+                  <label>40-Yard Dash (sec)</label>
+                  <input value={form.forty_yard_dash} onChange={(e) => setForm((f) => ({ ...f, forty_yard_dash: e.target.value }))} placeholder="4.53" />
+                </div>
+                <div className="form-field">
+                  <label>Vertical Jump (in)</label>
+                  <input value={form.vertical_jump} onChange={(e) => setForm((f) => ({ ...f, vertical_jump: e.target.value }))} placeholder="34.5" />
+                </div>
+                <div className="form-field">
+                  <label>Broad Jump (in)</label>
+                  <input value={form.broad_jump} onChange={(e) => setForm((f) => ({ ...f, broad_jump: e.target.value }))} placeholder="118" />
+                </div>
+                <div className="form-field">
+                  <label>Bench Press (reps @225)</label>
+                  <input value={form.bench_press_reps} onChange={(e) => setForm((f) => ({ ...f, bench_press_reps: e.target.value }))} placeholder="14" />
+                </div>
+                <div className="form-field">
+                  <label>Shuttle (sec)</label>
+                  <input value={form.shuttle_time} onChange={(e) => setForm((f) => ({ ...f, shuttle_time: e.target.value }))} placeholder="4.25" />
+                </div>
+              </div>
+            </div>
+
             <div className="form-field">
               <label>Coach Evaluation</label>
               <input value={form.coach_evaluation} onChange={(e) => setForm((f) => ({ ...f, coach_evaluation: e.target.value }))} placeholder="Athletic upside, coachability…" />
@@ -408,6 +449,11 @@ export default function ProspectsPage() {
                     <Link href={`/prospects/${p.id}`} style={{ textDecoration: "none", color: "inherit", flex: 1 }}>
                       <span className="when">{STATUS_LABEL[p.status] || p.status}</span>
                       <strong>{p.athlete_name}</strong> {p.grad_year ? `· Class of ${p.grad_year}` : ""} {p.position ? `· ${p.position}` : ""} {p.level_of_play ? `· ${p.level_of_play}` : ""}
+                      {p.is_underexposed && (
+                        <span className="badge badge-not-contacted" style={{ marginLeft: 6 }} title="No offers/commitment on file yet, but the profile has substance — worth a look.">
+                          Underexposed
+                        </span>
+                      )}
                       <div style={{ fontSize: 11.5, color: "#697386", marginTop: 2 }}>
                         {p.schools?.name ? `${p.schools.name} · ` : ""}{p.city || p.schools?.city}{p.state || p.schools?.state ? `, ${p.state || p.schools?.state}` : ""}
                         {p.athlete_email ? ` · ${p.athlete_email}` : ""}{p.athlete_cell ? ` · ${p.athlete_cell}` : ""}
