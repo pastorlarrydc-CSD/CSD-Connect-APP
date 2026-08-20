@@ -419,6 +419,11 @@ export default function SchoolProfilePage() {
                 Confidence score: {school.confidence_score ?? 0}%
               </span>
               {school.claimed_by && <span className="badge badge-contacted">Coach-verified listing</span>}
+              {school.record_updated && (
+                <span className="badge badge-not-contacted" title={school.record_last_updated_at ? `Last changed ${new Date(school.record_last_updated_at).toLocaleDateString()}` : "This record has been changed since it was imported."}>
+                  Updated{school.record_last_updated_at ? ` ${new Date(school.record_last_updated_at).toLocaleDateString()}` : ""}
+                </span>
+              )}
             </div>
             <div className="notice">Source: {school.source || "CSD Master Coaches Database"}.</div>
 
