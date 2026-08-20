@@ -206,6 +206,9 @@ export default function AdminPage() {
               <Link href="/admin/data-quality" className="btn btn-sm btn-primary" style={{ marginRight: 8 }}>
                 Data Quality Review
               </Link>
+              <Link href="/admin/duplicates" className="btn btn-sm btn-primary" style={{ marginRight: 8 }}>
+                Duplicate Detection &amp; Cleanup
+              </Link>
               <Link href="/schools/new" className="btn btn-sm btn-primary" style={{ marginRight: 8 }}>
                 Add School
               </Link>
