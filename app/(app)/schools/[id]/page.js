@@ -20,6 +20,7 @@ function withProtocol(v) {
 const SUGGESTION_STATUS_LABEL = { pending: "Pending review", approved: "Approved — now live", rejected: "Not approved" };
 const CLAIM_STATUS_LABEL = { pending: "Pending review", approved: "Approved", rejected: "Not approved" };
 const EMPTY_COACH_FORM = { hc_first_name: "", hc_last_name: "", hc_email: "", hc_cell: "", hc_office: "", note: "" };
+const EMPTY_OWNER_FORM = { hc_first_name: "", hc_last_name: "", hc_email: "", hc_cell: "", hc_office: "", website: "", note: "" };
 
 function confidenceColor(score) {
   if (score >= 70) return "#1d7a4c";
@@ -73,7 +74,7 @@ export default function SchoolProfilePage() {
   const [claimError, setClaimError] = useState("");
 
   // Direct self-update, once a claim is approved and this is "your" school
-  const [ownerForm, setOwnerForm] = useState(EMPTY_COACH_FORM);
+  const [ownerForm, setOwnerForm] = useState(EMPTY_OWNER_FORM);
   const [savingOwnerForm, setSavingOwnerForm] = useState(false);
   const [ownerFormError, setOwnerFormError] = useState("");
   const [ownerFormSaved, setOwnerFormSaved] = useState(false);
@@ -94,6 +95,15 @@ export default function SchoolProfilePage() {
 
   const isOwner = !!(profile?.school_id && school?.id && Number(profile.school_id) === Number(school.id));
   const canClaim = profile?.role === "hs_coach" && !profile?.school_id;
+  // Verification staff/sysadmin can write to schools directly per RLS
+  // (schools_write policy) -- used below for a quick inline website fix,
+  // since a stale/broken URL here is exactly what breaks the automated
+  // coach-change recheck.
+  const isStaff = profile?.role === "verifier" || profile?.role === "sysadmin";
+  const [editingWebsite, setEditingWebsite] = useState(false);
+  const [websiteDraft, setWebsiteDraft] = useState("");
+  const [websiteSaving, setWebsiteSaving] = useState(false);
+  const [websiteError, setWebsiteError] = useState("");
 
   const load = useCallback(async () => {
     const { data: schoolData } = await supabase.from("schools").select("*").eq("id", id).maybeSingle();
@@ -113,8 +123,10 @@ export default function SchoolProfilePage() {
         hc_email: schoolData.hc_email || "",
         hc_cell: schoolData.hc_cell || "",
         hc_office: schoolData.hc_office || "",
+        website: schoolData.website || "",
         note: "",
       });
+      setWebsiteDraft(schoolData.website || "");
     }
 
     if (user?.id) {
@@ -282,6 +294,7 @@ export default function SchoolProfilePage() {
           hc_email: ownerForm.hc_email,
           hc_cell: ownerForm.hc_cell,
           hc_office: ownerForm.hc_office,
+          website: ownerForm.website,
         }),
       });
       const body = await res.json().catch(() => ({}));
@@ -337,6 +350,43 @@ export default function SchoolProfilePage() {
       setRecheckError(err.message || "Could not run this check.");
     } finally {
       setCheckingUpdate(false);
+    }
+  }
+
+  function startEditWebsite() {
+    setWebsiteDraft(school.website || "");
+    setWebsiteError("");
+    setEditingWebsite(true);
+  }
+
+  async function saveWebsiteDirect(e) {
+    e.preventDefault();
+    setWebsiteError("");
+    setWebsiteSaving(true);
+    try {
+      const newVal = websiteDraft.trim() || null;
+      const oldVal = school.website || null;
+      const { error } = await supabase
+        .from("schools")
+        .update({ website: newVal, updated_at: new Date().toISOString() })
+        .eq("id", id);
+      if (error) throw error;
+      if (newVal !== oldVal && user?.id) {
+        await supabase.from("school_change_log").insert({
+          school_id: id,
+          field_name: "website",
+          old_value: oldVal,
+          new_value: newVal,
+          source: "Edited directly by verification staff",
+          changed_by: user.id,
+        });
+      }
+      setEditingWebsite(false);
+      load();
+    } catch (err) {
+      setWebsiteError(err.message || "Could not save this website.");
+    } finally {
+      setWebsiteSaving(false);
     }
   }
 
@@ -425,8 +475,15 @@ export default function SchoolProfilePage() {
           </div>
 
           <div className="card" style={{ marginBottom: 14 }}>
-            <h3>School Info</h3>
-            <div className="kv">
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+              <h3 style={{ margin: 0 }}>School Info</h3>
+              {isStaff && !editingWebsite && (
+                <button className="btn btn-sm" onClick={startEditWebsite}>
+                  Edit website
+                </button>
+              )}
+            </div>
+            <div className="kv" style={{ marginTop: 10 }}>
               <div className="k">Address</div>
               <div className="v">
                 {school.addr1}
@@ -438,17 +495,36 @@ export default function SchoolProfilePage() {
               <div className="v">{fmtPhone(school.phone) || "—"}</div>
               <div className="k">Website</div>
               <div className="v">
-                {school.website ? (
-                  <a href={withProtocol(school.website)} target="_blank" rel="noopener noreferrer">
-                    {school.website}
-                  </a>
-                ) : (
-                  "—"
-                )}
+                {!editingWebsite &&
+                  (school.website ? (
+                    <a href={withProtocol(school.website)} target="_blank" rel="noopener noreferrer">
+                      {school.website}
+                    </a>
+                  ) : (
+                    "—"
+                  ))}
               </div>
               <div className="k">Classification</div>
               <div className="v">{school.classification || "—"}</div>
             </div>
+
+            {editingWebsite && (
+              <form onSubmit={saveWebsiteDirect} style={{ marginTop: 10, borderTop: "1px solid #eef0f3", paddingTop: 10 }}>
+                {websiteError && <div className="notice danger" style={{ marginBottom: 10 }}>{websiteError}</div>}
+                <div className="form-field">
+                  <label>Website</label>
+                  <input value={websiteDraft} onChange={(e) => setWebsiteDraft(e.target.value)} placeholder="www.school.edu/athletics" />
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button className="btn btn-sm btn-primary" disabled={websiteSaving}>
+                    {websiteSaving ? "Saving…" : "Save"}
+                  </button>
+                  <button type="button" className="btn btn-sm" onClick={() => setEditingWebsite(false)} disabled={websiteSaving}>
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            )}
           </div>
 
           <div className="card">
@@ -500,6 +576,10 @@ export default function SchoolProfilePage() {
                   <div className="form-field">
                     <label>Office</label>
                     <input value={ownerForm.hc_office} onChange={(e) => setOwnerForm((v) => ({ ...v, hc_office: e.target.value }))} />
+                  </div>
+                  <div className="form-field">
+                    <label>Website</label>
+                    <input value={ownerForm.website} onChange={(e) => setOwnerForm((v) => ({ ...v, website: e.target.value }))} placeholder="www.school.edu/athletics" />
                   </div>
                 </div>
                 <button className="btn btn-gold btn-sm" disabled={savingOwnerForm}>
