@@ -24,6 +24,10 @@ const RECRUITING_STATUSES = ["watching", "offered", "committed"];
 const RECRUITING_LABEL = { watching: "Watching", offered: "Offered", committed: "Committed" };
 const RECRUITING_BADGE_CLASS = { watching: "badge-watching", offered: "badge-offered", committed: "badge-committed" };
 
+// Predefined scouting tags -- kept as a fixed list so the board stays
+// consistent/filterable across a whole staff. See prospect_tags table.
+const TAG_OPTIONS = ["Priority", "Sleeper", "Needs Film", "Camp Invite", "Grayshirt", "Preferred Walk-on", "Do Not Pursue"];
+
 export default function ProspectDetailPage() {
   const { id } = useParams();
   const router = useRouter();
@@ -67,6 +71,19 @@ export default function ProspectDetailPage() {
   const [recruitingLoading, setRecruitingLoading] = useState(true);
   const [recruitingSaving, setRecruitingSaving] = useState(false);
   const [recruitingError, setRecruitingError] = useState("");
+
+  // Scouting: this college's own private 1-5 star rating, predefined tags,
+  // and timestamped notes on this athlete. See prospect_ratings,
+  // prospect_tags, and prospect_notes tables.
+  const [scoutingRating, setScoutingRating] = useState(0);
+  const [scoutingTags, setScoutingTags] = useState([]);
+  const [scoutingNotes, setScoutingNotes] = useState([]);
+  const [scoutingLoading, setScoutingLoading] = useState(true);
+  const [ratingSaving, setRatingSaving] = useState(false);
+  const [tagSaving, setTagSaving] = useState("");
+  const [noteDraft, setNoteDraft] = useState("");
+  const [noteSaving, setNoteSaving] = useState(false);
+  const [scoutingError, setScoutingError] = useState("");
 
   const canManageIntake = profile?.role === "verifier" || profile?.role === "sysadmin" || prospect?.submitted_by === user?.id;
   const canSetRecruitingStatus = !!college?.id;
@@ -135,6 +152,91 @@ export default function ProspectDetailPage() {
   useEffect(() => {
     loadRecruitingStatus();
   }, [loadRecruitingStatus]);
+
+  const loadScouting = useCallback(async () => {
+    if (!college?.id) {
+      setScoutingLoading(false);
+      return;
+    }
+    setScoutingLoading(true);
+    const [{ data: ratingRow }, { data: tagRows }, { data: noteRows }] = await Promise.all([
+      supabase.from("prospect_ratings").select("rating").eq("college_id", college.id).eq("prospect_id", id).maybeSingle(),
+      supabase.from("prospect_tags").select("tag").eq("college_id", college.id).eq("prospect_id", id),
+      supabase.from("prospect_notes").select("id,note,created_at").eq("college_id", college.id).eq("prospect_id", id).order("created_at", { ascending: false }),
+    ]);
+    setScoutingRating(ratingRow?.rating || 0);
+    setScoutingTags((tagRows || []).map((t) => t.tag));
+    setScoutingNotes(noteRows || []);
+    setScoutingLoading(false);
+  }, [supabase, college, id]);
+
+  useEffect(() => {
+    loadScouting();
+  }, [loadScouting]);
+
+  async function setRating(next) {
+    if (!college?.id) return;
+    setScoutingError("");
+    setRatingSaving(true);
+    try {
+      if (scoutingRating === next) {
+        const { error } = await supabase.from("prospect_ratings").delete().eq("college_id", college.id).eq("prospect_id", id);
+        if (error) throw error;
+        setScoutingRating(0);
+      } else {
+        const { error } = await supabase
+          .from("prospect_ratings")
+          .upsert(
+            { college_id: college.id, prospect_id: Number(id), rating: next, rated_by: user.id, updated_at: new Date().toISOString() },
+            { onConflict: "college_id,prospect_id" }
+          );
+        if (error) throw error;
+        setScoutingRating(next);
+      }
+    } catch (err) {
+      setScoutingError(err.message || "Could not save rating.");
+    } finally {
+      setRatingSaving(false);
+    }
+  }
+
+  async function toggleTag(tag) {
+    if (!college?.id) return;
+    setScoutingError("");
+    setTagSaving(tag);
+    try {
+      if (scoutingTags.includes(tag)) {
+        const { error } = await supabase.from("prospect_tags").delete().eq("college_id", college.id).eq("prospect_id", id).eq("tag", tag);
+        if (error) throw error;
+        setScoutingTags((prev) => prev.filter((t) => t !== tag));
+      } else {
+        const { error } = await supabase.from("prospect_tags").insert({ college_id: college.id, prospect_id: Number(id), tag, tagged_by: user.id });
+        if (error) throw error;
+        setScoutingTags((prev) => [...prev, tag]);
+      }
+    } catch (err) {
+      setScoutingError(err.message || "Could not update tags.");
+    } finally {
+      setTagSaving("");
+    }
+  }
+
+  async function addNote(e) {
+    e.preventDefault();
+    if (!college?.id || !noteDraft.trim()) return;
+    setScoutingError("");
+    setNoteSaving(true);
+    try {
+      const { error } = await supabase.from("prospect_notes").insert({ college_id: college.id, prospect_id: Number(id), note: noteDraft.trim(), written_by: user.id });
+      if (error) throw error;
+      setNoteDraft("");
+      loadScouting();
+    } catch (err) {
+      setScoutingError(err.message || "Could not save note.");
+    } finally {
+      setNoteSaving(false);
+    }
+  }
 
   async function setIntakeStatus(next) {
     setStatusError("");
@@ -504,6 +606,85 @@ export default function ProspectDetailPage() {
             <h3>Coach Evaluation</h3>
             <p style={{ margin: 0, fontSize: 13.5 }}>{prospect.coach_evaluation || <span className="empty-state">No evaluation submitted.</span>}</p>
           </div>
+
+          {canSetRecruitingStatus && (
+            <div className="card" style={{ marginBottom: 14 }}>
+              <h3>Scouting ({college?.name || "your college"})</h3>
+              <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
+                Your college&apos;s own rating, tags, and notes on this athlete — private to your staff, not visible to other colleges.
+              </p>
+              {scoutingError && <div className="notice danger" style={{ marginBottom: 10 }}>{scoutingError}</div>}
+              {scoutingLoading ? (
+                <div className="empty-state">Loading…</div>
+              ) : (
+                <>
+                  <div style={{ marginBottom: 12 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: "#3a4557", marginBottom: 4 }}>Rating</div>
+                    <div style={{ display: "flex", gap: 3 }}>
+                      {[1, 2, 3, 4, 5].map((n) => (
+                        <button
+                          key={n}
+                          type="button"
+                          title={`${n} star${n > 1 ? "s" : ""} — click again to clear`}
+                          onClick={() => setRating(n)}
+                          disabled={ratingSaving}
+                          style={{ border: "none", background: "none", cursor: "pointer", padding: 0, fontSize: 22, lineHeight: 1, color: n <= scoutingRating ? "#c9971f" : "#dde1e7" }}
+                        >
+                          ★
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div style={{ marginBottom: 12 }}>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: "#3a4557", marginBottom: 6 }}>Tags</div>
+                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                      {TAG_OPTIONS.map((tag) => {
+                        const active = scoutingTags.includes(tag);
+                        return (
+                          <button
+                            key={tag}
+                            type="button"
+                            className="btn btn-sm"
+                            disabled={tagSaving === tag}
+                            onClick={() => toggleTag(tag)}
+                            style={active ? { background: "#131a2b", color: "#fff", borderColor: "#131a2b" } : undefined}
+                          >
+                            {tag}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: "#3a4557", marginBottom: 6 }}>Notes</div>
+                    <form onSubmit={addNote} style={{ display: "flex", gap: 6, marginBottom: 10 }}>
+                      <input
+                        value={noteDraft}
+                        onChange={(e) => setNoteDraft(e.target.value)}
+                        placeholder="Add a scouting note…"
+                        style={{ flex: 1 }}
+                      />
+                      <button className="btn btn-sm btn-primary" disabled={noteSaving || !noteDraft.trim()}>
+                        {noteSaving ? "Saving…" : "Add"}
+                      </button>
+                    </form>
+                    {scoutingNotes.length ? (
+                      scoutingNotes.map((n) => (
+                        <div className="log-item" key={n.id}>
+                          <span className="when">{new Date(n.created_at).toLocaleString()}</span>
+                          <div style={{ fontSize: 13 }}>{n.note}</div>
+                        </div>
+                      ))
+                    ) : (
+                      <div className="empty-state">No notes yet.</div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
 
           <div className="card" style={{ marginBottom: 14 }}>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
