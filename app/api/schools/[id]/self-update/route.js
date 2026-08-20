@@ -4,8 +4,11 @@ import { getSupabaseAdminClient } from "@/lib/supabase/admin";
 
 // Fields a claimed owner is allowed to touch on their own school record --
 // deliberately narrow (no name/address/classification) even though the
-// admin client below has no column-level restriction of its own.
-const EDITABLE_FIELDS = ["hc_first_name", "hc_last_name", "hc_email", "hc_cell", "hc_office"];
+// admin client below has no column-level restriction of its own. Website
+// is included since a stale/broken URL here directly breaks the automated
+// coach-change recheck (see lib/schoolRecheck.js), and the claimed owner is
+// the best-positioned person to know their own school's current site.
+const EDITABLE_FIELDS = ["hc_first_name", "hc_last_name", "hc_email", "hc_cell", "hc_office", "website"];
 
 export async function POST(req, { params }) {
   try {
