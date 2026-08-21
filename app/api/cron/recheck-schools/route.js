@@ -1,15 +1,16 @@
 import { NextResponse } from "next/server";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
-import { checkSchoolWebsite } from "@/lib/schoolRecheck";
+import { checkSchoolCoach } from "@/lib/schoolRecheck";
 
 export const maxDuration = 60;
 
-// Nightly automated sweep -- picks the schools that have gone longest
-// without a website recheck (or have never been checked, via the
+// Nightly automated sweep -- Coach-Change Radar. Picks the schools that have
+// gone longest without a recheck (or have never been checked, via the
 // school_recheck_priority view) and runs the same "does the on-file head
-// coach's name still appear on their site" check the manual "Check for
-// updates" button runs, just at scale across the database. Invoked by
-// Vercel Cron (see vercel.json) once a night; Vercel automatically attaches
+// coach's name still appear on their website -- or, failing that, their
+// MaxPreps roster page" check the manual "Check for updates" button runs,
+// just at scale across the database. Invoked by Vercel Cron (see
+// vercel.json) once a night; Vercel automatically attaches
 // `Authorization: Bearer <CRON_SECRET>` using the CRON_SECRET environment
 // variable, and this route rejects anything that doesn't match.
 //
@@ -24,10 +25,10 @@ export const maxDuration = 60;
 // stale -- flagging on every miss would flood the verifier queue with false
 // positives. So this route only opens a flag once a school has come back
 // "not found" on MISS_THRESHOLD separate nightly checks IN A ROW (looking
-// at the most recent log rows for that school). A "confirmed" check in
-// between resets the streak. Once a flag is opened for a streak, it won't
-// open a second one on top of a still-pending automated flag for the same
-// school.
+// at the most recent log rows for that school). A "confirmed" (including a
+// MaxPreps confirmation) in between resets the streak. Once a flag is
+// opened for a streak, it won't open a second one on top of a still-pending
+// automated flag for the same school.
 //
 // Processes up to BATCH_SIZE candidates per run, but stops picking up new
 // work once TIME_BUDGET_MS has elapsed so it always finishes comfortably
@@ -59,7 +60,7 @@ export async function GET(req) {
 
   const { data: candidates, error: candErr } = await supabase
     .from("school_recheck_priority")
-    .select("school_id, website, hc_first_name, hc_last_name")
+    .select("school_id, website, hc_first_name, hc_last_name, maxpreps_url")
     .order("last_checked_at", { ascending: true, nullsFirst: true })
     .limit(BATCH_SIZE);
 
@@ -68,7 +69,7 @@ export async function GET(req) {
     return NextResponse.json({ error: "Could not load candidate schools." }, { status: 500 });
   }
 
-  const summary = { confirmed: 0, not_found: 0, no_website: 0, no_coach_on_file: 0, fetch_error: 0 };
+  const summary = { confirmed: 0, confirmed_maxpreps: 0, not_found: 0, no_website: 0, no_coach_on_file: 0, fetch_error: 0 };
   let processed = 0;
   let flagsOpened = 0;
   let cursor = 0;
@@ -80,7 +81,11 @@ export async function GET(req) {
       if (i >= candidates.length) return;
       const c = candidates[i];
 
-      const { result, detail } = await checkSchoolWebsite({ website: c.website, hc_last_name: c.hc_last_name });
+      const { result, detail } = await checkSchoolCoach({
+        website: c.website,
+        hc_last_name: c.hc_last_name,
+        maxpreps_url: c.maxpreps_url,
+      });
       summary[result] = (summary[result] || 0) + 1;
       processed++;
 
@@ -116,7 +121,7 @@ export async function GET(req) {
             await supabase.from("school_flags").insert({
               school_id: c.school_id,
               flagged_by: SYSTEM_USER_ID,
-              reason: `Automated nightly recheck: "${c.hc_last_name}" was not found on ${c.website} on ${MISS_THRESHOLD} checks in a row. May be outdated -- please verify.`,
+              reason: `Automated nightly recheck: "${c.hc_last_name}" was not found on ${c.website}${c.maxpreps_url ? " or the MaxPreps roster page on file" : ""} on ${MISS_THRESHOLD} checks in a row. May be outdated -- please verify.`,
             });
             flagsOpened++;
           }
