@@ -1,13 +1,31 @@
 "use client";
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 import { mileageRateForDate } from "@/lib/mileageRates";
+
+const CONTACT_TYPES = ["Call", "Email", "Text", "Visit", "Evaluation"];
+const LEADERBOARD_RANGES = [
+  { label: "Last 30 days", days: 30 },
+  { label: "Last 90 days", days: 90 },
+  { label: "Last 12 months", days: 365 },
+  { label: "All time", days: null },
+];
+
+function monthKey(dateStr) {
+  const d = new Date(dateStr);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+}
+function monthLabel(key) {
+  const [y, m] = key.split("-").map(Number);
+  return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: "short", year: "2-digit" });
+}
 
 export default function ReportsPage() {
   const supabase = getSupabaseBrowserClient();
   const { college } = useAuth();
   const [data, setData] = useState(null);
+  const [leaderboardDays, setLeaderboardDays] = useState(90);
 
   useEffect(() => {
     async function load() {
@@ -32,6 +50,10 @@ export default function ReportsPage() {
       let totalReimbursement = 0;
       let tripsWithMiles = 0;
       let territoryCoverage = [];
+      let monthlyTrend = [];
+      let outreachEffectiveness = [];
+      let activityRows = [];
+      let staffNames = {};
 
       if (college?.id) {
         const [{ count: assignedCount }, { count: contactedCount }, { count: watchCount }] = await Promise.all([
@@ -99,6 +121,69 @@ export default function ReportsPage() {
             })
           );
         }
+
+        // Activity trend + outreach-type effectiveness + staff leaderboard --
+        // all derived from this college's own contact_logs, fetched once and
+        // sliced client-side (small dataset for a program-sized team) so the
+        // leaderboard's date-range selector doesn't need a fresh query.
+        const [{ data: logs }, { data: profileRows }, { data: statusRows }] = await Promise.all([
+          supabase
+            .from("contact_logs")
+            .select("id,school_id,contact_type,contact_date,logged_by")
+            .eq("college_id", college.id),
+          supabase.from("profiles").select("id,full_name").eq("college_id", college.id),
+          supabase
+            .from("prospect_recruiting_status")
+            .select("status, prospects(school_id)")
+            .eq("college_id", college.id)
+            .in("status", ["offered", "committed"]),
+        ]);
+        activityRows = logs || [];
+        (profileRows || []).forEach((p) => {
+          staffNames[p.id] = p.full_name;
+        });
+
+        // Monthly trend -- last 6 months, total + per contact_type.
+        const now = new Date();
+        const months = [];
+        for (let i = 5; i >= 0; i--) {
+          const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+          months.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`);
+        }
+        const byMonth = {};
+        months.forEach((k) => {
+          byMonth[k] = { key: k, label: monthLabel(k), total: 0, byType: {} };
+        });
+        activityRows.forEach((row) => {
+          if (!row.contact_date) return;
+          const k = monthKey(row.contact_date);
+          if (!byMonth[k]) return; // outside the 6-month window
+          byMonth[k].total += 1;
+          byMonth[k].byType[row.contact_type] = (byMonth[k].byType[row.contact_type] || 0) + 1;
+        });
+        monthlyTrend = months.map((k) => byMonth[k]);
+
+        // Outreach-type effectiveness -- a proxy, not strict attribution:
+        // of the schools this college contacted via each channel, how many
+        // now have a prospect this college has marked Offered/Committed.
+        const engagedSchoolIds = new Set();
+        (statusRows || []).forEach((r) => {
+          if (r.prospects?.school_id) engagedSchoolIds.add(r.prospects.school_id);
+        });
+        const schoolsByType = {};
+        activityRows.forEach((row) => {
+          const t = row.contact_type || "Other";
+          (schoolsByType[t] = schoolsByType[t] || new Set()).add(row.school_id);
+        });
+        outreachEffectiveness = Object.entries(schoolsByType)
+          .map(([type, schoolSet]) => {
+            let engaged = 0;
+            schoolSet.forEach((sid) => {
+              if (engagedSchoolIds.has(sid)) engaged += 1;
+            });
+            return { type, schoolsContacted: schoolSet.size, engaged, pct: schoolSet.size ? Math.round((engaged / schoolSet.size) * 100) : 0 };
+          })
+          .sort((a, b) => b.schoolsContacted - a.schoolsContacted);
       }
 
       setData({
@@ -114,10 +199,33 @@ export default function ReportsPage() {
         totalReimbursement,
         tripsWithMiles,
         territoryCoverage,
+        monthlyTrend,
+        outreachEffectiveness,
+        activityRows,
+        staffNames,
       });
     }
     load();
   }, [supabase, college]);
+
+  const staffLeaderboard = useMemo(() => {
+    if (!data) return [];
+    const cutoff = leaderboardDays ? Date.now() - leaderboardDays * 24 * 60 * 60 * 1000 : null;
+    const byStaff = {};
+    (data.activityRows || []).forEach((row) => {
+      if (cutoff && row.contact_date && new Date(row.contact_date).getTime() < cutoff) return;
+      const key = row.logged_by || "unknown";
+      if (!byStaff[key]) {
+        byStaff[key] = { id: key, name: data.staffNames?.[key] || "Unknown", total: 0, byType: {}, schools: new Set() };
+      }
+      byStaff[key].total += 1;
+      byStaff[key].byType[row.contact_type] = (byStaff[key].byType[row.contact_type] || 0) + 1;
+      byStaff[key].schools.add(row.school_id);
+    });
+    return Object.values(byStaff)
+      .map((s) => ({ ...s, schoolCount: s.schools.size }))
+      .sort((a, b) => b.total - a.total);
+  }, [data, leaderboardDays]);
 
   if (!data) return <div className="view"><div className="empty-state">Loading reports…</div></div>;
 
@@ -206,6 +314,138 @@ export default function ReportsPage() {
           <div className="empty-state">
             No territories set up yet. Create one on the Territories page to see coverage broken out by region here.
           </div>
+        )}
+      </div>
+
+      <div className="card" style={{ marginTop: 14 }}>
+        <h3>Activity Trend (Last 6 Months)</h3>
+        {data.monthlyTrend.some((m) => m.total > 0) ? (
+          <>
+            <div style={{ display: "flex", alignItems: "flex-end", gap: 14, height: 130, marginBottom: 10, paddingTop: 6 }}>
+              {data.monthlyTrend.map((m) => {
+                const max = Math.max(...data.monthlyTrend.map((x) => x.total), 1);
+                return (
+                  <div key={m.key} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "flex-end", height: "100%" }}>
+                    <div style={{ fontSize: 11, fontWeight: 700, marginBottom: 4 }}>{m.total || ""}</div>
+                    <div
+                      style={{
+                        width: "100%",
+                        maxWidth: 42,
+                        height: `${Math.max((m.total / max) * 100, m.total ? 4 : 0)}%`,
+                        background: "#0b1f3a",
+                        borderRadius: "4px 4px 0 0",
+                      }}
+                    />
+                    <div style={{ fontSize: 11, color: "#697386", marginTop: 6 }}>{m.label}</div>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="table-wrap" style={{ boxShadow: "none", border: "none" }}>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Month</th>
+                    {CONTACT_TYPES.map((t) => (
+                      <th key={t}>{t}</th>
+                    ))}
+                    <th>Total</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.monthlyTrend.map((m) => (
+                    <tr key={m.key}>
+                      <td>{m.label}</td>
+                      {CONTACT_TYPES.map((t) => (
+                        <td key={t}>{m.byType[t] || 0}</td>
+                      ))}
+                      <td style={{ fontWeight: 700 }}>{m.total}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </>
+        ) : (
+          <div className="empty-state">No contact activity logged yet — trends will appear here once you start logging calls, emails, texts, or visits.</div>
+        )}
+      </div>
+
+      <div className="card" style={{ marginTop: 14 }}>
+        <h3>Outreach-Type Effectiveness</h3>
+        {data.outreachEffectiveness.length ? (
+          <>
+            <div className="table-wrap" style={{ boxShadow: "none", border: "none" }}>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Contact Type</th>
+                    <th>Schools Contacted</th>
+                    <th>Now Offered/Committed</th>
+                    <th>Rate</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {data.outreachEffectiveness.map((row) => (
+                    <tr key={row.type}>
+                      <td>{row.type}</td>
+                      <td>{row.schoolsContacted}</td>
+                      <td>{row.engaged}</td>
+                      <td>{row.pct}%</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="notice" style={{ marginTop: 10, fontSize: 11.5 }}>
+              A proxy signal, not strict cause-and-effect: for each contact type, the share of schools you reached that way which now have at least one prospect your program has marked Offered or Committed on the Recruiting CRM.
+            </div>
+          </>
+        ) : (
+          <div className="empty-state">No contact activity logged yet.</div>
+        )}
+      </div>
+
+      <div className="card" style={{ marginTop: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+          <h3 style={{ margin: 0 }}>Staff Activity Leaderboard</h3>
+          <select value={leaderboardDays ?? "all"} onChange={(e) => setLeaderboardDays(e.target.value === "all" ? null : Number(e.target.value))} style={{ width: 170 }}>
+            {LEADERBOARD_RANGES.map((r) => (
+              <option key={r.label} value={r.days ?? "all"}>
+                {r.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        {staffLeaderboard.length ? (
+          <div className="table-wrap" style={{ boxShadow: "none", border: "none", marginTop: 10 }}>
+            <table>
+              <thead>
+                <tr>
+                  <th>Staff</th>
+                  <th>Total Contacts</th>
+                  <th>Schools Touched</th>
+                  {CONTACT_TYPES.map((t) => (
+                    <th key={t}>{t}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {staffLeaderboard.map((s) => (
+                  <tr key={s.id}>
+                    <td>{s.name}</td>
+                    <td style={{ fontWeight: 700 }}>{s.total}</td>
+                    <td>{s.schoolCount}</td>
+                    {CONTACT_TYPES.map((t) => (
+                      <td key={t}>{s.byType[t] || 0}</td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        ) : (
+          <div className="empty-state" style={{ marginTop: 10 }}>No contact activity in this range.</div>
         )}
       </div>
 
