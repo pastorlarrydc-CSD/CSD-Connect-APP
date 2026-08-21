@@ -23,7 +23,13 @@ const EDIT_FIELDS = [
   ["hc_email", "Email"],
   ["hc_cell", "Cell"],
   ["hc_office", "Office"],
+  ["maxpreps_url", "MaxPreps URL"],
 ];
+
+// A flag opened by the nightly Coach-Change Radar sweep always starts with
+// this exact text (see app/api/cron/recheck-schools) -- used to tell those
+// apart from flags a coach raised by hand from a school profile page.
+const AUTOMATED_FLAG_PREFIX = "Automated nightly recheck";
 
 function fmtPhone(v) {
   if (!v) return "";
@@ -38,11 +44,20 @@ export default function DataQualityPage() {
 
   // Flagged-as-outdated queue -- loads automatically (unlike the full scan
   // below, which is opt-in) so stale records surface the moment someone
-  // reports one, rather than waiting for the next manual scan.
+  // reports one, rather than waiting for the next manual scan. Populated by
+  // both a coach's manual "flag as outdated" and the automated Coach-Change
+  // Radar sweep, distinguished below by badge.
   const [flaggedQueue, setFlaggedQueue] = useState([]);
   const [loadingFlags, setLoadingFlags] = useState(true);
   const [flagActionId, setFlagActionId] = useState(null);
   const [flagActionError, setFlagActionError] = useState("");
+
+  // Coach-Change Radar summary -- aggregate stats from the nightly
+  // automated sweep's most recent run, pulled from school_recheck_log
+  // (every row the sweep writes is tagged with a "[Automated nightly
+  // sweep]" detail prefix so it can be told apart from on-demand checks).
+  const [radarStats, setRadarStats] = useState(null);
+  const [loadingRadar, setLoadingRadar] = useState(true);
 
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState("");
@@ -63,7 +78,7 @@ export default function DataQualityPage() {
     setLoadingFlags(true);
     const { data } = await supabase
       .from("school_flags")
-      .select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office), colleges:flagged_by_college_id(name)")
+      .select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,maxpreps_url), colleges:flagged_by_college_id(name)")
       .eq("status", "pending")
       .order("created_at", { ascending: true });
     setFlaggedQueue(data || []);
@@ -74,13 +89,48 @@ export default function DataQualityPage() {
     loadFlags();
   }, [loadFlags]);
 
+  const loadRadarStats = useCallback(async () => {
+    if (!canReview) {
+      setLoadingRadar(false);
+      return;
+    }
+    setLoadingRadar(true);
+    // The sweep runs once a night; a 26-hour lookback comfortably covers
+    // "last night's run" even if the schedule shifts slightly, without
+    // pulling in more than one run's worth of rows.
+    const since = new Date(Date.now() - 26 * 60 * 60 * 1000).toISOString();
+    const { data } = await supabase
+      .from("school_recheck_log")
+      .select("result, checked_at")
+      .ilike("detail", "[Automated nightly sweep]%")
+      .gte("checked_at", since)
+      .order("checked_at", { ascending: false })
+      .limit(2000);
+
+    if (!data || data.length === 0) {
+      setRadarStats({ checked: 0, lastRunAt: null, counts: {} });
+      setLoadingRadar(false);
+      return;
+    }
+    const counts = {};
+    data.forEach((row) => {
+      counts[row.result] = (counts[row.result] || 0) + 1;
+    });
+    setRadarStats({ checked: data.length, lastRunAt: data[0].checked_at, counts });
+    setLoadingRadar(false);
+  }, [supabase, canReview]);
+
+  useEffect(() => {
+    loadRadarStats();
+  }, [loadRadarStats]);
+
   const fetchAllSchools = useCallback(async () => {
     const rows = [];
     let from = 0;
     for (;;) {
       const { data, error } = await supabase
         .from("schools")
-        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,lat,lon,verification_status")
+        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,lat,lon,verification_status,maxpreps_url")
         .order("id", { ascending: true })
         .range(from, from + PAGE_SIZE - 1);
       if (error) throw error;
@@ -114,6 +164,7 @@ export default function DataQualityPage() {
       hc_email: school.hc_email || "",
       hc_cell: school.hc_cell || "",
       hc_office: school.hc_office || "",
+      maxpreps_url: school.maxpreps_url || "",
     });
   }
 
@@ -222,6 +273,8 @@ export default function DataQualityPage() {
     ? result.flagged.filter((r) => filter === "all" || r.issues.some((iss) => iss.code === filter)).slice(0, DISPLAY_CAP)
     : [];
   const visibleTotal = result ? result.flagged.filter((r) => filter === "all" || r.issues.some((iss) => iss.code === filter)).length : 0;
+  const automatedPendingCount = flaggedQueue.filter((f) => (f.reason || "").startsWith(AUTOMATED_FLAG_PREFIX)).length;
+  const confirmedTotal = (radarStats?.counts.confirmed || 0) + (radarStats?.counts.confirmed_maxpreps || 0);
 
   return (
     <div className="view">
@@ -239,9 +292,44 @@ export default function DataQualityPage() {
       </div>
 
       <div className="card" style={{ marginBottom: 14 }}>
+        <h3 style={{ marginBottom: 4 }}>Coach-Change Radar</h3>
+        <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
+          Every school with a website or MaxPreps URL on file gets an automated recheck on a nightly rolling schedule — a coach change surfaces here on its own, without anyone having to notice and flag it by hand.
+        </p>
+        {loadingRadar ? (
+          <div className="empty-state">Loading…</div>
+        ) : !radarStats || radarStats.checked === 0 ? (
+          <div className="empty-state">No automated sweep activity in the last day. The nightly job runs once a day — check back after it&apos;s had a chance to run.</div>
+        ) : (
+          <div className="grid grid-4">
+            <div className="card stat-card">
+              <div className="label">Checked, Last Run</div>
+              <div className="num">{radarStats.checked.toLocaleString()}</div>
+              <div className="sub">{radarStats.lastRunAt ? new Date(radarStats.lastRunAt).toLocaleString() : ""}</div>
+            </div>
+            <div className="card stat-card">
+              <div className="label">Confirmed</div>
+              <div className="num">{confirmedTotal.toLocaleString()}</div>
+              <div className="sub">{radarStats.counts.confirmed_maxpreps ? `${radarStats.counts.confirmed_maxpreps} via MaxPreps fallback` : "coach name matched on file"}</div>
+            </div>
+            <div className="card stat-card">
+              <div className="label">Not Found</div>
+              <div className="num">{(radarStats.counts.not_found || 0).toLocaleString()}</div>
+              <div className="sub">needs 2 misses in a row to flag</div>
+            </div>
+            <div className="card stat-card">
+              <div className="label">Automated Flags Pending</div>
+              <div className="num">{automatedPendingCount.toLocaleString()}</div>
+              <div className="sub">in the queue below</div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      <div className="card" style={{ marginBottom: 14 }}>
         <h3 style={{ marginBottom: 4 }}>Flagged as Possibly Outdated ({flaggedQueue.length})</h3>
         <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
-          Reported by coaches browsing the database — surfaces here immediately, no scan needed.
+          Reported by coaches browsing the database, or raised automatically by Coach-Change Radar — surfaces here immediately, no scan needed.
         </p>
         {flagActionError && <div className="notice danger" style={{ marginBottom: 10 }}>{flagActionError}</div>}
         {loadingFlags ? (
@@ -252,11 +340,20 @@ export default function DataQualityPage() {
           flaggedQueue.map((flag) => {
             const s = flag.schools;
             const isEditing = editingId === s?.id;
+            const isAutomated = (flag.reason || "").startsWith(AUTOMATED_FLAG_PREFIX);
             return (
               <div className="log-item" key={flag.id} style={{ paddingBottom: 12 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
                   <div>
-                    <strong>{s?.name}</strong> — {s?.city}, {s?.state}
+                    <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                      <strong>{s?.name}</strong> — {s?.city}, {s?.state}
+                      <span
+                        className={isAutomated ? "badge badge-unverified" : "badge"}
+                        style={isAutomated ? undefined : { background: "#e8ebf0", color: "#42506b" }}
+                      >
+                        {isAutomated ? "Automated · Coach-Change Radar" : "Manual flag"}
+                      </span>
+                    </div>
                     <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
                       Flagged {new Date(flag.created_at).toLocaleDateString()} by {flag.colleges?.name || "an HS coach account"}
                       {flag.reason ? ` — "${flag.reason}"` : ""}
