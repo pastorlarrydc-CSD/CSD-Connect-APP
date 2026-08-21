@@ -3,6 +3,7 @@ import { useEffect, useState, useCallback, Fragment } from "react";
 import Link from "next/link";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
+import { computeConfidenceScore } from "@/lib/dataQuality";
 
 const ROLE_TABLE = [
   ["College Coach / Staff", "Search, map, CRM, watchlists — own college's data only"],
@@ -67,7 +68,7 @@ export default function AdminPage() {
     setLoadingCorrections(true);
     const { data } = await supabase
       .from("school_edit_suggestions")
-      .select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office), colleges:suggested_by_college_id(name)")
+      .select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,website,maxpreps_url,verification_status,confidence_score), colleges:suggested_by_college_id(name)")
       .eq("status", "pending")
       .order("created_at", { ascending: true });
     setPendingCorrections(data || []);
@@ -142,6 +143,9 @@ export default function AdminPage() {
       if (Object.keys(update).length) {
         update.verification_status = "verified";
         update.last_verified_at = new Date().toISOString();
+        // Redo the confidence score against the record as it will look
+        // right after this approval lands -- see lib/dataQuality.js.
+        update.confidence_score = computeConfidenceScore({ ...current, ...update });
         const { error } = await supabase.from("schools").update(update).eq("id", suggestion.school_id);
         if (error) throw error;
         if (changes.length) {
