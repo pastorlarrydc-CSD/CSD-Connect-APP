@@ -21,6 +21,18 @@ const SUGGESTION_STATUS_LABEL = { pending: "Pending review", approved: "Approved
 const CLAIM_STATUS_LABEL = { pending: "Pending review", approved: "Approved", rejected: "Not approved" };
 const EMPTY_COACH_FORM = { hc_first_name: "", hc_last_name: "", hc_email: "", hc_cell: "", hc_office: "", note: "" };
 const EMPTY_OWNER_FORM = { hc_first_name: "", hc_last_name: "", hc_email: "", hc_cell: "", hc_office: "", website: "", note: "" };
+const EMPTY_STAFF_FORM = { hc_first_name: "", hc_last_name: "", hc_email: "", hc_cell: "", hc_office: "" };
+
+// Verification staff/sysadmin write directly to schools (schools_write RLS
+// policy), so unlike "Suggest a correction" below, this never goes through
+// a review queue -- the person editing here IS the reviewer.
+const STAFF_EDIT_FIELDS = [
+  ["hc_first_name", "First name"],
+  ["hc_last_name", "Last name"],
+  ["hc_email", "Email"],
+  ["hc_cell", "Cell"],
+  ["hc_office", "Office"],
+];
 
 function confidenceColor(score) {
   if (score >= 70) return "#1d7a4c";
@@ -104,6 +116,28 @@ export default function SchoolProfilePage() {
   const [websiteDraft, setWebsiteDraft] = useState("");
   const [websiteSaving, setWebsiteSaving] = useState(false);
   const [websiteError, setWebsiteError] = useState("");
+
+  // Staff-only direct edit of the head coach fields -- a lighter, on-page
+  // version of the Quick Fix / Mark Coach Change tools on the Data Quality
+  // Review page (app/(app)/admin/data-quality/page.js), for when staff are
+  // already looking at a profile and don't want to leave it. Shares the
+  // same save/coach-change split: staffCoachChangeFrom holds the outgoing
+  // coach's snapshot when this was opened via "Mark Coach Change" (fields
+  // start blank), and is null for a plain "Quick Fix" (fields start
+  // pre-filled).
+  const [staffEditing, setStaffEditing] = useState(false);
+  const [staffCoachChangeFrom, setStaffCoachChangeFrom] = useState(null);
+  const [staffEditValues, setStaffEditValues] = useState(EMPTY_STAFF_FORM);
+  const [staffSaving, setStaffSaving] = useState(false);
+  const [staffSaveError, setStaffSaveError] = useState("");
+
+  // "Mark Verified" -- confirm-with-no-changes, same as its counterpart on
+  // the Data Quality Review page. Doesn't touch confidence_score directly;
+  // the schools table recomputes that itself on every write (see
+  // trg_set_school_confidence_score), so the % badge above updates on its
+  // own once `load()` re-reads the row.
+  const [markingVerified, setMarkingVerified] = useState(false);
+  const [markVerifiedError, setMarkVerifiedError] = useState("");
 
   const load = useCallback(async () => {
     const { data: schoolData } = await supabase.from("schools").select("*").eq("id", id).maybeSingle();
@@ -390,6 +424,109 @@ export default function SchoolProfilePage() {
     }
   }
 
+  // Resolves every pending "possibly outdated" flag on this school, not
+  // just the current viewer's own -- same behavior as resolvePendingFlags
+  // on the Data Quality Review page. Called any time staff mark this
+  // record verified, whether via Quick Fix, Mark Coach Change, or plain
+  // Mark Verified, since all three are a human confirming the record.
+  async function resolveAllPendingFlags() {
+    await supabase
+      .from("school_flags")
+      .update({ status: "resolved", resolved_by: user.id, resolved_at: new Date().toISOString() })
+      .eq("school_id", id)
+      .eq("status", "pending");
+  }
+
+  function startStaffEdit() {
+    setStaffCoachChangeFrom(null);
+    setStaffSaveError("");
+    setStaffEditValues({
+      hc_first_name: school.hc_first_name || "",
+      hc_last_name: school.hc_last_name || "",
+      hc_email: school.hc_email || "",
+      hc_cell: school.hc_cell || "",
+      hc_office: school.hc_office || "",
+    });
+    setStaffEditing(true);
+  }
+
+  // Same editor, opened to record a head coach change specifically: fields
+  // start blank instead of pre-filled, and the save gets tagged "Head
+  // coach change (manual)" in school_change_log so it shows up correctly
+  // in the Coach Change History report.
+  function startStaffCoachChange() {
+    setStaffCoachChangeFrom(school);
+    setStaffSaveError("");
+    setStaffEditValues(EMPTY_STAFF_FORM);
+    setStaffEditing(true);
+  }
+
+  function cancelStaffEdit() {
+    setStaffEditing(false);
+    setStaffCoachChangeFrom(null);
+    setStaffSaveError("");
+  }
+
+  async function saveStaffEdit(e) {
+    e.preventDefault();
+    setStaffSaveError("");
+    setStaffSaving(true);
+    try {
+      const isCoachChange = !!staffCoachChangeFrom;
+      const changes = [];
+      const update = { verification_status: "verified", last_verified_at: new Date().toISOString() };
+      STAFF_EDIT_FIELDS.forEach(([field]) => {
+        const newVal = staffEditValues[field].trim() || null;
+        const oldVal = school[field] || null;
+        if (newVal !== oldVal) {
+          update[field] = newVal;
+          changes.push({
+            school_id: id,
+            field_name: field,
+            old_value: oldVal,
+            new_value: newVal,
+            source: isCoachChange ? "Head coach change (manual)" : "School profile (quick fix)",
+            changed_by: user.id,
+          });
+        }
+      });
+      // confidence_score isn't set here -- the schools table recomputes it
+      // itself on every write via trg_set_school_confidence_score.
+      const { error } = await supabase.from("schools").update(update).eq("id", id);
+      if (error) throw error;
+      if (changes.length) {
+        const { error: logError } = await supabase.from("school_change_log").insert(changes);
+        if (logError) throw logError;
+      }
+      await resolveAllPendingFlags();
+      setStaffEditing(false);
+      setStaffCoachChangeFrom(null);
+      load();
+    } catch (err) {
+      setStaffSaveError(err.message || "Could not save this fix.");
+    } finally {
+      setStaffSaving(false);
+    }
+  }
+
+  async function markVerified() {
+    setMarkingVerified(true);
+    setMarkVerifiedError("");
+    try {
+      const { error } = await supabase
+        .from("schools")
+        .update({ verification_status: "verified", last_verified_at: new Date().toISOString() })
+        .eq("id", id);
+      if (error) throw error;
+      await resolveAllPendingFlags();
+      load();
+    } catch (err) {
+      setMarkVerifiedError(err.message || "Could not mark this school verified.");
+    } finally {
+      setMarkingVerified(false);
+    }
+  }
+
   if (loading) return <div className="view"><div className="empty-state">Loading school profile…</div></div>;
   if (!school) return <div className="view"><div className="notice danger">School not found.</div></div>;
 
@@ -432,6 +569,11 @@ export default function SchoolProfilePage() {
                 <button className="btn btn-sm" onClick={checkForUpdates} disabled={checkingUpdate}>
                   {checkingUpdate ? "Checking website…" : "Check for updates"}
                 </button>
+                {isStaff && (
+                  <button className="btn btn-sm" disabled={markingVerified} onClick={markVerified}>
+                    {markingVerified ? "Marking…" : "Mark Verified"}
+                  </button>
+                )}
                 {lastRecheck && (
                   <span style={{ fontSize: 11.5, color: "#697386" }}>
                     Last checked {new Date(lastRecheck.checked_at).toLocaleDateString()} — {RECHECK_RESULT_LABEL[lastRecheck.result] || lastRecheck.result}
@@ -442,6 +584,7 @@ export default function SchoolProfilePage() {
                 Checks this school&apos;s own website for the on-file head coach&apos;s name — an automated first pass, not a replacement for verifier review.
               </p>
               {recheckError && <div className="notice danger" style={{ marginTop: 8 }}>{recheckError}</div>}
+              {markVerifiedError && <div className="notice danger" style={{ marginTop: 8 }}>{markVerifiedError}</div>}
               {recheckResult && (
                 <div className={RECHECK_RESULT_CLASS[recheckResult.result] || "notice"} style={{ marginTop: 8 }}>
                   {RECHECK_RESULT_LABEL[recheckResult.result] || recheckResult.result}
@@ -533,9 +676,15 @@ export default function SchoolProfilePage() {
           </div>
 
           <div className="card">
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4, flexWrap: "wrap", gap: 8 }}>
               <h3 style={{ margin: 0 }}>Head Football Coach</h3>
-              {!isOwner && (
+              {isStaff && !staffEditing && (
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button className="btn btn-sm btn-primary" onClick={startStaffEdit}>Quick Fix</button>
+                  <button className="btn btn-sm" onClick={startStaffCoachChange}>Mark Coach Change</button>
+                </div>
+              )}
+              {!isOwner && !isStaff && (
                 <button className="btn btn-sm" onClick={() => setShowCorrectionForm((v) => !v)}>
                   {showCorrectionForm ? "Cancel" : "Suggest a correction"}
                 </button>
@@ -553,6 +702,36 @@ export default function SchoolProfilePage() {
               <div className="k">Office</div>
               <div className="v">{fmtPhone(school.hc_office) || <span className="empty-state">not on file</span>}</div>
             </div>
+
+            {isStaff && staffEditing && staffCoachChangeFrom && (
+              <div className="notice" style={{ marginTop: 10, fontSize: 12.5 }}>
+                Recording a new head coach at <strong>{school.name}</strong>. Outgoing: {[staffCoachChangeFrom.hc_first_name, staffCoachChangeFrom.hc_last_name].filter(Boolean).join(" ") || "no name on file"}
+                {staffCoachChangeFrom.hc_email ? ` · ${staffCoachChangeFrom.hc_email}` : ""}
+                {staffCoachChangeFrom.hc_cell ? ` · ${fmtPhone(staffCoachChangeFrom.hc_cell)}` : ""}. Fields left blank below will be cleared, not carried over.
+              </div>
+            )}
+
+            {isStaff && staffEditing && (
+              <form onSubmit={saveStaffEdit} style={{ marginTop: 10, borderTop: "1px solid #eef0f3", paddingTop: 10 }}>
+                {staffSaveError && <div className="notice danger" style={{ marginBottom: 10 }}>{staffSaveError}</div>}
+                <div className="grid grid-2" style={{ marginBottom: 8 }}>
+                  {STAFF_EDIT_FIELDS.map(([field, label]) => (
+                    <div className="form-field" key={field} style={{ marginBottom: 0 }}>
+                      <label>{label}</label>
+                      <input value={staffEditValues[field]} onChange={(e) => setStaffEditValues((v) => ({ ...v, [field]: e.target.value }))} />
+                    </div>
+                  ))}
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button className="btn btn-sm btn-gold" disabled={staffSaving}>
+                    {staffSaving ? "Saving…" : staffCoachChangeFrom ? "Save Coach Change" : "Save & Mark Verified"}
+                  </button>
+                  <button type="button" className="btn btn-sm" onClick={cancelStaffEdit} disabled={staffSaving}>
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            )}
 
             {isOwner && (
               <form onSubmit={saveOwnerForm} style={{ marginTop: 14, borderTop: "1px solid #eef0f3", paddingTop: 12 }}>
