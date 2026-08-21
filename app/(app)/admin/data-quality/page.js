@@ -55,6 +55,20 @@ const RADAR_FILTERS = [
   { key: "confirmed_maxpreps", label: "Confirmed (MaxPreps)" },
 ];
 
+// Every "source" string that can end up on a school_change_log row touching
+// hc_first_name/hc_last_name -- see the Coach Change History card below.
+// Anything not listed here still shows up, just with a plain gray badge
+// carrying the raw source text, so a new write path never goes missing.
+const COACH_CHANGE_SOURCE_META = {
+  "Head coach change (manual)": { label: "Marked coach change", color: "#0b5fff", bg: "#e8f0ff" },
+  "Data quality review (quick fix)": { label: "Quick fix", color: "#697386", bg: "#f0f1f4" },
+  "Coach-submitted correction (approved)": { label: "Coach-submitted (approved)", color: "#1a7f37", bg: "#e6f4ea" },
+  "Coach-submitted correction (approved, edited by verifier)": { label: "Coach-submitted, edited", color: "#1a7f37", bg: "#e6f4ea" },
+  "Bulk correction upload (Data Quality)": { label: "Bulk upload", color: "#8a6100", bg: "#fff4dc" },
+  "Bulk school update (CSV)": { label: "Bulk update tool", color: "#8a6100", bg: "#fff4dc" },
+};
+const COACH_CHANGE_FIELD_LABELS = { hc_first_name: "First name", hc_last_name: "Last name" };
+
 function fmtPhone(v) {
   if (!v) return "";
   const digits = String(v).replace(/\D/g, "");
@@ -98,6 +112,11 @@ export default function DataQualityPage() {
   const [editValues, setEditValues] = useState({});
   const [saving, setSaving] = useState(null);
   const [saveError, setSaveError] = useState("");
+  // Set only when the open editor was opened via "Mark Coach Change" rather
+  // than plain "Quick Fix" -- holds the pre-change school row so the form
+  // can show who the outgoing coach was and saveEdit can tag the write
+  // distinctly in school_change_log (see COACH_CHANGE_SOURCE_META).
+  const [coachChangeFrom, setCoachChangeFrom] = useState(null);
   const scannedAt = useRef(null);
 
   // MaxPreps URL auto-discovery -- only ever active for whichever single
@@ -135,6 +154,16 @@ export default function DataQualityPage() {
   const [uploadApplyError, setUploadApplyError] = useState("");
   const [uploadApplyStatus, setUploadApplyStatus] = useState("");
   const [uploadApplyResult, setUploadApplyResult] = useState(null); // {schools, fields}
+
+  // Coach Change History -- every hc_first_name/hc_last_name entry ever
+  // written to school_change_log, however it got there (Quick Fix, the
+  // "Mark Coach Change" button below, a bulk upload/update, or an approved
+  // coach-submitted correction), grouped so a name change made in one save
+  // shows as one entry instead of two.
+  const [coachChanges, setCoachChanges] = useState([]);
+  const [loadingCoachChanges, setLoadingCoachChanges] = useState(true);
+  const [coachChangeExporting, setCoachChangeExporting] = useState(false);
+  const [coachChangeExportError, setCoachChangeExportError] = useState("");
 
   const loadFlags = useCallback(async () => {
     if (!canReview) {
@@ -191,6 +220,68 @@ export default function DataQualityPage() {
   useEffect(() => {
     loadRadarStats();
   }, [loadRadarStats]);
+
+  const loadCoachChanges = useCallback(async () => {
+    if (!canReview) {
+      setLoadingCoachChanges(false);
+      return;
+    }
+    setLoadingCoachChanges(true);
+    const { data } = await supabase
+      .from("school_change_log")
+      .select("id, school_id, field_name, old_value, new_value, source, changed_at, schools(name,city,state)")
+      .in("field_name", ["hc_first_name", "hc_last_name"])
+      .order("changed_at", { ascending: false })
+      .limit(2000);
+
+    // A single save writes hc_first_name and hc_last_name as separate rows
+    // sharing the same changed_at (one insert statement, one transaction
+    // timestamp) -- group them back into one entry per save.
+    const groups = new Map();
+    (data || []).forEach((row) => {
+      const key = `${row.school_id}|${row.changed_at}`;
+      if (!groups.has(key)) {
+        groups.set(key, { school_id: row.school_id, schools: row.schools, changed_at: row.changed_at, source: row.source, fields: [] });
+      }
+      groups.get(key).fields.push(row);
+    });
+    setCoachChanges(Array.from(groups.values()).sort((a, b) => new Date(b.changed_at) - new Date(a.changed_at)));
+    setLoadingCoachChanges(false);
+  }, [supabase, canReview]);
+
+  useEffect(() => {
+    loadCoachChanges();
+  }, [loadCoachChanges]);
+
+  // Exports the full Coach Change History list (not capped to the ~100
+  // shown on screen) -- one row per changed field, so "old value"/"new
+  // value" stay in their own columns for a spreadsheet.
+  function exportCoachChanges() {
+    setCoachChangeExportError("");
+    setCoachChangeExporting(true);
+    try {
+      const csv = Papa.unparse({
+        fields: ["school_name", "city", "state", "field", "old_value", "new_value", "source", "changed_at"],
+        data: coachChanges.flatMap((g) =>
+          g.fields.map((f) => [
+            g.schools?.name || "",
+            g.schools?.city || "",
+            g.schools?.state || "",
+            COACH_CHANGE_FIELD_LABELS[f.field_name] || f.field_name,
+            f.old_value || "",
+            f.new_value || "",
+            f.source || "",
+            f.changed_at ? new Date(f.changed_at).toISOString() : "",
+          ])
+        ),
+      });
+      downloadBlob(csv, `coach_change_history_${new Date().toISOString().slice(0, 10)}.csv`);
+    } catch (err) {
+      setCoachChangeExportError(err.message || "Could not export this list.");
+    } finally {
+      setCoachChangeExporting(false);
+    }
+  }
 
   function downloadBlob(csv, filename) {
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
@@ -494,6 +585,9 @@ export default function DataQualityPage() {
         setFlaggedQueue((prev) => prev.filter((f) => !updatedIds.has(f.school_id)));
       }
 
+      if (uploadPreview.some((row) => row.fields.some((f) => f.field === "hc_first_name" || f.field === "hc_last_name"))) {
+        loadCoachChanges();
+      }
       setUploadApplyResult({
         schools: applied,
         fields: uploadPreview.reduce((sum, row) => sum + row.fields.length, 0),
@@ -510,6 +604,7 @@ export default function DataQualityPage() {
 
   function startEdit(school) {
     setEditingId(school.id);
+    setCoachChangeFrom(null);
     setSaveError("");
     setDiscoverError("");
     setSuggestions([]);
@@ -523,8 +618,31 @@ export default function DataQualityPage() {
     });
   }
 
+  // Same editor as Quick Fix, but opened specifically to record a head
+  // coach change: the coach fields start blank (rather than pre-filled
+  // with the outgoing coach's info) so you're not left editing stale
+  // values into the new coach's record, the form shows who's leaving, and
+  // the save gets tagged "Head coach change (manual)" in school_change_log
+  // so it shows up clearly in Coach Change History below.
+  function startCoachChange(school) {
+    setEditingId(school.id);
+    setCoachChangeFrom(school);
+    setSaveError("");
+    setDiscoverError("");
+    setSuggestions([]);
+    setEditValues({
+      hc_first_name: "",
+      hc_last_name: "",
+      hc_email: "",
+      hc_cell: "",
+      hc_office: "",
+      maxpreps_url: school.maxpreps_url || "",
+    });
+  }
+
   function cancelEdit() {
     setEditingId(null);
+    setCoachChangeFrom(null);
     setSaveError("");
     setDiscoverError("");
     setSuggestions([]);
@@ -583,6 +701,7 @@ export default function DataQualityPage() {
     setSaveError("");
     try {
       const before = school;
+      const isCoachChange = coachChangeFrom?.id === before.id;
       const changes = [];
       const update = { verification_status: "verified", last_verified_at: new Date().toISOString() };
       EDIT_FIELDS.forEach(([field]) => {
@@ -595,7 +714,7 @@ export default function DataQualityPage() {
             field_name: field,
             old_value: oldVal,
             new_value: newVal,
-            source: "Data quality review (quick fix)",
+            source: isCoachChange ? "Head coach change (manual)" : "Data quality review (quick fix)",
             changed_by: user.id,
           });
         }
@@ -624,7 +743,11 @@ export default function DataQualityPage() {
       // Also reflect the fix in the "Find & Edit a School" search results,
       // if this school is showing there -- a no-op otherwise.
       setSearchResults((prev) => prev.map((s) => (s.id === before.id ? { ...s, ...update } : s)));
+      if (changes.some((c) => c.field_name === "hc_first_name" || c.field_name === "hc_last_name")) {
+        loadCoachChanges();
+      }
       setEditingId(null);
+      setCoachChangeFrom(null);
     } catch (err) {
       setSaveError(err.message || "Could not save this fix.");
     } finally {
@@ -721,10 +844,21 @@ export default function DataQualityPage() {
                 <div style={{ display: "flex", gap: 6 }}>
                   <Link href={`/schools/${s.id}`} className="btn btn-sm">Open Profile</Link>
                   {!isEditing && (
-                    <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
+                    <>
+                      <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
+                      <button className="btn btn-sm" onClick={() => startCoachChange(s)}>Mark Coach Change</button>
+                    </>
                   )}
                 </div>
               </div>
+
+              {isEditing && coachChangeFrom?.id === s.id && (
+                <div className="notice" style={{ marginTop: 8, fontSize: 12.5 }}>
+                  Recording a new head coach at <strong>{s.name}</strong>. Outgoing: {[coachChangeFrom.hc_first_name, coachChangeFrom.hc_last_name].filter(Boolean).join(" ") || "no name on file"}
+                  {coachChangeFrom.hc_email ? ` · ${coachChangeFrom.hc_email}` : ""}
+                  {coachChangeFrom.hc_cell ? ` · ${fmtPhone(coachChangeFrom.hc_cell)}` : ""}. Fields left blank below will be cleared, not carried over.
+                </div>
+              )}
 
               {isEditing && (
                 <div style={{ background: "#f7f8fa", border: "1px solid #dde1e7", borderRadius: 8, padding: 10, marginTop: 8 }}>
@@ -760,7 +894,7 @@ export default function DataQualityPage() {
                   {saveError && <div className="notice danger" style={{ marginBottom: 8 }}>{saveError}</div>}
                   <div style={{ display: "flex", gap: 8 }}>
                     <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
-                      {saving === s.id ? "Saving…" : "Save & Mark Verified"}
+                      {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : "Save & Mark Verified"}
                     </button>
                     <button type="button" className="btn btn-sm" onClick={cancelEdit} disabled={saving === s.id}>
                       Cancel
@@ -885,6 +1019,60 @@ export default function DataQualityPage() {
       </div>
 
       <div className="card" style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+          <div>
+            <h3 style={{ marginBottom: 4 }}>Coach Change History</h3>
+            <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 0 }}>
+              Every recorded head coach name change, however it was made — &quot;Mark Coach Change,&quot; a Quick Fix, a bulk upload, or an approved coach-submitted correction.
+            </p>
+          </div>
+          <button className="btn btn-sm" onClick={exportCoachChanges} disabled={coachChangeExporting || coachChanges.length === 0}>
+            {coachChangeExporting ? "Exporting…" : "Download CSV"}
+          </button>
+        </div>
+        {coachChangeExportError && <div className="notice danger" style={{ marginTop: 10 }}>{coachChangeExportError}</div>}
+        {loadingCoachChanges ? (
+          <div className="empty-state" style={{ marginTop: 10 }}>Loading…</div>
+        ) : coachChanges.length === 0 ? (
+          <div className="empty-state" style={{ marginTop: 10 }}>No coach changes recorded yet.</div>
+        ) : (
+          <div style={{ maxHeight: 360, overflow: "auto", marginTop: 10 }}>
+            {coachChanges.slice(0, 100).map((g) => {
+              const meta = COACH_CHANGE_SOURCE_META[g.source] || { label: g.source || "Unknown source", color: "#697386", bg: "#f0f1f4" };
+              return (
+                <div className="log-item" key={`${g.school_id}|${g.changed_at}`} style={{ paddingBottom: 10 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+                    <div>
+                      <strong>{g.schools?.name}</strong> — {g.schools?.city}, {g.schools?.state}
+                      <span className="badge" style={{ marginLeft: 8, color: meta.color, background: meta.bg }}>{meta.label}</span>
+                      <div style={{ marginTop: 4, fontSize: 12.5 }}>
+                        {g.fields.map((f) => (
+                          <div key={f.id}>
+                            {COACH_CHANGE_FIELD_LABELS[f.field_name] || f.field_name}: <span style={{ color: "#697386" }}>{f.old_value || "—"}</span> → <strong>{f.new_value || "—"}</strong>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                      <Link href={`/schools/${g.school_id}`} className="btn btn-sm">Open Profile</Link>
+                      <span style={{ fontSize: 11, color: "#9aa2b1", whiteSpace: "nowrap" }}>
+                        {g.changed_at ? new Date(g.changed_at).toLocaleString() : ""}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+            {coachChanges.length > 100 && (
+              <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
+                Showing the first 100 of {coachChanges.length.toLocaleString()} — download the CSV for the full list.
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="card" style={{ marginBottom: 14 }}>
         <h3 style={{ marginBottom: 4 }}>Flagged as Possibly Outdated ({flaggedQueue.length})</h3>
         <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
           Reported by coaches browsing the database, or raised automatically by Coach-Change Radar — surfaces here immediately, no scan needed.
@@ -925,13 +1113,24 @@ export default function DataQualityPage() {
                   <div style={{ display: "flex", gap: 6 }}>
                     <Link href={`/schools/${flag.school_id}`} className="btn btn-sm">Open Profile</Link>
                     {!isEditing && s && (
-                      <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
+                      <>
+                        <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
+                        <button className="btn btn-sm" onClick={() => startCoachChange(s)}>Mark Coach Change</button>
+                      </>
                     )}
                     <button className="btn btn-sm" disabled={flagActionId === flag.id} onClick={() => confirmAccurate(flag)}>
                       {flagActionId === flag.id ? "Saving…" : "Confirm accurate"}
                     </button>
                   </div>
                 </div>
+
+                {isEditing && s && coachChangeFrom?.id === s.id && (
+                  <div className="notice" style={{ marginTop: 8, fontSize: 12.5 }}>
+                    Recording a new head coach at <strong>{s.name}</strong>. Outgoing: {[coachChangeFrom.hc_first_name, coachChangeFrom.hc_last_name].filter(Boolean).join(" ") || "no name on file"}
+                    {coachChangeFrom.hc_email ? ` · ${coachChangeFrom.hc_email}` : ""}
+                    {coachChangeFrom.hc_cell ? ` · ${fmtPhone(coachChangeFrom.hc_cell)}` : ""}. Fields left blank below will be cleared, not carried over.
+                  </div>
+                )}
 
                 {isEditing && s && (
                   <div style={{ background: "#f7f8fa", border: "1px solid #dde1e7", borderRadius: 8, padding: 10, marginTop: 8 }}>
@@ -967,7 +1166,7 @@ export default function DataQualityPage() {
                     {saveError && <div className="notice danger" style={{ marginBottom: 8 }}>{saveError}</div>}
                     <div style={{ display: "flex", gap: 8 }}>
                       <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
-                        {saving === s.id ? "Saving…" : "Save & Mark Verified"}
+                        {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : "Save & Mark Verified"}
                       </button>
                       <button type="button" className="btn btn-sm" onClick={cancelEdit} disabled={saving === s.id}>
                         Cancel
@@ -1141,10 +1340,21 @@ export default function DataQualityPage() {
                       <div style={{ display: "flex", gap: 6 }}>
                         <Link href={`/schools/${s.id}`} className="btn btn-sm">Open Profile</Link>
                         {!isEditing && (
-                          <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
+                          <>
+                            <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
+                            <button className="btn btn-sm" onClick={() => startCoachChange(s)}>Mark Coach Change</button>
+                          </>
                         )}
                       </div>
                     </div>
+
+                    {isEditing && coachChangeFrom?.id === s.id && (
+                      <div className="notice" style={{ marginTop: 8, fontSize: 12.5 }}>
+                        Recording a new head coach at <strong>{s.name}</strong>. Outgoing: {[coachChangeFrom.hc_first_name, coachChangeFrom.hc_last_name].filter(Boolean).join(" ") || "no name on file"}
+                        {coachChangeFrom.hc_email ? ` · ${coachChangeFrom.hc_email}` : ""}
+                        {coachChangeFrom.hc_cell ? ` · ${fmtPhone(coachChangeFrom.hc_cell)}` : ""}. Fields left blank below will be cleared, not carried over.
+                      </div>
+                    )}
 
                     {isEditing && (
                       <div style={{ background: "#f7f8fa", border: "1px solid #dde1e7", borderRadius: 8, padding: 10, marginTop: 8 }}>
@@ -1182,7 +1392,7 @@ export default function DataQualityPage() {
                         </div>
                         <div style={{ display: "flex", gap: 8 }}>
                           <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
-                            {saving === s.id ? "Saving…" : "Save & Mark Verified"}
+                            {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : "Save & Mark Verified"}
                           </button>
                           <button type="button" className="btn btn-sm" onClick={cancelEdit} disabled={saving === s.id}>
                             Cancel
