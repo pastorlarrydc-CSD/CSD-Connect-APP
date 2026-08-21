@@ -28,6 +28,11 @@ const RECRUITING_BADGE_CLASS = { watching: "badge-watching", offered: "badge-off
 // consistent/filterable across a whole staff. See prospect_tags table.
 const TAG_OPTIONS = ["Priority", "Sleeper", "Needs Film", "Camp Invite", "Grayshirt", "Preferred Walk-on", "Do Not Pursue"];
 
+// Optional scouting category for a note -- lets film/observation notes be
+// tagged and skimmed without forcing every note into a rigid structure.
+// See prospect_notes.note_category (checked against this same list in the DB).
+const NOTE_CATEGORIES = ["General", "Speed/Athleticism", "Technique", "Football IQ", "Effort/Competitiveness", "Concern", "Big Play"];
+
 export default function ProspectDetailPage() {
   const { id } = useParams();
   const router = useRouter();
@@ -103,6 +108,8 @@ export default function ProspectDetailPage() {
   const [ratingSaving, setRatingSaving] = useState(false);
   const [tagSaving, setTagSaving] = useState("");
   const [noteDraft, setNoteDraft] = useState("");
+  const [noteTimestamp, setNoteTimestamp] = useState("");
+  const [noteCategory, setNoteCategory] = useState("General");
   const [noteSaving, setNoteSaving] = useState(false);
   const [scoutingError, setScoutingError] = useState("");
 
@@ -183,7 +190,12 @@ export default function ProspectDetailPage() {
     const [{ data: ratingRow }, { data: tagRows }, { data: noteRows }] = await Promise.all([
       supabase.from("prospect_ratings").select("rating").eq("college_id", college.id).eq("prospect_id", id).maybeSingle(),
       supabase.from("prospect_tags").select("tag").eq("college_id", college.id).eq("prospect_id", id),
-      supabase.from("prospect_notes").select("id,note,created_at").eq("college_id", college.id).eq("prospect_id", id).order("created_at", { ascending: false }),
+      supabase
+        .from("prospect_notes")
+        .select("id,note,created_at,film_timestamp,note_category")
+        .eq("college_id", college.id)
+        .eq("prospect_id", id)
+        .order("created_at", { ascending: false }),
     ]);
     setScoutingRating(ratingRow?.rating || 0);
     setScoutingTags((tagRows || []).map((t) => t.tag));
@@ -248,9 +260,18 @@ export default function ProspectDetailPage() {
     setScoutingError("");
     setNoteSaving(true);
     try {
-      const { error } = await supabase.from("prospect_notes").insert({ college_id: college.id, prospect_id: Number(id), note: noteDraft.trim(), written_by: user.id });
+      const { error } = await supabase.from("prospect_notes").insert({
+        college_id: college.id,
+        prospect_id: Number(id),
+        note: noteDraft.trim(),
+        written_by: user.id,
+        film_timestamp: noteTimestamp.trim() || null,
+        note_category: noteCategory || null,
+      });
       if (error) throw error;
       setNoteDraft("");
+      setNoteTimestamp("");
+      setNoteCategory("General");
       loadScouting();
     } catch (err) {
       setScoutingError(err.message || "Could not save note.");
@@ -834,22 +855,50 @@ export default function ProspectDetailPage() {
                   </div>
 
                   <div>
-                    <div style={{ fontSize: 12, fontWeight: 600, color: "#3a4557", marginBottom: 6 }}>Notes</div>
-                    <form onSubmit={addNote} style={{ display: "flex", gap: 6, marginBottom: 10 }}>
-                      <input
-                        value={noteDraft}
-                        onChange={(e) => setNoteDraft(e.target.value)}
-                        placeholder="Add a scouting note…"
-                        style={{ flex: 1 }}
-                      />
-                      <button className="btn btn-sm btn-primary" disabled={noteSaving || !noteDraft.trim()}>
-                        {noteSaving ? "Saving…" : "Add"}
-                      </button>
+                    <div style={{ fontSize: 12, fontWeight: 600, color: "#3a4557", marginBottom: 2 }}>Notes</div>
+                    <p style={{ fontSize: 11, color: "#9aa2b1", margin: "0 0 8px" }}>
+                      Referencing the Hudl film above? Add a moment marker (e.g. &quot;2:15&quot;) and a category so film breakdowns are easy to skim later. Hudl doesn&apos;t let us jump the player to it automatically — it&apos;s a note to yourself/your staff.
+                    </p>
+                    <form onSubmit={addNote} style={{ marginBottom: 10 }}>
+                      <div style={{ display: "flex", gap: 6, marginBottom: 6, flexWrap: "wrap" }}>
+                        <input
+                          value={noteTimestamp}
+                          onChange={(e) => setNoteTimestamp(e.target.value)}
+                          placeholder="Film marker (optional, e.g. 2:15)"
+                          style={{ width: 190 }}
+                        />
+                        <select value={noteCategory} onChange={(e) => setNoteCategory(e.target.value)} style={{ width: 190 }}>
+                          {NOTE_CATEGORIES.map((c) => (
+                            <option key={c} value={c}>
+                              {c}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <input
+                          value={noteDraft}
+                          onChange={(e) => setNoteDraft(e.target.value)}
+                          placeholder="Add a scouting note…"
+                          style={{ flex: 1 }}
+                        />
+                        <button className="btn btn-sm btn-primary" disabled={noteSaving || !noteDraft.trim()}>
+                          {noteSaving ? "Saving…" : "Add"}
+                        </button>
+                      </div>
                     </form>
                     {scoutingNotes.length ? (
                       scoutingNotes.map((n) => (
                         <div className="log-item" key={n.id}>
-                          <span className="when">{new Date(n.created_at).toLocaleString()}</span>
+                          <span className="when">
+                            {new Date(n.created_at).toLocaleString()}
+                            {n.film_timestamp ? ` · film @ ${n.film_timestamp}` : ""}
+                          </span>
+                          {n.note_category && (
+                            <span className="badge badge-not-contacted" style={{ marginRight: 6, marginBottom: 4, display: "inline-block" }}>
+                              {n.note_category}
+                            </span>
+                          )}
                           <div style={{ fontSize: 13 }}>{n.note}</div>
                         </div>
                       ))
