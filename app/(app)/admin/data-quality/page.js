@@ -126,6 +126,11 @@ export default function DataQualityPage() {
   // can show who the outgoing coach was and saveEdit can tag the write
   // distinctly in school_change_log (see COACH_CHANGE_SOURCE_META).
   const [coachChangeFrom, setCoachChangeFrom] = useState(null);
+  // A lighter-weight sibling to Quick Fix -- for a school found via search
+  // or turned up by a scan where nothing actually needs to change, just a
+  // "yes, I checked this, it's still right" without opening the editor.
+  const [markingVerifiedId, setMarkingVerifiedId] = useState(null);
+  const [markVerifiedError, setMarkVerifiedError] = useState("");
   const scannedAt = useRef(null);
 
   // MaxPreps URL auto-discovery -- only ever active for whichever single
@@ -701,6 +706,42 @@ export default function DataQualityPage() {
     setFlaggedQueue((prev) => prev.filter((f) => f.school_id !== schoolId));
   }
 
+  // Marks a school verified with no field changes -- for a record found
+  // via search or a scan that you've actually checked (in person, on the
+  // phone, on the school's website) and it's already correct. Same effect
+  // as "Confirm accurate" in the flagged queue below, just reachable from
+  // places that don't have a flag to confirm against. Doesn't touch
+  // confidence_score directly -- the database recalculates that on its own
+  // the moment verification_status/last_verified_at change (see the
+  // trg_set_school_confidence_score trigger), so the on-screen % badge may
+  // lag a beat until the next search or scan picks up the fresh value.
+  async function markVerified(school) {
+    setMarkingVerifiedId(school.id);
+    setMarkVerifiedError("");
+    try {
+      const update = { verification_status: "verified", last_verified_at: new Date().toISOString() };
+      const { error } = await supabase.from("schools").update(update).eq("id", school.id);
+      if (error) throw error;
+      await resolvePendingFlags(school.id);
+
+      const merged = { ...school, ...update };
+      setResult((prev) => {
+        if (!prev) return prev;
+        const nextFlagged = prev.flagged.map((r) => (r.school.id === school.id ? { ...r, school: merged } : r));
+        const reclass = classifySchool(merged);
+        const finalFlagged = reclass.actionable
+          ? nextFlagged.map((r) => (r.school.id === school.id ? { ...r, ...reclass, school: merged } : r))
+          : nextFlagged.filter((r) => r.school.id !== school.id);
+        return { ...prev, flagged: finalFlagged, totalFlagged: finalFlagged.length };
+      });
+      setSearchResults((prev) => prev.map((s) => (s.id === school.id ? { ...s, ...update } : s)));
+    } catch (err) {
+      setMarkVerifiedError(err.message || "Could not mark this school verified.");
+    } finally {
+      setMarkingVerifiedId(null);
+    }
+  }
+
   // Saves the quick-fix directly to schools (verifier/sysadmin have direct
   // write access via RLS -- this doesn't go through the coach-suggestion
   // review queue, since the reviewer IS the one making the fix here) and
@@ -840,6 +881,7 @@ export default function DataQualityPage() {
           </button>
         </form>
         {searchError && <div className="notice danger" style={{ marginBottom: 10 }}>{searchError}</div>}
+        {markVerifiedError && <div className="notice danger" style={{ marginBottom: 10 }}>{markVerifiedError}</div>}
         {hasSearched && !searching && !searchError && searchResults.length === 0 && (
           <div className="empty-state">No schools matched &quot;{schoolQuery}&quot;.</div>
         )}
@@ -865,6 +907,9 @@ export default function DataQualityPage() {
                     <>
                       <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
                       <button className="btn btn-sm" onClick={() => startCoachChange(s)}>Mark Coach Change</button>
+                      <button className="btn btn-sm" disabled={markingVerifiedId === s.id} onClick={() => markVerified(s)}>
+                        {markingVerifiedId === s.id ? "Marking…" : "Mark Verified"}
+                      </button>
                     </>
                   )}
                 </div>
@@ -1339,6 +1384,7 @@ export default function DataQualityPage() {
             </div>
 
             {saveError && <div className="notice danger" style={{ margin: "8px 0" }}>{saveError}</div>}
+            {markVerifiedError && <div className="notice danger" style={{ margin: "8px 0" }}>{markVerifiedError}</div>}
             {visibleRows.length === 0 ? (
               <div className="empty-state">Nothing in this filter — nice work.</div>
             ) : (
@@ -1369,6 +1415,9 @@ export default function DataQualityPage() {
                           <>
                             <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
                             <button className="btn btn-sm" onClick={() => startCoachChange(s)}>Mark Coach Change</button>
+                            <button className="btn btn-sm" disabled={markingVerifiedId === s.id} onClick={() => markVerified(s)}>
+                              {markingVerifiedId === s.id ? "Marking…" : "Mark Verified"}
+                            </button>
                           </>
                         )}
                       </div>
