@@ -3,7 +3,6 @@ import { useEffect, useState, useCallback, Fragment } from "react";
 import Link from "next/link";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
-import { computeConfidenceScore } from "@/lib/dataQuality";
 
 const ROLE_TABLE = [
   ["College Coach / Staff", "Search, map, CRM, watchlists — own college's data only"],
@@ -143,9 +142,10 @@ export default function AdminPage() {
       if (Object.keys(update).length) {
         update.verification_status = "verified";
         update.last_verified_at = new Date().toISOString();
-        // Redo the confidence score against the record as it will look
-        // right after this approval lands -- see lib/dataQuality.js.
-        update.confidence_score = computeConfidenceScore({ ...current, ...update });
+        // confidence_score is NOT set here -- schools has a BEFORE
+        // UPDATE trigger (trg_set_school_confidence_score) that
+        // recomputes it from the row's own columns on every write, so
+        // anything sent here would just be silently overridden anyway.
         const { error } = await supabase.from("schools").update(update).eq("id", suggestion.school_id);
         if (error) throw error;
         if (changes.length) {
