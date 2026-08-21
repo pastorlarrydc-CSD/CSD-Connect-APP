@@ -105,6 +105,17 @@ export default function DataQualityPage() {
   const [discoverError, setDiscoverError] = useState("");
   const [suggestions, setSuggestions] = useState([]);
 
+  // "Find & Edit a School" -- a standalone lookup so any school can be
+  // reopened for a Quick Fix at any time, not just ones currently flagged
+  // or turned up by a scan. Shares editingId/editValues/saveEdit with the
+  // other two lists above, so once a school shows up here, everything
+  // (including MaxPreps discovery) works exactly the same way.
+  const [schoolQuery, setSchoolQuery] = useState("");
+  const [searchResults, setSearchResults] = useState([]);
+  const [searching, setSearching] = useState(false);
+  const [searchError, setSearchError] = useState("");
+  const [hasSearched, setHasSearched] = useState(false);
+
   const loadFlags = useCallback(async () => {
     if (!canReview) {
       setLoadingFlags(false);
@@ -220,6 +231,29 @@ export default function DataQualityPage() {
     }
     return rows;
   }, [supabase]);
+
+  async function searchSchoolsByName(e) {
+    e.preventDefault();
+    const q = schoolQuery.trim();
+    if (!q) return;
+    setSearching(true);
+    setSearchError("");
+    setHasSearched(true);
+    try {
+      const { data, error } = await supabase
+        .from("schools")
+        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,maxpreps_url")
+        .ilike("name", `%${q}%`)
+        .order("name")
+        .limit(25);
+      if (error) throw error;
+      setSearchResults(data || []);
+    } catch (err) {
+      setSearchError(err.message || "Could not search schools.");
+    } finally {
+      setSearching(false);
+    }
+  }
 
   const runScan = useCallback(async () => {
     setScanning(true);
@@ -348,6 +382,9 @@ export default function DataQualityPage() {
           : nextFlagged.filter((r) => r.school.id !== before.id);
         return { ...prev, flagged: finalFlagged, totalFlagged: finalFlagged.length };
       });
+      // Also reflect the fix in the "Find & Edit a School" search results,
+      // if this school is showing there -- a no-op otherwise.
+      setSearchResults((prev) => prev.map((s) => (s.id === before.id ? { ...s, ...update } : s)));
       setEditingId(null);
     } catch (err) {
       setSaveError(err.message || "Could not save this fix.");
@@ -407,6 +444,94 @@ export default function DataQualityPage() {
         <button className="btn btn-gold" onClick={runScan} disabled={scanning}>
           {scanning ? "Scanning…" : result ? "Re-scan Database" : "Scan Database"}
         </button>
+      </div>
+
+      <div className="card" style={{ marginBottom: 14 }}>
+        <h3 style={{ marginBottom: 4 }}>Find &amp; Edit a School</h3>
+        <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
+          Look up any school by name to open its Quick Fix editor — not just ones currently flagged or turned up by a scan. Use this to get back to a school you already fixed, or to add something (like a MaxPreps URL) you didn't have on hand the first time.
+        </p>
+        <form onSubmit={searchSchoolsByName} style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+          <input
+            value={schoolQuery}
+            onChange={(e) => setSchoolQuery(e.target.value)}
+            placeholder="School name…"
+            style={{ flex: 1 }}
+          />
+          <button className="btn btn-sm btn-gold" type="submit" disabled={searching || !schoolQuery.trim()}>
+            {searching ? "Searching…" : "Search"}
+          </button>
+        </form>
+        {searchError && <div className="notice danger" style={{ marginBottom: 10 }}>{searchError}</div>}
+        {hasSearched && !searching && !searchError && searchResults.length === 0 && (
+          <div className="empty-state">No schools matched &quot;{schoolQuery}&quot;.</div>
+        )}
+        {searchResults.map((s) => {
+          const isEditing = editingId === s.id;
+          return (
+            <div className="log-item" key={s.id} style={{ paddingBottom: 12 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+                <div>
+                  <strong>{s.name}</strong> — {s.city}, {s.state}
+                  <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
+                    {[s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ") || "no coach name"}
+                    {s.hc_email ? ` · ${s.hc_email}` : ""}
+                    {s.hc_cell ? ` · ${fmtPhone(s.hc_cell)}` : ""}
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <Link href={`/schools/${s.id}`} className="btn btn-sm">Open Profile</Link>
+                  {!isEditing && (
+                    <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
+                  )}
+                </div>
+              </div>
+
+              {isEditing && (
+                <div style={{ background: "#f7f8fa", border: "1px solid #dde1e7", borderRadius: 8, padding: 10, marginTop: 8 }}>
+                  <div className="grid grid-2" style={{ marginBottom: 8 }}>
+                    {EDIT_FIELDS.map(([field, label]) => (
+                      <div className="form-field" key={field} style={{ marginBottom: 0 }}>
+                        <label>{label}</label>
+                        <input value={editValues[field]} onChange={(e) => setEditValues((prev) => ({ ...prev, [field]: e.target.value }))} />
+                      </div>
+                    ))}
+                  </div>
+                  <div style={{ marginBottom: 8 }}>
+                    <button type="button" className="btn btn-sm" disabled={discovering} onClick={() => discoverMaxPreps(s)}>
+                      {discovering ? "Searching…" : "Find MaxPreps page"}
+                    </button>
+                    {discoverError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverError}</div>}
+                    {suggestions.length > 0 && (
+                      <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                        {suggestions.map((sugg) => (
+                          <button
+                            type="button"
+                            key={sugg.link}
+                            className="btn btn-sm"
+                            style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
+                            onClick={() => pickSuggestion(sugg.link)}
+                          >
+                            {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  {saveError && <div className="notice danger" style={{ marginBottom: 8 }}>{saveError}</div>}
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
+                      {saving === s.id ? "Saving…" : "Save & Mark Verified"}
+                    </button>
+                    <button type="button" className="btn btn-sm" onClick={cancelEdit} disabled={saving === s.id}>
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
       </div>
 
       <div className="card" style={{ marginBottom: 14 }}>
