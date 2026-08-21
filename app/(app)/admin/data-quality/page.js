@@ -1,6 +1,7 @@
 "use client";
 import { useState, useEffect, useCallback, useRef } from "react";
 import Link from "next/link";
+import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 import { classifySchools, classifySchool } from "@/lib/dataQuality";
@@ -31,6 +32,28 @@ const EDIT_FIELDS = [
 // apart from flags a coach raised by hand from a school profile page.
 const AUTOMATED_FLAG_PREFIX = "Automated nightly recheck";
 
+// Every result code checkSchoolCoach/checkSchoolCoach can return (see
+// lib/schoolRecheck.js), with how each shows up in the Coach-Change Radar
+// report below -- label, filter option, and pill color.
+const RADAR_RESULT_META = {
+  confirmed: { label: "Confirmed", color: "#1a7f37", bg: "#e6f4ea" },
+  confirmed_maxpreps: { label: "Confirmed (MaxPreps)", color: "#1a7f37", bg: "#e6f4ea" },
+  not_found: { label: "Not found", color: "#b3261e", bg: "#fbe9e7" },
+  fetch_error: { label: "Could not load", color: "#8a6100", bg: "#fff4dc" },
+  no_website: { label: "No website on file", color: "#697386", bg: "#f0f1f4" },
+  no_coach_on_file: { label: "No coach on file", color: "#697386", bg: "#f0f1f4" },
+};
+
+const RADAR_FILTERS = [
+  { key: "all", label: "All results" },
+  { key: "not_found", label: "Not found" },
+  { key: "fetch_error", label: "Could not load" },
+  { key: "no_website", label: "No website on file" },
+  { key: "no_coach_on_file", label: "No coach on file" },
+  { key: "confirmed", label: "Confirmed" },
+  { key: "confirmed_maxpreps", label: "Confirmed (MaxPreps)" },
+];
+
 function fmtPhone(v) {
   if (!v) return "";
   const digits = String(v).replace(/\D/g, "");
@@ -52,12 +75,18 @@ export default function DataQualityPage() {
   const [flagActionId, setFlagActionId] = useState(null);
   const [flagActionError, setFlagActionError] = useState("");
 
-  // Coach-Change Radar summary -- aggregate stats from the nightly
-  // automated sweep's most recent run, pulled from school_recheck_log
-  // (every row the sweep writes is tagged with a "[Automated nightly
-  // sweep]" detail prefix so it can be told apart from on-demand checks).
+  // Coach-Change Radar summary -- aggregate stats AND the underlying rows
+  // from the nightly automated sweep's most recent run, pulled from
+  // school_recheck_log (every row the sweep writes is tagged with a
+  // "[Automated nightly sweep]" detail prefix so it can be told apart from
+  // on-demand checks). radarRows backs both the browsable report table
+  // below and the CSV export -- radarStats is just the summary card.
   const [radarStats, setRadarStats] = useState(null);
+  const [radarRows, setRadarRows] = useState([]);
   const [loadingRadar, setLoadingRadar] = useState(true);
+  const [radarFilter, setRadarFilter] = useState("all");
+  const [radarExporting, setRadarExporting] = useState(false);
+  const [radarExportError, setRadarExportError] = useState("");
 
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState("");
@@ -107,7 +136,7 @@ export default function DataQualityPage() {
     const since = new Date(Date.now() - 26 * 60 * 60 * 1000).toISOString();
     const { data } = await supabase
       .from("school_recheck_log")
-      .select("result, checked_at")
+      .select("id, school_id, result, detail, website_checked, coach_name_checked, checked_at, schools(name,city,state)")
       .ilike("detail", "[Automated nightly sweep]%")
       .gte("checked_at", since)
       .order("checked_at", { ascending: false })
@@ -115,6 +144,7 @@ export default function DataQualityPage() {
 
     if (!data || data.length === 0) {
       setRadarStats({ checked: 0, lastRunAt: null, counts: {} });
+      setRadarRows([]);
       setLoadingRadar(false);
       return;
     }
@@ -123,12 +153,56 @@ export default function DataQualityPage() {
       counts[row.result] = (counts[row.result] || 0) + 1;
     });
     setRadarStats({ checked: data.length, lastRunAt: data[0].checked_at, counts });
+    setRadarRows(data);
     setLoadingRadar(false);
   }, [supabase, canReview]);
 
   useEffect(() => {
     loadRadarStats();
   }, [loadRadarStats]);
+
+  function downloadBlob(csv, filename) {
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  // Exports whatever the report table below is currently filtered to --
+  // "Not Found" for a coaches-not-found report, "Could Not Load" for a
+  // report of websites the sweep couldn't even fetch, or "All results" for
+  // the full list of every school checked in the last run.
+  function exportRadarLog() {
+    setRadarExportError("");
+    setRadarExporting(true);
+    try {
+      const rows = radarFilter === "all" ? radarRows : radarRows.filter((r) => r.result === radarFilter);
+      const csv = Papa.unparse({
+        fields: ["school_name", "city", "state", "result", "website_checked", "coach_name_checked", "detail", "checked_at"],
+        data: rows.map((r) => [
+          r.schools?.name || "",
+          r.schools?.city || "",
+          r.schools?.state || "",
+          RADAR_RESULT_META[r.result]?.label || r.result,
+          r.website_checked || "",
+          r.coach_name_checked || "",
+          (r.detail || "").replace("[Automated nightly sweep] ", ""),
+          r.checked_at ? new Date(r.checked_at).toISOString() : "",
+        ]),
+      });
+      const suffix = radarFilter === "all" ? "all" : radarFilter;
+      downloadBlob(csv, `coach_change_radar_${suffix}_${new Date().toISOString().slice(0, 10)}.csv`);
+    } catch (err) {
+      setRadarExportError(err.message || "Could not export this report.");
+    } finally {
+      setRadarExporting(false);
+    }
+  }
 
   const fetchAllSchools = useCallback(async () => {
     const rows = [];
@@ -318,6 +392,7 @@ export default function DataQualityPage() {
   const visibleTotal = result ? result.flagged.filter((r) => filter === "all" || r.issues.some((iss) => iss.code === filter)).length : 0;
   const automatedPendingCount = flaggedQueue.filter((f) => (f.reason || "").startsWith(AUTOMATED_FLAG_PREFIX)).length;
   const confirmedTotal = (radarStats?.counts.confirmed || 0) + (radarStats?.counts.confirmed_maxpreps || 0);
+  const radarFilteredRows = radarFilter === "all" ? radarRows : radarRows.filter((r) => r.result === radarFilter);
 
   return (
     <div className="view">
@@ -366,6 +441,82 @@ export default function DataQualityPage() {
               <div className="sub">in the queue below</div>
             </div>
           </div>
+        )}
+
+        {radarStats && radarStats.checked > 0 && (
+          <>
+            <div className="filters" style={{ marginTop: 12 }}>
+              {RADAR_FILTERS.map((f) => (
+                <button
+                  key={f.key}
+                  className="btn btn-sm"
+                  style={radarFilter === f.key ? { background: "#0b1f3a", color: "#fff", borderColor: "#0b1f3a" } : undefined}
+                  onClick={() => setRadarFilter(f.key)}
+                >
+                  {f.label}
+                  {f.key !== "all" && radarStats.counts[f.key] ? ` (${radarStats.counts[f.key]})` : ""}
+                </button>
+              ))}
+              <button
+                type="button"
+                className="btn btn-sm"
+                style={{ marginLeft: "auto" }}
+                disabled={radarExporting || radarFilteredRows.length === 0}
+                onClick={exportRadarLog}
+              >
+                {radarExporting ? "Exporting…" : "Download CSV"}
+              </button>
+            </div>
+            {radarExportError && <div className="notice danger" style={{ marginTop: 8 }}>{radarExportError}</div>}
+
+            <div style={{ marginTop: 10 }}>
+              {radarFilteredRows.length === 0 ? (
+                <div className="empty-state">Nothing matches this filter in last night&apos;s run.</div>
+              ) : (
+                <>
+                  {radarFilteredRows.slice(0, DISPLAY_CAP).map((row) => {
+                    const meta = RADAR_RESULT_META[row.result] || { label: row.result, color: "#42506b", bg: "#e8ebf0" };
+                    return (
+                      <div className="log-item" key={row.id} style={{ paddingBottom: 10 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+                          <div>
+                            <strong>{row.schools?.name || `School #${row.school_id}`}</strong> — {row.schools?.city}, {row.schools?.state}
+                            <span
+                              style={{
+                                marginLeft: 8,
+                                fontSize: 11,
+                                fontWeight: 600,
+                                padding: "2px 8px",
+                                borderRadius: 999,
+                                color: meta.color,
+                                background: meta.bg,
+                              }}
+                            >
+                              {meta.label}
+                            </span>
+                            <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
+                              {(row.detail || "").replace("[Automated nightly sweep] ", "")}
+                            </div>
+                          </div>
+                          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                            <Link href={`/schools/${row.school_id}`} className="btn btn-sm">Open Profile</Link>
+                            <span style={{ fontSize: 11, color: "#9aa2b1", whiteSpace: "nowrap" }}>
+                              {row.checked_at ? new Date(row.checked_at).toLocaleString() : ""}
+                            </span>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {radarFilteredRows.length > DISPLAY_CAP && (
+                    <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
+                      Showing the first {DISPLAY_CAP} of {radarFilteredRows.length.toLocaleString()} — download the CSV for the full list.
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+          </>
         )}
       </div>
 
