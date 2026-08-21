@@ -70,6 +70,12 @@ export default function DataQualityPage() {
   const [saveError, setSaveError] = useState("");
   const scannedAt = useRef(null);
 
+  // MaxPreps URL auto-discovery -- only ever active for whichever single
+  // row is currently being edited (editingId), same as editValues itself.
+  const [discovering, setDiscovering] = useState(false);
+  const [discoverError, setDiscoverError] = useState("");
+  const [suggestions, setSuggestions] = useState([]);
+
   const loadFlags = useCallback(async () => {
     if (!canReview) {
       setLoadingFlags(false);
@@ -158,6 +164,8 @@ export default function DataQualityPage() {
   function startEdit(school) {
     setEditingId(school.id);
     setSaveError("");
+    setDiscoverError("");
+    setSuggestions([]);
     setEditValues({
       hc_first_name: school.hc_first_name || "",
       hc_last_name: school.hc_last_name || "",
@@ -171,6 +179,41 @@ export default function DataQualityPage() {
   function cancelEdit() {
     setEditingId(null);
     setSaveError("");
+    setDiscoverError("");
+    setSuggestions([]);
+  }
+
+  // Asks Google's Programmable Search Engine (via our own API route, which
+  // holds the actual key) where this school's MaxPreps page lives, rather
+  // than scraping MaxPreps directly -- see app/api/schools/[id]/discover-
+  // maxpreps for why. Only ever returns candidates for a human to pick
+  // from; never writes maxpreps_url on its own.
+  async function discoverMaxPreps(school) {
+    setDiscovering(true);
+    setDiscoverError("");
+    setSuggestions([]);
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const res = await fetch(`/api/schools/${school.id}/discover-maxpreps`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session?.access_token}` },
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || "Could not search for a MaxPreps page.");
+      setSuggestions(json.candidates || []);
+      if (!json.candidates?.length) setDiscoverError("No MaxPreps page turned up for this school. Try searching MaxPreps directly and paste the link in.");
+    } catch (err) {
+      setDiscoverError(err.message || "Could not search for a MaxPreps page.");
+    } finally {
+      setDiscovering(false);
+    }
+  }
+
+  function pickSuggestion(link) {
+    setEditValues((prev) => ({ ...prev, maxpreps_url: link }));
+    setSuggestions([]);
   }
 
   async function resolvePendingFlags(schoolId) {
@@ -385,6 +428,27 @@ export default function DataQualityPage() {
                         </div>
                       ))}
                     </div>
+                    <div style={{ marginBottom: 8 }}>
+                      <button type="button" className="btn btn-sm" disabled={discovering} onClick={() => discoverMaxPreps(s)}>
+                        {discovering ? "Searching…" : "Find MaxPreps page"}
+                      </button>
+                      {discoverError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverError}</div>}
+                      {suggestions.length > 0 && (
+                        <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                          {suggestions.map((sugg) => (
+                            <button
+                              type="button"
+                              key={sugg.link}
+                              className="btn btn-sm"
+                              style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
+                              onClick={() => pickSuggestion(sugg.link)}
+                            >
+                              {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
                     {saveError && <div className="notice danger" style={{ marginBottom: 8 }}>{saveError}</div>}
                     <div style={{ display: "flex", gap: 8 }}>
                       <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
@@ -495,6 +559,27 @@ export default function DataQualityPage() {
                               />
                             </div>
                           ))}
+                        </div>
+                        <div style={{ marginBottom: 8 }}>
+                          <button type="button" className="btn btn-sm" disabled={discovering} onClick={() => discoverMaxPreps(s)}>
+                            {discovering ? "Searching…" : "Find MaxPreps page"}
+                          </button>
+                          {discoverError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverError}</div>}
+                          {suggestions.length > 0 && (
+                            <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                              {suggestions.map((sugg) => (
+                                <button
+                                  type="button"
+                                  key={sugg.link}
+                                  className="btn btn-sm"
+                                  style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
+                                  onClick={() => pickSuggestion(sugg.link)}
+                                >
+                                  {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                                </button>
+                              ))}
+                            </div>
+                          )}
                         </div>
                         <div style={{ display: "flex", gap: 8 }}>
                           <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
