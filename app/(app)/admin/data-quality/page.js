@@ -8,6 +8,7 @@ import { classifySchools, classifySchool } from "@/lib/dataQuality";
 
 const PAGE_SIZE = 1000;
 const DISPLAY_CAP = 200;
+const BATCH_SIZE = 300;
 
 const FILTERS = [
   { key: "all", label: "All actionable issues" },
@@ -116,6 +117,25 @@ export default function DataQualityPage() {
   const [searchError, setSearchError] = useState("");
   const [hasSearched, setHasSearched] = useState(false);
 
+  // Data-quality scan CSV export/import -- lets Larry pull the whole
+  // review queue into Excel/Sheets, fix records there, and bring the
+  // corrections back in one batch instead of working the Quick Fix panel
+  // row by row. Mirrors the matching + apply logic of the Bulk Update
+  // Schools tool, scoped to whatever's currently in this queue.
+  const [exportingIssues, setExportingIssues] = useState(false);
+  const [exportIssuesError, setExportIssuesError] = useState("");
+  const uploadInputRef = useRef(null);
+  const [uploadFileName, setUploadFileName] = useState("");
+  const [uploadParsing, setUploadParsing] = useState(false);
+  const [uploadError, setUploadError] = useState("");
+  const [uploadPreview, setUploadPreview] = useState([]); // [{id,name,city,state,fields:[{field,label,old,new}]}]
+  const [uploadUnchanged, setUploadUnchanged] = useState(0);
+  const [uploadUnmatched, setUploadUnmatched] = useState([]); // [{row,reason}]
+  const [uploadApplying, setUploadApplying] = useState(false);
+  const [uploadApplyError, setUploadApplyError] = useState("");
+  const [uploadApplyStatus, setUploadApplyStatus] = useState("");
+  const [uploadApplyResult, setUploadApplyResult] = useState(null); // {schools, fields}
+
   const loadFlags = useCallback(async () => {
     if (!canReview) {
       setLoadingFlags(false);
@@ -215,6 +235,40 @@ export default function DataQualityPage() {
     }
   }
 
+  // Exports every school currently in the review queue -- respecting the
+  // active issue filter, but NOT capped to the ~200 rows shown on screen --
+  // so the full problem list can be worked in a spreadsheet.
+  function exportIssuesCsv() {
+    if (!result) return;
+    setExportIssuesError("");
+    setExportingIssues(true);
+    try {
+      const rows = result.flagged.filter((r) => filter === "all" || r.issues.some((iss) => iss.code === filter));
+      const csv = Papa.unparse({
+        fields: ["school_id", "school_name", "city", "state", "issues", "hc_first_name", "hc_last_name", "hc_email", "hc_cell", "hc_office", "maxpreps_url"],
+        data: rows.map((r) => [
+          r.school.id,
+          r.school.name || "",
+          r.school.city || "",
+          r.school.state || "",
+          r.issues.filter((iss) => iss.actionable).map((iss) => iss.label).join("; "),
+          r.school.hc_first_name || "",
+          r.school.hc_last_name || "",
+          r.school.hc_email || "",
+          r.school.hc_cell || "",
+          r.school.hc_office || "",
+          r.school.maxpreps_url || "",
+        ]),
+      });
+      const suffix = filter === "all" ? "all" : filter;
+      downloadBlob(csv, `data_quality_issues_${suffix}_${new Date().toISOString().slice(0, 10)}.csv`);
+    } catch (err) {
+      setExportIssuesError(err.message || "Could not export this list.");
+    } finally {
+      setExportingIssues(false);
+    }
+  }
+
   const fetchAllSchools = useCallback(async () => {
     const rows = [];
     let from = 0;
@@ -268,6 +322,191 @@ export default function DataQualityPage() {
       setScanning(false);
     }
   }, [fetchAllSchools]);
+
+  function resetUpload() {
+    setUploadPreview([]);
+    setUploadUnchanged(0);
+    setUploadUnmatched([]);
+    setUploadError("");
+    setUploadApplyResult(null);
+    setUploadApplyError("");
+    setUploadFileName("");
+    if (uploadInputRef.current) uploadInputRef.current.value = "";
+  }
+
+  // Reads a CSV exported from (and then edited in) this page -- or any
+  // hand-built correction sheet -- and matches each row back to a school
+  // by school_id (preferred) or school_name + state (+ city to break ties
+  // among same-named schools), the same matching rule the Bulk Update
+  // Schools tool uses so the two stay predictable together. Only the
+  // Quick Fix fields (EDIT_FIELDS) are read; any other column is ignored,
+  // and blank cells never overwrite existing data.
+  async function handleUploadFile(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    resetUpload();
+    setUploadFileName(file.name);
+    setUploadParsing(true);
+    try {
+      const text = await file.text();
+      const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+      if (parsed.errors?.length) throw new Error(parsed.errors[0].message);
+      const rows = (parsed.data || []).map((row) => {
+        const clean = {};
+        Object.keys(row).forEach((k) => {
+          clean[k.trim().toLowerCase()] = row[k];
+        });
+        return clean;
+      });
+      if (!rows.length) throw new Error("The file has no data rows.");
+
+      const schools = await fetchAllSchools();
+      const byId = new Map(schools.map((s) => [String(s.id), s]));
+      const byNameState = new Map();
+      schools.forEach((s) => {
+        const key = `${(s.name || "").trim().toLowerCase()}|${(s.state || "").trim().toUpperCase()}`;
+        if (!byNameState.has(key)) byNameState.set(key, []);
+        byNameState.get(key).push(s);
+      });
+
+      const preview = [];
+      const unmatched = [];
+      let unchangedCount = 0;
+
+      rows.forEach((row, idx) => {
+        const label = row.school_name || row.name || `Row ${idx + 2}`;
+        let school = null;
+        const idVal = String(row.school_id || row.id || "").trim();
+        if (idVal && byId.has(idVal)) {
+          school = byId.get(idVal);
+        } else {
+          const nameVal = (row.school_name || row.name || "").trim();
+          const stateVal = (row.state || "").trim().toUpperCase();
+          if (nameVal && stateVal) {
+            const key = `${nameVal.toLowerCase()}|${stateVal}`;
+            let candidates = byNameState.get(key) || [];
+            if (candidates.length > 1 && row.city) {
+              const narrowed = candidates.filter((c) => (c.city || "").trim().toLowerCase() === row.city.trim().toLowerCase());
+              if (narrowed.length) candidates = narrowed;
+            }
+            if (candidates.length === 1) school = candidates[0];
+            else if (candidates.length > 1) {
+              unmatched.push({ row: label, reason: `${candidates.length} schools match "${nameVal}, ${stateVal}" — add a city or school_id column to disambiguate.` });
+              return;
+            }
+          }
+        }
+        if (!school) {
+          unmatched.push({ row: label, reason: idVal ? `No school found with id ${idVal}.` : "Could not match on school_id or school_name + state." });
+          return;
+        }
+
+        const fields = [];
+        EDIT_FIELDS.forEach(([field, fieldLabel]) => {
+          if (!(field in row)) return;
+          const newVal = String(row[field] ?? "").trim();
+          if (newVal === "") return;
+          const oldVal = (school[field] || "").toString().trim();
+          if (newVal !== oldVal) fields.push({ field, label: fieldLabel, old: oldVal || "—", new: newVal });
+        });
+        if (fields.length) preview.push({ id: school.id, name: school.name, city: school.city, state: school.state, fields });
+        else unchangedCount += 1;
+      });
+
+      setUploadPreview(preview);
+      setUploadUnchanged(unchangedCount);
+      setUploadUnmatched(unmatched);
+    } catch (err) {
+      setUploadError(err.message || "Could not read this file.");
+    } finally {
+      setUploadParsing(false);
+    }
+  }
+
+  // Applies the previewed changes in batches, same bookkeeping as every
+  // other write path on this page: mark verified, log each changed field
+  // to school_change_log, clear any pending "possibly outdated" flags on
+  // the schools touched, and fold the results back into the queue without
+  // waiting on a full re-scan.
+  async function applyUpload() {
+    setUploadApplying(true);
+    setUploadApplyError("");
+    setUploadApplyResult(null);
+    try {
+      let applied = 0;
+      const now = new Date().toISOString();
+      for (let i = 0; i < uploadPreview.length; i += BATCH_SIZE) {
+        const chunk = uploadPreview.slice(i, i + BATCH_SIZE);
+        setUploadApplyStatus(`Applying ${i + 1}–${Math.min(i + BATCH_SIZE, uploadPreview.length)} of ${uploadPreview.length}…`);
+        const upserts = chunk.map((row) => {
+          const update = { id: row.id, verification_status: "verified", last_verified_at: now };
+          row.fields.forEach((f) => {
+            update[f.field] = f.new;
+          });
+          return update;
+        });
+        const { error } = await supabase.from("schools").upsert(upserts, { onConflict: "id" });
+        if (error) throw error;
+
+        const changes = [];
+        chunk.forEach((row) => {
+          row.fields.forEach((f) => {
+            changes.push({
+              school_id: row.id,
+              field_name: f.field,
+              old_value: f.old === "—" ? null : f.old,
+              new_value: f.new,
+              source: "Bulk correction upload (Data Quality)",
+              changed_by: user.id,
+            });
+          });
+        });
+        if (changes.length) {
+          const { error: logError } = await supabase.from("school_change_log").insert(changes);
+          if (logError) throw logError;
+        }
+        applied += chunk.length;
+      }
+
+      const updatedIds = new Set(uploadPreview.map((row) => row.id));
+      const patchById = new Map(uploadPreview.map((row) => [row.id, row.fields.reduce((acc, f) => ({ ...acc, [f.field]: f.new }), {})]));
+
+      setResult((prev) => {
+        if (!prev) return prev;
+        const next = prev.flagged
+          .map((r) => {
+            if (!updatedIds.has(r.school.id)) return r;
+            const merged = { ...r.school, ...patchById.get(r.school.id), verification_status: "verified", last_verified_at: now };
+            const reclass = classifySchool(merged);
+            return reclass.actionable ? { ...r, ...reclass, school: merged } : null;
+          })
+          .filter(Boolean);
+        return { ...prev, flagged: next, totalFlagged: next.length };
+      });
+      setSearchResults((prev) => prev.map((s) => (updatedIds.has(s.id) ? { ...s, ...patchById.get(s.id) } : s)));
+
+      if (updatedIds.size) {
+        await supabase
+          .from("school_flags")
+          .update({ status: "resolved", resolved_by: user.id, resolved_at: now })
+          .in("school_id", Array.from(updatedIds))
+          .eq("status", "pending");
+        setFlaggedQueue((prev) => prev.filter((f) => !updatedIds.has(f.school_id)));
+      }
+
+      setUploadApplyResult({
+        schools: applied,
+        fields: uploadPreview.reduce((sum, row) => sum + row.fields.length, 0),
+      });
+      setUploadPreview([]);
+      setUploadUnchanged(0);
+    } catch (err) {
+      setUploadApplyError(err.message || "Something went wrong applying these changes.");
+    } finally {
+      setUploadApplying(false);
+      setUploadApplyStatus("");
+    }
+  }
 
   function startEdit(school) {
     setEditingId(school.id);
@@ -790,9 +1029,93 @@ export default function DataQualityPage() {
           </div>
 
           <div className="card">
-            <h3 style={{ marginBottom: 4 }}>
-              Review Queue {visibleTotal > DISPLAY_CAP ? `— showing top ${DISPLAY_CAP} of ${visibleTotal}` : `(${visibleTotal})`}
-            </h3>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8, marginBottom: 4 }}>
+              <h3 style={{ marginBottom: 4 }}>
+                Review Queue {visibleTotal > DISPLAY_CAP ? `— showing top ${DISPLAY_CAP} of ${visibleTotal}` : `(${visibleTotal})`}
+              </h3>
+              <button className="btn btn-sm" onClick={exportIssuesCsv} disabled={exportingIssues || result.flagged.length === 0}>
+                {exportingIssues ? "Exporting…" : "Download CSV"}
+              </button>
+            </div>
+            {exportIssuesError && <div className="notice danger" style={{ marginBottom: 10 }}>{exportIssuesError}</div>}
+
+            <div style={{ background: "#f7f8fa", border: "1px solid #dde1e7", borderRadius: 8, padding: 10, marginBottom: 14 }}>
+              <div style={{ fontWeight: 600, marginBottom: 4 }}>Upload corrected CSV</div>
+              <p style={{ fontSize: 12.5, color: "#697386", marginTop: 0, marginBottom: 8 }}>
+                Edit the downloaded file in Excel or Sheets, then re-upload it here to apply corrections in bulk. Matches rows on <code>school_id</code> (preferred) or <code>school_name</code> + <code>state</code> (+ <code>city</code> to break ties). Reads <code>hc_first_name, hc_last_name, hc_email, hc_cell, hc_office, maxpreps_url</code> — blank cells are left unchanged, and any other column is ignored.
+              </p>
+              <input ref={uploadInputRef} type="file" accept=".csv" onChange={handleUploadFile} disabled={uploadParsing || uploadApplying} />
+              {uploadParsing && <div className="empty-state" style={{ marginTop: 8 }}>Reading {uploadFileName}…</div>}
+              {uploadError && <div className="notice danger" style={{ marginTop: 8 }}>{uploadError}</div>}
+
+              {uploadApplyResult && (
+                <div className="notice" style={{ marginTop: 8 }}>
+                  Applied {uploadApplyResult.fields} field{uploadApplyResult.fields === 1 ? "" : "s"} across {uploadApplyResult.schools} school{uploadApplyResult.schools === 1 ? "" : "s"}.
+                </div>
+              )}
+
+              {(uploadPreview.length > 0 || uploadUnmatched.length > 0 || uploadUnchanged > 0) && (
+                <div style={{ marginTop: 10 }}>
+                  <div className="grid grid-3" style={{ marginBottom: 10 }}>
+                    <div className="stat-card">
+                      <div className="label">Schools to update</div>
+                      <div className="num">{uploadPreview.length}</div>
+                      <div className="sub">{uploadPreview.reduce((sum, r) => sum + r.fields.length, 0)} field(s) changing</div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="label">Already up to date</div>
+                      <div className="num">{uploadUnchanged}</div>
+                      <div className="sub">no differences found</div>
+                    </div>
+                    <div className="stat-card">
+                      <div className="label">Unmatched rows</div>
+                      <div className="num">{uploadUnmatched.length}</div>
+                      <div className="sub">need school_id or name+state</div>
+                    </div>
+                  </div>
+
+                  {uploadApplyError && <div className="notice danger" style={{ marginBottom: 10 }}>{uploadApplyError}</div>}
+
+                  {uploadUnmatched.length > 0 && (
+                    <div className="notice danger" style={{ marginBottom: 10 }}>
+                      <strong>{uploadUnmatched.length} row(s) could not be matched:</strong>
+                      <div style={{ maxHeight: 140, overflow: "auto", marginTop: 6 }}>
+                        {uploadUnmatched.slice(0, 50).map((u, i) => (
+                          <div key={i} style={{ fontSize: 12, padding: "3px 0" }}>{u.row}: {u.reason}</div>
+                        ))}
+                        {uploadUnmatched.length > 50 && <div style={{ fontSize: 12 }}>…and {uploadUnmatched.length - 50} more.</div>}
+                      </div>
+                    </div>
+                  )}
+
+                  {uploadPreview.length > 0 && (
+                    <>
+                      <div style={{ maxHeight: 260, overflow: "auto", marginBottom: 10 }}>
+                        {uploadPreview.slice(0, 100).map((row) => (
+                          <div key={row.id} style={{ fontSize: 12.5, padding: "6px 0", borderBottom: "1px solid #eee" }}>
+                            <strong>{row.name}</strong> — {row.city}, {row.state}
+                            <div style={{ color: "#697386", marginTop: 2 }}>
+                              {row.fields.map((f) => `${f.label}: "${f.old}" → "${f.new}"`).join("  ·  ")}
+                            </div>
+                          </div>
+                        ))}
+                        {uploadPreview.length > 100 && <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>…and {uploadPreview.length - 100} more.</div>}
+                      </div>
+                      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                        <button className="btn btn-sm btn-gold" onClick={applyUpload} disabled={uploadApplying}>
+                          {uploadApplying ? "Applying…" : `Apply ${uploadPreview.length} Change${uploadPreview.length === 1 ? "" : "s"}`}
+                        </button>
+                        <button type="button" className="btn btn-sm" onClick={resetUpload} disabled={uploadApplying}>
+                          Cancel
+                        </button>
+                        {uploadApplyStatus && <span style={{ fontSize: 12, color: "#697386" }}>{uploadApplyStatus}</span>}
+                      </div>
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+
             {saveError && <div className="notice danger" style={{ margin: "8px 0" }}>{saveError}</div>}
             {visibleRows.length === 0 ? (
               <div className="empty-state">Nothing in this filter — nice work.</div>
