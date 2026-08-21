@@ -17,6 +17,7 @@ const NAV_LINKS = [
   { href: "/territories", label: "Territories" },
   { href: "/reports", label: "Reports" },
   { href: "/admin", label: "Admin" },
+  { href: "/integrations", label: "Integrations" },
   { href: "/billing", label: "Billing" },
   { href: "/account", label: "Account Security" },
 ];
