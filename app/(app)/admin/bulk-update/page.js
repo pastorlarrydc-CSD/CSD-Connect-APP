@@ -229,12 +229,19 @@ export default function BulkUpdatePage() {
         const changes = [];
         chunk.forEach((row) => {
           row.fields.forEach((f) => {
+            // A bulk upload that touches the coach's name is, in practice,
+            // almost always recording a coach change (a season's worth of
+            // hires dumped in from a spreadsheet) -- tag those two fields
+            // the same way "Mark Coach Change" does on the Data Quality
+            // Review page, so they show up correctly in Coach Change
+            // History without anyone having to fix them one at a time.
+            const isCoachName = f.field === "hc_first_name" || f.field === "hc_last_name";
             changes.push({
               school_id: row.id,
               field_name: f.field,
               old_value: f.old === "—" ? null : f.old,
               new_value: f.new,
-              source: "Bulk school update (CSV)",
+              source: isCoachName ? "Head coach change (manual)" : "Bulk school update (CSV)",
               changed_by: user.id,
             });
           });
