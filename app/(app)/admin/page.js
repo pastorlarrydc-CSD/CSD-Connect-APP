@@ -43,6 +43,15 @@ export default function AdminPage() {
   const [correctionActingId, setCorrectionActingId] = useState(null);
   const [correctionError, setCorrectionError] = useState("");
 
+  // Lets a reviewer tweak a coach's suggested values before approving them
+  // (e.g. fix a typo'd email) instead of only being able to accept a
+  // suggestion exactly as submitted or reject it outright. The suggestion
+  // itself stays pending in the database the whole time you're editing --
+  // navigating away and coming back just reloads the same pending row, so
+  // nothing is lost by stepping away mid-review.
+  const [editingCorrectionId, setEditingCorrectionId] = useState(null);
+  const [correctionEditValues, setCorrectionEditValues] = useState({});
+
   const [pendingClaims, setPendingClaims] = useState([]);
   const [loadingClaims, setLoadingClaims] = useState(true);
   const [claimActingId, setClaimActingId] = useState(null);
@@ -101,7 +110,13 @@ export default function AdminPage() {
     loadClaims();
   }, [supabase, college, loadCorrections, loadClaims]);
 
-  async function approveCorrection(suggestion) {
+  // overrideValues comes from the "Edit" panel below when a reviewer has
+  // adjusted the coach's suggested values before approving -- when it's
+  // present it wins over what was originally submitted. The suggestion row
+  // itself always keeps the coach's original text (that's the record of
+  // what they actually asked for); what got applied to schools + why is
+  // what the school_change_log entry's source/old/new values capture.
+  async function approveCorrection(suggestion, overrideValues) {
     setCorrectionError("");
     setCorrectionActingId(suggestion.id);
     try {
@@ -109,7 +124,7 @@ export default function AdminPage() {
       const update = {};
       const changes = [];
       for (const [field] of EDIT_FIELDS) {
-        const suggested = suggestion[field];
+        const suggested = overrideValues ? overrideValues[field]?.trim() || null : suggestion[field];
         if (suggested == null || suggested === "") continue;
         const existing = current?.[field] || null;
         if (suggested !== existing) {
@@ -119,7 +134,7 @@ export default function AdminPage() {
             field_name: field,
             old_value: existing,
             new_value: suggested,
-            source: "Coach-submitted correction (approved)",
+            source: overrideValues ? "Coach-submitted correction (approved, edited by verifier)" : "Coach-submitted correction (approved)",
             changed_by: user.id,
           });
         }
@@ -139,12 +154,28 @@ export default function AdminPage() {
         .update({ status: "approved", reviewed_by: user.id, reviewed_at: new Date().toISOString() })
         .eq("id", suggestion.id);
       if (statusError) throw statusError;
+      setEditingCorrectionId(null);
       loadCorrections();
     } catch (err) {
       setCorrectionError(err.message || "Could not approve this correction.");
     } finally {
       setCorrectionActingId(null);
     }
+  }
+
+  function startEditCorrection(suggestion) {
+    setCorrectionError("");
+    setEditingCorrectionId(suggestion.id);
+    const values = {};
+    EDIT_FIELDS.forEach(([field]) => {
+      values[field] = (suggestion[field] ?? suggestion.schools?.[field] ?? "").toString();
+    });
+    setCorrectionEditValues(values);
+  }
+
+  function cancelEditCorrection() {
+    setEditingCorrectionId(null);
+    setCorrectionError("");
   }
 
   async function rejectCorrection(suggestion) {
@@ -280,6 +311,11 @@ export default function AdminPage() {
                     </div>
                   </div>
                   <div style={{ display: "flex", gap: 6 }}>
+                    {editingCorrectionId !== suggestion.id && (
+                      <button className="btn btn-sm" disabled={correctionActingId === suggestion.id} onClick={() => startEditCorrection(suggestion)}>
+                        Edit
+                      </button>
+                    )}
                     <button className="btn btn-sm btn-primary" disabled={correctionActingId === suggestion.id} onClick={() => approveCorrection(suggestion)}>
                       Approve
                     </button>
@@ -288,24 +324,54 @@ export default function AdminPage() {
                     </button>
                   </div>
                 </div>
-                <div className="kv" style={{ gridTemplateColumns: "110px 1fr 1fr", marginTop: 8, fontSize: 12.5 }}>
-                  <div className="k" />
-                  <div className="k">Current</div>
-                  <div className="k">Suggested</div>
-                  {EDIT_FIELDS.map(([field, label]) => {
-                    const suggested = suggestion[field];
-                    if (suggested == null || suggested === "") return null;
-                    const current = suggestion.schools?.[field] || "—";
-                    const changed = suggested !== current;
-                    return (
-                      <Fragment key={field}>
-                        <div className="k">{label}</div>
-                        <div className="v" style={{ fontWeight: 400 }}>{current}</div>
-                        <div className="v" style={{ color: changed ? "#1e7145" : undefined, fontWeight: changed ? 700 : 400 }}>{suggested}</div>
-                      </Fragment>
-                    );
-                  })}
-                </div>
+
+                {editingCorrectionId === suggestion.id ? (
+                  <div style={{ background: "#f7f8fa", border: "1px solid #dde1e7", borderRadius: 8, padding: 10, marginTop: 8 }}>
+                    <div className="grid grid-2" style={{ marginBottom: 8 }}>
+                      {EDIT_FIELDS.map(([field, label]) => (
+                        <div className="form-field" key={field} style={{ marginBottom: 0 }}>
+                          <label>{label}</label>
+                          <input
+                            value={correctionEditValues[field] || ""}
+                            onChange={(e) => setCorrectionEditValues((prev) => ({ ...prev, [field]: e.target.value }))}
+                          />
+                        </div>
+                      ))}
+                    </div>
+                    {correctionError && <div className="notice danger" style={{ marginBottom: 8 }}>{correctionError}</div>}
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button
+                        className="btn btn-sm btn-gold"
+                        disabled={correctionActingId === suggestion.id}
+                        onClick={() => approveCorrection(suggestion, correctionEditValues)}
+                      >
+                        {correctionActingId === suggestion.id ? "Saving…" : "Save & Approve"}
+                      </button>
+                      <button type="button" className="btn btn-sm" onClick={cancelEditCorrection} disabled={correctionActingId === suggestion.id}>
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="kv" style={{ gridTemplateColumns: "110px 1fr 1fr", marginTop: 8, fontSize: 12.5 }}>
+                    <div className="k" />
+                    <div className="k">Current</div>
+                    <div className="k">Suggested</div>
+                    {EDIT_FIELDS.map(([field, label]) => {
+                      const suggested = suggestion[field];
+                      if (suggested == null || suggested === "") return null;
+                      const current = suggestion.schools?.[field] || "—";
+                      const changed = suggested !== current;
+                      return (
+                        <Fragment key={field}>
+                          <div className="k">{label}</div>
+                          <div className="v" style={{ fontWeight: 400 }}>{current}</div>
+                          <div className="v" style={{ color: changed ? "#1e7145" : undefined, fontWeight: changed ? 700 : 400 }}>{suggested}</div>
+                        </Fragment>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             ))
           ) : (
