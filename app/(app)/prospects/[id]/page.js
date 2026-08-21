@@ -66,6 +66,27 @@ export default function ProspectDetailPage() {
   const [linksSaving, setLinksSaving] = useState(false);
   const [linksError, setLinksError] = useState("");
 
+  // Combine-style measurables -- optional, position-agnostic set (40-yard
+  // dash, vertical, broad jump, bench reps, shuttle). Same inline-edit
+  // pattern as the cards above.
+  const [editingMeasurables, setEditingMeasurables] = useState(false);
+  const [measurablesForm, setMeasurablesForm] = useState({
+    forty_yard_dash: "",
+    vertical_jump: "",
+    broad_jump: "",
+    bench_press_reps: "",
+    shuttle_time: "",
+  });
+  const [measurablesSaving, setMeasurablesSaving] = useState(false);
+  const [measurablesError, setMeasurablesError] = useState("");
+
+  // AI scouting insight -- on-demand, opt-in, never automatic. Result is
+  // stored on the prospect (ai_summary/ai_sleeper_flag/ai_sleeper_reason/
+  // ai_evaluated_at) by app/api/prospects/[id]/ai-evaluate, and is always
+  // rendered in its own clearly-labeled card, separate from verified facts.
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState("");
+
   // Recruiting interest (this college's own watching/offered/committed mark).
   const [recruitingStatus, setRecruitingStatus] = useState(null); // null = not tracked yet
   const [recruitingLoading, setRecruitingLoading] = useState(true);
@@ -360,6 +381,62 @@ export default function ProspectDetailPage() {
     load();
   }
 
+  function startEditMeasurables() {
+    setMeasurablesForm({
+      forty_yard_dash: prospect.forty_yard_dash ?? "",
+      vertical_jump: prospect.vertical_jump ?? "",
+      broad_jump: prospect.broad_jump ?? "",
+      bench_press_reps: prospect.bench_press_reps ?? "",
+      shuttle_time: prospect.shuttle_time ?? "",
+    });
+    setMeasurablesError("");
+    setEditingMeasurables(true);
+  }
+
+  async function saveMeasurables(e) {
+    e.preventDefault();
+    setMeasurablesError("");
+    setMeasurablesSaving(true);
+    const { error } = await supabase
+      .from("prospects")
+      .update({
+        forty_yard_dash: measurablesForm.forty_yard_dash === "" ? null : parseFloat(measurablesForm.forty_yard_dash),
+        vertical_jump: measurablesForm.vertical_jump === "" ? null : parseFloat(measurablesForm.vertical_jump),
+        broad_jump: measurablesForm.broad_jump === "" ? null : parseFloat(measurablesForm.broad_jump),
+        bench_press_reps: measurablesForm.bench_press_reps === "" ? null : parseInt(measurablesForm.bench_press_reps, 10),
+        shuttle_time: measurablesForm.shuttle_time === "" ? null : parseFloat(measurablesForm.shuttle_time),
+      })
+      .eq("id", id);
+    setMeasurablesSaving(false);
+    if (error) {
+      setMeasurablesError(error.message);
+      return;
+    }
+    setEditingMeasurables(false);
+    load();
+  }
+
+  async function generateAiInsight() {
+    setAiError("");
+    setAiLoading(true);
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const res = await fetch(`/api/prospects/${id}/ai-evaluate`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session?.access_token}` },
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "Could not generate an AI insight.");
+      await load();
+    } catch (err) {
+      setAiError(err.message || "Could not generate an AI insight.");
+    } finally {
+      setAiLoading(false);
+    }
+  }
+
   async function deleteProspect() {
     if (!confirm(`Delete ${prospect.athlete_name}? This cannot be undone.`)) return;
     setDeleteError("");
@@ -407,6 +484,11 @@ export default function ProspectDetailPage() {
         <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
           {prospect.committed_to && <span className="badge badge-committed">Committed — {prospect.committed_to}</span>}
           {recruitingStatus && <span className={`badge ${RECRUITING_BADGE_CLASS[recruitingStatus]}`}>{RECRUITING_LABEL[recruitingStatus]}</span>}
+          {prospect.is_underexposed && (
+            <span className="badge badge-not-contacted" title="No offers/commitment on file yet, but the profile has substance — worth a look.">
+              Underexposed
+            </span>
+          )}
           <span className="badge badge-contacted">{prospect.status}</span>
         </div>
       </div>
@@ -515,6 +597,66 @@ export default function ProspectDetailPage() {
             )}
           </div>
 
+          <div className="card" style={{ marginBottom: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+              <h3 style={{ margin: 0 }}>Measurables</h3>
+              {canManageIntake && !editingMeasurables && (
+                <button className="btn btn-sm" onClick={startEditMeasurables}>
+                  Edit
+                </button>
+              )}
+            </div>
+            <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>Combine-style testing numbers, self- or coach-reported. Leave blank if not tested.</p>
+            {measurablesError && <div className="notice danger" style={{ marginBottom: 10 }}>{measurablesError}</div>}
+            {editingMeasurables ? (
+              <form onSubmit={saveMeasurables} style={{ marginTop: 8 }}>
+                <div className="grid grid-2">
+                  <div className="form-field">
+                    <label>40-Yard Dash (sec)</label>
+                    <input value={measurablesForm.forty_yard_dash} onChange={(e) => setMeasurablesForm((f) => ({ ...f, forty_yard_dash: e.target.value }))} placeholder="4.53" />
+                  </div>
+                  <div className="form-field">
+                    <label>Vertical Jump (in)</label>
+                    <input value={measurablesForm.vertical_jump} onChange={(e) => setMeasurablesForm((f) => ({ ...f, vertical_jump: e.target.value }))} placeholder="34.5" />
+                  </div>
+                  <div className="form-field">
+                    <label>Broad Jump (in)</label>
+                    <input value={measurablesForm.broad_jump} onChange={(e) => setMeasurablesForm((f) => ({ ...f, broad_jump: e.target.value }))} placeholder="118" />
+                  </div>
+                  <div className="form-field">
+                    <label>Bench Press (reps @225)</label>
+                    <input value={measurablesForm.bench_press_reps} onChange={(e) => setMeasurablesForm((f) => ({ ...f, bench_press_reps: e.target.value }))} placeholder="14" />
+                  </div>
+                  <div className="form-field">
+                    <label>Shuttle (sec)</label>
+                    <input value={measurablesForm.shuttle_time} onChange={(e) => setMeasurablesForm((f) => ({ ...f, shuttle_time: e.target.value }))} placeholder="4.25" />
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button className="btn btn-sm btn-primary" disabled={measurablesSaving}>
+                    {measurablesSaving ? "Saving…" : "Save"}
+                  </button>
+                  <button type="button" className="btn btn-sm" onClick={() => setEditingMeasurables(false)} disabled={measurablesSaving}>
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <div className="kv">
+                <div className="k">40-Yard Dash</div>
+                <div className="v">{prospect.forty_yard_dash != null ? `${prospect.forty_yard_dash}s` : <span className="empty-state">not on file</span>}</div>
+                <div className="k">Vertical Jump</div>
+                <div className="v">{prospect.vertical_jump != null ? `${prospect.vertical_jump}"` : <span className="empty-state">not on file</span>}</div>
+                <div className="k">Broad Jump</div>
+                <div className="v">{prospect.broad_jump != null ? `${prospect.broad_jump}"` : <span className="empty-state">not on file</span>}</div>
+                <div className="k">Bench Press</div>
+                <div className="v">{prospect.bench_press_reps != null ? `${prospect.bench_press_reps} reps @225` : <span className="empty-state">not on file</span>}</div>
+                <div className="k">Shuttle</div>
+                <div className="v">{prospect.shuttle_time != null ? `${prospect.shuttle_time}s` : <span className="empty-state">not on file</span>}</div>
+              </div>
+            )}
+          </div>
+
           <div className="card">
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
               <h3 style={{ margin: 0 }}>Contact Info</h3>
@@ -605,6 +747,40 @@ export default function ProspectDetailPage() {
           <div className="card" style={{ marginBottom: 14 }}>
             <h3>Coach Evaluation</h3>
             <p style={{ margin: 0, fontSize: 13.5 }}>{prospect.coach_evaluation || <span className="empty-state">No evaluation submitted.</span>}</p>
+          </div>
+
+          <div className="card" style={{ marginBottom: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+              <h3 style={{ margin: 0 }}>AI Scouting Insight</h3>
+              <button className="btn btn-sm" onClick={generateAiInsight} disabled={aiLoading}>
+                {aiLoading ? "Generating…" : prospect.ai_summary ? "Refresh" : "Generate AI Insight"}
+              </button>
+            </div>
+            <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
+              AI-generated from the facts on this page — <strong>not verified</strong>, and not a substitute for film or a coach&apos;s own evaluation. Generated on demand only.
+            </p>
+            {aiError && <div className="notice danger" style={{ marginBottom: 10 }}>{aiError}</div>}
+            {prospect.ai_summary ? (
+              <div style={{ background: "#f7f8fa", border: "1px solid #eef0f3", borderRadius: 8, padding: 10 }}>
+                <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 6 }}>
+                  <span className="badge" style={{ background: "#e8e2f7", color: "#4b3a8f" }}>AI-generated · not verified</span>
+                  {prospect.ai_sleeper_flag && (
+                    <span className="badge badge-not-contacted" title={prospect.ai_sleeper_reason || ""}>
+                      AI Flag: Possible Sleeper
+                    </span>
+                  )}
+                </div>
+                <p style={{ margin: 0, fontSize: 13.5 }}>{prospect.ai_summary}</p>
+                {prospect.ai_sleeper_flag && prospect.ai_sleeper_reason && (
+                  <p style={{ margin: "6px 0 0", fontSize: 12.5, color: "#697386" }}>Why: {prospect.ai_sleeper_reason}</p>
+                )}
+                {prospect.ai_evaluated_at && (
+                  <p style={{ margin: "6px 0 0", fontSize: 11, color: "#9aa2b1" }}>Generated {new Date(prospect.ai_evaluated_at).toLocaleString()}</p>
+                )}
+              </div>
+            ) : (
+              <div className="empty-state">No AI insight generated yet.</div>
+            )}
           </div>
 
           {canSetRecruitingStatus && (
