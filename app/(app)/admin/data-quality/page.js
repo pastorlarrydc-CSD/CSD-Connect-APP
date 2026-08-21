@@ -4,7 +4,7 @@ import Link from "next/link";
 import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
-import { classifySchools, classifySchool } from "@/lib/dataQuality";
+import { classifySchools, classifySchool, computeConfidenceScore } from "@/lib/dataQuality";
 
 const PAGE_SIZE = 1000;
 const DISPLAY_CAP = 200;
@@ -73,6 +73,15 @@ function fmtPhone(v) {
   if (!v) return "";
   const digits = String(v).replace(/\D/g, "");
   return digits.length === 10 ? `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}` : v;
+}
+
+// Same bands as the confidence-score readout on a school's profile page
+// (app/(app)/schools/[id]/page.js) -- kept visually consistent so the
+// color means the same thing everywhere it shows up.
+function confidenceColor(score) {
+  if (score >= 70) return "#1d7a4c";
+  if (score >= 40) return "#a17a00";
+  return "#b3312c";
 }
 
 export default function DataQualityPage() {
@@ -173,7 +182,7 @@ export default function DataQualityPage() {
     setLoadingFlags(true);
     const { data } = await supabase
       .from("school_flags")
-      .select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,maxpreps_url), colleges:flagged_by_college_id(name)")
+      .select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,maxpreps_url,website,verification_status,confidence_score), colleges:flagged_by_college_id(name)")
       .eq("status", "pending")
       .order("created_at", { ascending: true });
     setFlaggedQueue(data || []);
@@ -366,7 +375,7 @@ export default function DataQualityPage() {
     for (;;) {
       const { data, error } = await supabase
         .from("schools")
-        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,lat,lon,verification_status,maxpreps_url")
+        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,lat,lon,verification_status,maxpreps_url,website,confidence_score")
         .order("id", { ascending: true })
         .range(from, from + PAGE_SIZE - 1);
       if (error) throw error;
@@ -387,7 +396,7 @@ export default function DataQualityPage() {
     try {
       const { data, error } = await supabase
         .from("schools")
-        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,maxpreps_url")
+        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,maxpreps_url,website,verification_status,confidence_score")
         .ilike("name", `%${q}%`)
         .order("name")
         .limit(25);
@@ -500,7 +509,7 @@ export default function DataQualityPage() {
           const oldVal = (school[field] || "").toString().trim();
           if (newVal !== oldVal) fields.push({ field, label: fieldLabel, old: oldVal || "—", new: newVal });
         });
-        if (fields.length) preview.push({ id: school.id, name: school.name, city: school.city, state: school.state, fields });
+        if (fields.length) preview.push({ id: school.id, name: school.name, city: school.city, state: school.state, fields, original: school });
         else unchangedCount += 1;
       });
 
@@ -526,6 +535,7 @@ export default function DataQualityPage() {
     try {
       let applied = 0;
       const now = new Date().toISOString();
+      const updatesById = new Map();
       for (let i = 0; i < uploadPreview.length; i += BATCH_SIZE) {
         const chunk = uploadPreview.slice(i, i + BATCH_SIZE);
         setUploadApplyStatus(`Applying ${i + 1}–${Math.min(i + BATCH_SIZE, uploadPreview.length)} of ${uploadPreview.length}…`);
@@ -534,6 +544,8 @@ export default function DataQualityPage() {
           row.fields.forEach((f) => {
             update[f.field] = f.new;
           });
+          update.confidence_score = computeConfidenceScore({ ...row.original, ...update });
+          updatesById.set(row.id, update);
           return update;
         });
         const { error } = await supabase.from("schools").upsert(upserts, { onConflict: "id" });
@@ -560,21 +572,20 @@ export default function DataQualityPage() {
       }
 
       const updatedIds = new Set(uploadPreview.map((row) => row.id));
-      const patchById = new Map(uploadPreview.map((row) => [row.id, row.fields.reduce((acc, f) => ({ ...acc, [f.field]: f.new }), {})]));
 
       setResult((prev) => {
         if (!prev) return prev;
         const next = prev.flagged
           .map((r) => {
             if (!updatedIds.has(r.school.id)) return r;
-            const merged = { ...r.school, ...patchById.get(r.school.id), verification_status: "verified", last_verified_at: now };
+            const merged = { ...r.school, ...updatesById.get(r.school.id) };
             const reclass = classifySchool(merged);
             return reclass.actionable ? { ...r, ...reclass, school: merged } : null;
           })
           .filter(Boolean);
         return { ...prev, flagged: next, totalFlagged: next.length };
       });
-      setSearchResults((prev) => prev.map((s) => (updatedIds.has(s.id) ? { ...s, ...patchById.get(s.id) } : s)));
+      setSearchResults((prev) => prev.map((s) => (updatedIds.has(s.id) ? { ...s, ...updatesById.get(s.id) } : s)));
 
       if (updatedIds.size) {
         await supabase
@@ -719,6 +730,11 @@ export default function DataQualityPage() {
           });
         }
       });
+      // Redo the confidence score against the record as it will look right
+      // after this write lands, so it always reflects what's actually on
+      // file rather than whatever it was set to at the last edit (or, for
+      // most schools, at the original bulk import).
+      update.confidence_score = computeConfidenceScore({ ...before, ...update });
 
       const { error: updateError } = await supabase.from("schools").update(update).eq("id", before.id);
       if (updateError) throw updateError;
@@ -764,10 +780,9 @@ export default function DataQualityPage() {
         .update({ status: "resolved", resolved_by: user.id, resolved_at: new Date().toISOString() })
         .eq("id", flag.id);
       if (error) throw error;
-      const { error: schoolError } = await supabase
-        .from("schools")
-        .update({ verification_status: "verified", last_verified_at: new Date().toISOString() })
-        .eq("id", flag.school_id);
+      const schoolUpdate = { verification_status: "verified", last_verified_at: new Date().toISOString() };
+      if (flag.schools) schoolUpdate.confidence_score = computeConfidenceScore({ ...flag.schools, ...schoolUpdate });
+      const { error: schoolError } = await supabase.from("schools").update(schoolUpdate).eq("id", flag.school_id);
       if (schoolError) throw schoolError;
       setFlaggedQueue((prev) => prev.filter((f) => f.id !== flag.id));
     } catch (err) {
@@ -835,6 +850,9 @@ export default function DataQualityPage() {
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
                 <div>
                   <strong>{s.name}</strong> — {s.city}, {s.state}
+                  <span style={{ fontSize: 11, fontWeight: 600, color: confidenceColor(s.confidence_score ?? 0), marginLeft: 8 }}>
+                    {s.confidence_score ?? 0}% confidence
+                  </span>
                   <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
                     {[s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ") || "no coach name"}
                     {s.hc_email ? ` · ${s.hc_email}` : ""}
@@ -1099,6 +1117,11 @@ export default function DataQualityPage() {
                       >
                         {isAutomated ? "Automated · Coach-Change Radar" : "Manual flag"}
                       </span>
+                      {s && (
+                        <span style={{ fontSize: 11, fontWeight: 600, color: confidenceColor(s.confidence_score ?? 0) }}>
+                          {s.confidence_score ?? 0}% confidence
+                        </span>
+                      )}
                     </div>
                     <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
                       Flagged {new Date(flag.created_at).toLocaleDateString()} by {flag.colleges?.name || "an HS coach account"}
@@ -1327,6 +1350,9 @@ export default function DataQualityPage() {
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
                       <div>
                         <strong>{s.name}</strong> — {s.city}, {s.state}
+                        <span style={{ fontSize: 11, fontWeight: 600, color: confidenceColor(s.confidence_score ?? 0), marginLeft: 8 }}>
+                          {s.confidence_score ?? 0}% confidence
+                        </span>
                         <div style={{ marginTop: 4, display: "flex", flexWrap: "wrap", gap: 6 }}>
                           {row.issues
                             .filter((iss) => iss.actionable)
