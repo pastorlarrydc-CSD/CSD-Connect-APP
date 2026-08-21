@@ -4,11 +4,19 @@ import Link from "next/link";
 import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
-import { classifySchools, classifySchool, computeConfidenceScore } from "@/lib/dataQuality";
+import { classifySchools, classifySchool } from "@/lib/dataQuality";
 
 const PAGE_SIZE = 1000;
 const DISPLAY_CAP = 200;
 const BATCH_SIZE = 300;
+const RECHECK_LIMIT = 2000;
+// Matches the recency bonus bands in compute_school_confidence_score() --
+// a verified school's confidence score starts losing its recency bonus
+// past 180 days since last_verified_at (10 -> 5), and loses it entirely
+// past 365 days (5 -> 0). This queue surfaces those schools before that
+// decay happens quietly in the background.
+const RECHECK_CUTOFF_DAYS = 180;
+const RECHECK_STALE_DAYS = 365;
 
 const FILTERS = [
   { key: "all", label: "All actionable issues" },
@@ -17,6 +25,12 @@ const FILTERS = [
   { key: "bad_cell", label: "Malformed cell" },
   { key: "bad_office", label: "Malformed office phone" },
   { key: "no_name", label: "No coach name" },
+];
+
+const SORTS = [
+  { key: "default", label: "Sort: Severity (default)" },
+  { key: "confidence_asc", label: "Sort: Confidence, low → high" },
+  { key: "confidence_desc", label: "Sort: Confidence, high → low" },
 ];
 
 const EDIT_FIELDS = [
@@ -62,6 +76,7 @@ const RADAR_FILTERS = [
 const COACH_CHANGE_SOURCE_META = {
   "Head coach change (manual)": { label: "Marked coach change", color: "#0b5fff", bg: "#e8f0ff" },
   "Data quality review (quick fix)": { label: "Quick fix", color: "#697386", bg: "#f0f1f4" },
+  "School profile (quick fix)": { label: "Quick fix (school profile)", color: "#697386", bg: "#f0f1f4" },
   "Coach-submitted correction (approved)": { label: "Coach-submitted (approved)", color: "#1a7f37", bg: "#e6f4ea" },
   "Coach-submitted correction (approved, edited by verifier)": { label: "Coach-submitted, edited", color: "#1a7f37", bg: "#e6f4ea" },
   "Bulk correction upload (Data Quality)": { label: "Bulk upload", color: "#8a6100", bg: "#fff4dc" },
@@ -116,6 +131,7 @@ export default function DataQualityPage() {
   const [scanError, setScanError] = useState("");
   const [result, setResult] = useState(null); // { flagged, counts, totalFlagged, totalScanned }
   const [filter, setFilter] = useState("all");
+  const [sortBy, setSortBy] = useState("default");
 
   const [editingId, setEditingId] = useState(null);
   const [editValues, setEditValues] = useState({});
@@ -178,6 +194,15 @@ export default function DataQualityPage() {
   const [loadingCoachChanges, setLoadingCoachChanges] = useState(true);
   const [coachChangeExporting, setCoachChangeExporting] = useState(false);
   const [coachChangeExportError, setCoachChangeExportError] = useState("");
+
+  // Needs Re-check -- verified schools whose last_verified_at has aged past
+  // the recency bands the confidence-score trigger cares about (see
+  // RECHECK_CUTOFF_DAYS/RECHECK_STALE_DAYS above), oldest first, so staff
+  // can re-confirm a listing before its score quietly decays.
+  const [needsRecheck, setNeedsRecheck] = useState([]);
+  const [loadingNeedsRecheck, setLoadingNeedsRecheck] = useState(true);
+  const [recheckExporting, setRecheckExporting] = useState(false);
+  const [recheckExportError, setRecheckExportError] = useState("");
 
   const loadFlags = useCallback(async () => {
     if (!canReview) {
@@ -266,6 +291,61 @@ export default function DataQualityPage() {
   useEffect(() => {
     loadCoachChanges();
   }, [loadCoachChanges]);
+
+  const loadNeedsRecheck = useCallback(async () => {
+    if (!canReview) {
+      setLoadingNeedsRecheck(false);
+      return;
+    }
+    setLoadingNeedsRecheck(true);
+    const cutoff = new Date(Date.now() - RECHECK_CUTOFF_DAYS * 24 * 60 * 60 * 1000).toISOString();
+    const { data } = await supabase
+      .from("schools")
+      .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,maxpreps_url,website,verification_status,confidence_score,last_verified_at")
+      .eq("verification_status", "verified")
+      .lt("last_verified_at", cutoff)
+      .order("last_verified_at", { ascending: true })
+      .limit(RECHECK_LIMIT);
+    setNeedsRecheck(data || []);
+    setLoadingNeedsRecheck(false);
+  }, [supabase, canReview]);
+
+  useEffect(() => {
+    loadNeedsRecheck();
+  }, [loadNeedsRecheck]);
+
+  function daysSince(dateStr) {
+    return Math.floor((Date.now() - new Date(dateStr).getTime()) / (24 * 60 * 60 * 1000));
+  }
+
+  // Exports the full Needs Re-check list (not capped to what's on screen).
+  function exportNeedsRecheck() {
+    setRecheckExportError("");
+    setRecheckExporting(true);
+    try {
+      const csv = Papa.unparse({
+        fields: ["school_id", "school_name", "city", "state", "days_since_verified", "hc_first_name", "hc_last_name", "hc_email", "hc_cell", "hc_office", "confidence_score"],
+        data: needsRecheck.map((s) => [
+          s.id,
+          s.name || "",
+          s.city || "",
+          s.state || "",
+          daysSince(s.last_verified_at),
+          s.hc_first_name || "",
+          s.hc_last_name || "",
+          s.hc_email || "",
+          s.hc_cell || "",
+          s.hc_office || "",
+          s.confidence_score ?? 0,
+        ]),
+      });
+      downloadBlob(csv, `needs_recheck_${new Date().toISOString().slice(0, 10)}.csv`);
+    } catch (err) {
+      setRecheckExportError(err.message || "Could not export this list.");
+    } finally {
+      setRecheckExporting(false);
+    }
+  }
 
   // Exports the full Coach Change History list (not capped to the ~100
   // shown on screen) -- one row per changed field, so "old value"/"new
@@ -514,7 +594,7 @@ export default function DataQualityPage() {
           const oldVal = (school[field] || "").toString().trim();
           if (newVal !== oldVal) fields.push({ field, label: fieldLabel, old: oldVal || "—", new: newVal });
         });
-        if (fields.length) preview.push({ id: school.id, name: school.name, city: school.city, state: school.state, fields, original: school });
+        if (fields.length) preview.push({ id: school.id, name: school.name, city: school.city, state: school.state, fields });
         else unchangedCount += 1;
       });
 
@@ -549,7 +629,10 @@ export default function DataQualityPage() {
           row.fields.forEach((f) => {
             update[f.field] = f.new;
           });
-          update.confidence_score = computeConfidenceScore({ ...row.original, ...update });
+          // confidence_score isn't set here -- the schools table recomputes
+          // it itself on every write (see the trigger note in markVerified
+          // below), so anything sent from the client would just be
+          // overridden anyway.
           updatesById.set(row.id, update);
           return update;
         });
@@ -591,6 +674,9 @@ export default function DataQualityPage() {
         return { ...prev, flagged: next, totalFlagged: next.length };
       });
       setSearchResults((prev) => prev.map((s) => (updatedIds.has(s.id) ? { ...s, ...updatesById.get(s.id) } : s)));
+      // Every row in this batch just got verification_status/last_verified_at
+      // refreshed, so none of them are stale anymore.
+      setNeedsRecheck((prev) => prev.filter((s) => !updatedIds.has(s.id)));
 
       if (updatedIds.size) {
         await supabase
@@ -735,6 +821,9 @@ export default function DataQualityPage() {
         return { ...prev, flagged: finalFlagged, totalFlagged: finalFlagged.length };
       });
       setSearchResults((prev) => prev.map((s) => (s.id === school.id ? { ...s, ...update } : s)));
+      // Freshly verified -- no longer stale, so it drops out of the Needs
+      // Re-check queue without waiting on a reload.
+      setNeedsRecheck((prev) => prev.filter((s) => s.id !== school.id));
     } catch (err) {
       setMarkVerifiedError(err.message || "Could not mark this school verified.");
     } finally {
@@ -771,12 +860,9 @@ export default function DataQualityPage() {
           });
         }
       });
-      // Redo the confidence score against the record as it will look right
-      // after this write lands, so it always reflects what's actually on
-      // file rather than whatever it was set to at the last edit (or, for
-      // most schools, at the original bulk import).
-      update.confidence_score = computeConfidenceScore({ ...before, ...update });
-
+      // confidence_score isn't set here -- the schools table recomputes it
+      // itself on every write, from whatever the row looks like after this
+      // update lands (see the trigger note in markVerified below).
       const { error: updateError } = await supabase.from("schools").update(update).eq("id", before.id);
       if (updateError) throw updateError;
       if (changes.length) {
@@ -800,6 +886,9 @@ export default function DataQualityPage() {
       // Also reflect the fix in the "Find & Edit a School" search results,
       // if this school is showing there -- a no-op otherwise.
       setSearchResults((prev) => prev.map((s) => (s.id === before.id ? { ...s, ...update } : s)));
+      // Freshly verified -- no longer stale, so it drops out of the Needs
+      // Re-check queue without waiting on a reload.
+      setNeedsRecheck((prev) => prev.filter((s) => s.id !== before.id));
       if (changes.some((c) => c.field_name === "hc_first_name" || c.field_name === "hc_last_name")) {
         loadCoachChanges();
       }
@@ -822,10 +911,10 @@ export default function DataQualityPage() {
         .eq("id", flag.id);
       if (error) throw error;
       const schoolUpdate = { verification_status: "verified", last_verified_at: new Date().toISOString() };
-      if (flag.schools) schoolUpdate.confidence_score = computeConfidenceScore({ ...flag.schools, ...schoolUpdate });
       const { error: schoolError } = await supabase.from("schools").update(schoolUpdate).eq("id", flag.school_id);
       if (schoolError) throw schoolError;
       setFlaggedQueue((prev) => prev.filter((f) => f.id !== flag.id));
+      setNeedsRecheck((prev) => prev.filter((s) => s.id !== flag.school_id));
     } catch (err) {
       setFlagActionError(err.message || "Could not dismiss this flag.");
     } finally {
@@ -841,10 +930,18 @@ export default function DataQualityPage() {
     );
   }
 
-  const visibleRows = result
-    ? result.flagged.filter((r) => filter === "all" || r.issues.some((iss) => iss.code === filter)).slice(0, DISPLAY_CAP)
-    : [];
-  const visibleTotal = result ? result.flagged.filter((r) => filter === "all" || r.issues.some((iss) => iss.code === filter)).length : 0;
+  const filteredRows = result ? result.flagged.filter((r) => filter === "all" || r.issues.some((iss) => iss.code === filter)) : [];
+  // classifySchools already sorts `filteredRows` by issue severity, then
+  // name -- that's the "default" sort below. Confidence sorting is applied
+  // on top, client-side, without touching that underlying order.
+  const sortedRows =
+    sortBy === "confidence_asc"
+      ? [...filteredRows].sort((a, b) => (a.school.confidence_score ?? 0) - (b.school.confidence_score ?? 0))
+      : sortBy === "confidence_desc"
+      ? [...filteredRows].sort((a, b) => (b.school.confidence_score ?? 0) - (a.school.confidence_score ?? 0))
+      : filteredRows;
+  const visibleRows = sortedRows.slice(0, DISPLAY_CAP);
+  const visibleTotal = filteredRows.length;
   const automatedPendingCount = flaggedQueue.filter((f) => (f.reason || "").startsWith(AUTOMATED_FLAG_PREFIX)).length;
   const confirmedTotal = (radarStats?.counts.confirmed || 0) + (radarStats?.counts.confirmed_maxpreps || 0);
   const radarFilteredRows = radarFilter === "all" ? radarRows : radarRows.filter((r) => r.result === radarFilter);
@@ -1136,6 +1233,125 @@ export default function DataQualityPage() {
       </div>
 
       <div className="card" style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+          <div>
+            <h3 style={{ marginBottom: 4 }}>Needs Re-check ({needsRecheck.length})</h3>
+            <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
+              Verified schools whose last check has aged past {RECHECK_CUTOFF_DAYS} days — that&apos;s exactly where the confidence score&apos;s recency bonus starts fading, and by {RECHECK_STALE_DAYS} days it&apos;s gone entirely. Oldest first.
+            </p>
+          </div>
+          <button className="btn btn-sm" onClick={exportNeedsRecheck} disabled={recheckExporting || needsRecheck.length === 0}>
+            {recheckExporting ? "Exporting…" : "Download CSV"}
+          </button>
+        </div>
+        {recheckExportError && <div className="notice danger" style={{ marginBottom: 10 }}>{recheckExportError}</div>}
+        {markVerifiedError && <div className="notice danger" style={{ marginBottom: 10 }}>{markVerifiedError}</div>}
+        {loadingNeedsRecheck ? (
+          <div className="empty-state">Loading…</div>
+        ) : needsRecheck.length === 0 ? (
+          <div className="empty-state">Nothing overdue — every verified school has been checked within the last {RECHECK_CUTOFF_DAYS} days.</div>
+        ) : (
+          <>
+            {needsRecheck.slice(0, DISPLAY_CAP).map((s) => {
+              const isEditing = editingId === s.id;
+              const days = daysSince(s.last_verified_at);
+              const stale = days >= RECHECK_STALE_DAYS;
+              return (
+                <div className="log-item" key={s.id} style={{ paddingBottom: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+                    <div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                        <strong>{s.name}</strong> — {s.city}, {s.state}
+                        <span className={stale ? "badge badge-private" : "badge badge-unverified"}>
+                          {stale ? `${days}d — score fully decayed` : `${days}d since verified`}
+                        </span>
+                        <span style={{ fontSize: 11, fontWeight: 600, color: confidenceColor(s.confidence_score ?? 0) }}>
+                          {s.confidence_score ?? 0}% confidence
+                        </span>
+                      </div>
+                      <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
+                        {[s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ") || "no name"}
+                        {s.hc_email ? ` · ${s.hc_email}` : ""}
+                        {s.hc_cell ? ` · ${fmtPhone(s.hc_cell)}` : ""}
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <Link href={`/schools/${s.id}`} className="btn btn-sm">Open Profile</Link>
+                      {!isEditing && (
+                        <>
+                          <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
+                          <button className="btn btn-sm" onClick={() => startCoachChange(s)}>Mark Coach Change</button>
+                          <button className="btn btn-sm" disabled={markingVerifiedId === s.id} onClick={() => markVerified(s)}>
+                            {markingVerifiedId === s.id ? "Marking…" : "Mark Verified"}
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  {isEditing && coachChangeFrom?.id === s.id && (
+                    <div className="notice" style={{ marginTop: 8, fontSize: 12.5 }}>
+                      Recording a new head coach at <strong>{s.name}</strong>. Outgoing: {[coachChangeFrom.hc_first_name, coachChangeFrom.hc_last_name].filter(Boolean).join(" ") || "no name on file"}
+                      {coachChangeFrom.hc_email ? ` · ${coachChangeFrom.hc_email}` : ""}
+                      {coachChangeFrom.hc_cell ? ` · ${fmtPhone(coachChangeFrom.hc_cell)}` : ""}. Fields left blank below will be cleared, not carried over.
+                    </div>
+                  )}
+
+                  {isEditing && (
+                    <div style={{ background: "#f7f8fa", border: "1px solid #dde1e7", borderRadius: 8, padding: 10, marginTop: 8 }}>
+                      <div className="grid grid-2" style={{ marginBottom: 8 }}>
+                        {EDIT_FIELDS.map(([field, label]) => (
+                          <div className="form-field" key={field} style={{ marginBottom: 0 }}>
+                            <label>{label}</label>
+                            <input value={editValues[field]} onChange={(e) => setEditValues((prev) => ({ ...prev, [field]: e.target.value }))} />
+                          </div>
+                        ))}
+                      </div>
+                      <div style={{ marginBottom: 8 }}>
+                        <button type="button" className="btn btn-sm" disabled={discovering} onClick={() => discoverMaxPreps(s)}>
+                          {discovering ? "Searching…" : "Find MaxPreps page"}
+                        </button>
+                        {discoverError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverError}</div>}
+                        {suggestions.length > 0 && (
+                          <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                            {suggestions.map((sugg) => (
+                              <button
+                                type="button"
+                                key={sugg.link}
+                                className="btn btn-sm"
+                                style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
+                                onClick={() => pickSuggestion(sugg.link)}
+                              >
+                                {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                      {saveError && <div className="notice danger" style={{ marginBottom: 8 }}>{saveError}</div>}
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
+                          {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : "Save & Mark Verified"}
+                        </button>
+                        <button type="button" className="btn btn-sm" onClick={cancelEdit} disabled={saving === s.id}>
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            {needsRecheck.length > DISPLAY_CAP && (
+              <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
+                Showing the oldest {DISPLAY_CAP} of {needsRecheck.length.toLocaleString()} — download the CSV for the full list.
+              </div>
+            )}
+          </>
+        )}
+      </div>
+
+      <div className="card" style={{ marginBottom: 14 }}>
         <h3 style={{ marginBottom: 4 }}>Flagged as Possibly Outdated ({flaggedQueue.length})</h3>
         <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
           Reported by coaches browsing the database, or raised automatically by Coach-Change Radar — surfaces here immediately, no scan needed.
@@ -1281,7 +1497,7 @@ export default function DataQualityPage() {
             </div>
           </div>
 
-          <div className="filters">
+          <div className="filters" style={{ alignItems: "center" }}>
             {FILTERS.map((f) => (
               <button
                 key={f.key}
@@ -1293,6 +1509,13 @@ export default function DataQualityPage() {
                 {f.key !== "all" && result.counts[f.key] ? ` (${result.counts[f.key]})` : ""}
               </button>
             ))}
+            <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} style={{ marginLeft: "auto" }}>
+              {SORTS.map((s) => (
+                <option key={s.key} value={s.key}>
+                  {s.label}
+                </option>
+              ))}
+            </select>
           </div>
 
           <div className="card">
