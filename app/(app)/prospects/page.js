@@ -1,6 +1,7 @@
 "use client";
 import { useEffect, useState, useCallback, useRef } from "react";
 import Link from "next/link";
+import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 
@@ -62,6 +63,125 @@ export default function ProspectsPage() {
 
   const canBulkAdd = profile?.role === "verifier" || profile?.role === "sysadmin";
   const isHsCoach = profile?.role === "hs_coach";
+
+  // Download every prospect on file as a CSV -- open to any signed-in user
+  // (not gated behind the verifier/sysadmin-only Bulk Add page), since
+  // exporting the roster for your own records or a spreadsheet is a
+  // widely-useful, read-only action.
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState("");
+
+  const fetchAllProspects = useCallback(async () => {
+    const rows = [];
+    let offset = 0;
+    for (;;) {
+      const { data, error } = await supabase
+        .from("prospects")
+        .select(
+          "athlete_name,grad_year,position,jersey_number,height,weight,gpa,athlete_email,athlete_cell,city,state,level_of_play,hudl_url,x_url,coach_evaluation,guardian_authorized,guardian_first_name,guardian_last_name,guardian_email,guardian_cell,offers_received,committed_to,forty_yard_dash,vertical_jump,broad_jump,bench_press_reps,shuttle_time,is_underexposed,status,created_at,schools(name,city,state)"
+        )
+        .order("created_at", { ascending: false })
+        .range(offset, offset + 999);
+      if (error) throw error;
+      rows.push(...(data || []));
+      if (!data || data.length < 1000) break;
+      offset += 1000;
+    }
+    return rows;
+  }, [supabase]);
+
+  function downloadBlob(csv, filename) {
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  async function exportProspects() {
+    setExportError("");
+    setExporting(true);
+    try {
+      const rows = await fetchAllProspects();
+      const csv = Papa.unparse({
+        fields: [
+          "athlete_name",
+          "grad_year",
+          "school_name",
+          "city",
+          "state",
+          "level_of_play",
+          "position",
+          "jersey_number",
+          "height",
+          "weight",
+          "gpa",
+          "forty_yard_dash",
+          "vertical_jump",
+          "broad_jump",
+          "bench_press_reps",
+          "shuttle_time",
+          "athlete_email",
+          "athlete_cell",
+          "guardian_authorized",
+          "guardian_first_name",
+          "guardian_last_name",
+          "guardian_email",
+          "guardian_cell",
+          "hudl_url",
+          "x_url",
+          "coach_evaluation",
+          "offers_received",
+          "committed_to",
+          "underexposed_flag",
+          "status",
+          "submitted_date",
+        ],
+        data: rows.map((r) => [
+          r.athlete_name,
+          r.grad_year || "",
+          r.schools?.name || "",
+          r.city || r.schools?.city || "",
+          r.state || r.schools?.state || "",
+          r.level_of_play || "",
+          r.position || "",
+          r.jersey_number || "",
+          r.height || "",
+          r.weight || "",
+          r.gpa ?? "",
+          r.forty_yard_dash ?? "",
+          r.vertical_jump ?? "",
+          r.broad_jump ?? "",
+          r.bench_press_reps ?? "",
+          r.shuttle_time ?? "",
+          r.athlete_email || "",
+          r.athlete_cell || "",
+          r.guardian_authorized ? "TRUE" : "FALSE",
+          r.guardian_first_name || "",
+          r.guardian_last_name || "",
+          r.guardian_email || "",
+          r.guardian_cell || "",
+          r.hudl_url || "",
+          r.x_url || "",
+          r.coach_evaluation || "",
+          r.offers_received || "",
+          r.committed_to || "",
+          r.is_underexposed ? "Yes" : "No",
+          r.status || "",
+          r.created_at ? new Date(r.created_at).toISOString().slice(0, 10) : "",
+        ]),
+      });
+      downloadBlob(csv, `csd_prospects_export_${new Date().toISOString().slice(0, 10)}.csv`);
+    } catch (err) {
+      setExportError(err.message || "Could not export prospects.");
+    } finally {
+      setExporting(false);
+    }
+  }
 
   const load = useCallback(async () => {
     if (college?.id) {
@@ -205,6 +325,9 @@ export default function ProspectsPage() {
           <Link href="/prospects/compare" className="btn btn-sm">
             Compare Prospects
           </Link>
+          <button className="btn btn-sm" onClick={exportProspects} disabled={exporting}>
+            {exporting ? "Exporting…" : "Download Prospects CSV"}
+          </button>
           {canBulkAdd && (
             <Link href="/prospects/bulk-add" className="btn btn-sm btn-primary">
               Bulk Add Prospects (CSV)
@@ -212,6 +335,8 @@ export default function ProspectsPage() {
           )}
         </div>
       </div>
+
+      {exportError && <div className="notice danger" style={{ marginBottom: 14 }}>{exportError}</div>}
 
       <div className="grid grid-2">
         <div className="card">
