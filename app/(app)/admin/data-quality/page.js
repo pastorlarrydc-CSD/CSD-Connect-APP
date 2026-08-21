@@ -204,6 +204,23 @@ export default function DataQualityPage() {
   const [recheckExporting, setRecheckExporting] = useState(false);
   const [recheckExportError, setRecheckExportError] = useState("");
 
+  // Bulk Mark Verified -- for a batch that's already been confirmed some
+  // other way (a trusted external roster, a phone-verified list) and just
+  // needs marking, with no field changes to make. A much lighter cousin of
+  // the CSV upload above: matches on school_id or school_name+state only,
+  // writes nothing to school_change_log (nothing changed), and just flips
+  // verification_status/last_verified_at.
+  const bulkVerifyInputRef = useRef(null);
+  const [bulkVerifyFileName, setBulkVerifyFileName] = useState("");
+  const [bulkVerifyParsing, setBulkVerifyParsing] = useState(false);
+  const [bulkVerifyError, setBulkVerifyError] = useState("");
+  const [bulkVerifyMatched, setBulkVerifyMatched] = useState([]); // [{id,name,city,state}]
+  const [bulkVerifyUnmatched, setBulkVerifyUnmatched] = useState([]); // [{row,reason}]
+  const [bulkVerifyApplying, setBulkVerifyApplying] = useState(false);
+  const [bulkVerifyApplyStatus, setBulkVerifyApplyStatus] = useState("");
+  const [bulkVerifyApplyError, setBulkVerifyApplyError] = useState("");
+  const [bulkVerifyApplyResult, setBulkVerifyApplyResult] = useState(null); // {count}
+
   const loadFlags = useCallback(async () => {
     if (!canReview) {
       setLoadingFlags(false);
@@ -642,12 +659,19 @@ export default function DataQualityPage() {
         const changes = [];
         chunk.forEach((row) => {
           row.fields.forEach((f) => {
+            // A bulk upload that touches the coach's name is, in practice,
+            // almost always recording a coach change (a season's worth of
+            // hires dumped in from a spreadsheet) -- tag those two fields
+            // the same way "Mark Coach Change" does, so they show up
+            // correctly in Coach Change History without anyone having to
+            // fix them one at a time by hand.
+            const isCoachName = f.field === "hc_first_name" || f.field === "hc_last_name";
             changes.push({
               school_id: row.id,
               field_name: f.field,
               old_value: f.old === "—" ? null : f.old,
               new_value: f.new,
-              source: "Bulk correction upload (Data Quality)",
+              source: isCoachName ? "Head coach change (manual)" : "Bulk correction upload (Data Quality)",
               changed_by: user.id,
             });
           });
@@ -701,6 +725,143 @@ export default function DataQualityPage() {
     } finally {
       setUploadApplying(false);
       setUploadApplyStatus("");
+    }
+  }
+
+  function resetBulkVerify() {
+    setBulkVerifyMatched([]);
+    setBulkVerifyUnmatched([]);
+    setBulkVerifyError("");
+    setBulkVerifyApplyResult(null);
+    setBulkVerifyApplyError("");
+    setBulkVerifyFileName("");
+    if (bulkVerifyInputRef.current) bulkVerifyInputRef.current.value = "";
+  }
+
+  // Reads a simple list of schools -- school_id (preferred) or
+  // school_name + state (+ city to break ties) -- and matches each row
+  // without touching any field. Same matching rule as the CSV upload
+  // above, just without the field-by-field diff, since there's nothing to
+  // diff here.
+  async function handleBulkVerifyFile(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    resetBulkVerify();
+    setBulkVerifyFileName(file.name);
+    setBulkVerifyParsing(true);
+    try {
+      const text = await file.text();
+      const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+      if (parsed.errors?.length) throw new Error(parsed.errors[0].message);
+      const rows = (parsed.data || []).map((row) => {
+        const clean = {};
+        Object.keys(row).forEach((k) => {
+          clean[k.trim().toLowerCase()] = row[k];
+        });
+        return clean;
+      });
+      if (!rows.length) throw new Error("The file has no data rows.");
+
+      const schools = await fetchAllSchools();
+      const byId = new Map(schools.map((s) => [String(s.id), s]));
+      const byNameState = new Map();
+      schools.forEach((s) => {
+        const key = `${(s.name || "").trim().toLowerCase()}|${(s.state || "").trim().toUpperCase()}`;
+        if (!byNameState.has(key)) byNameState.set(key, []);
+        byNameState.get(key).push(s);
+      });
+
+      const matched = [];
+      const unmatched = [];
+      const seenIds = new Set();
+
+      rows.forEach((row, idx) => {
+        const label = row.school_name || row.name || `Row ${idx + 2}`;
+        let school = null;
+        const idVal = String(row.school_id || row.id || "").trim();
+        if (idVal && byId.has(idVal)) {
+          school = byId.get(idVal);
+        } else {
+          const nameVal = (row.school_name || row.name || "").trim();
+          const stateVal = (row.state || "").trim().toUpperCase();
+          if (nameVal && stateVal) {
+            const key = `${nameVal.toLowerCase()}|${stateVal}`;
+            let candidates = byNameState.get(key) || [];
+            if (candidates.length > 1 && row.city) {
+              const narrowed = candidates.filter((c) => (c.city || "").trim().toLowerCase() === row.city.trim().toLowerCase());
+              if (narrowed.length) candidates = narrowed;
+            }
+            if (candidates.length === 1) school = candidates[0];
+            else if (candidates.length > 1) {
+              unmatched.push({ row: label, reason: `${candidates.length} schools match "${nameVal}, ${stateVal}" — add a city or school_id column to disambiguate.` });
+              return;
+            }
+          }
+        }
+        if (!school) {
+          unmatched.push({ row: label, reason: idVal ? `No school found with id ${idVal}.` : "Could not match on school_id or school_name + state." });
+          return;
+        }
+        if (seenIds.has(school.id)) return; // same school listed twice -- not an error, just skip the repeat
+        seenIds.add(school.id);
+        matched.push({ id: school.id, name: school.name, city: school.city, state: school.state });
+      });
+
+      setBulkVerifyMatched(matched);
+      setBulkVerifyUnmatched(unmatched);
+    } catch (err) {
+      setBulkVerifyError(err.message || "Could not read this file.");
+    } finally {
+      setBulkVerifyParsing(false);
+    }
+  }
+
+  // Applies the batch in one shot (chunked for the upsert): flips
+  // verification_status/last_verified_at, resolves any pending "possibly
+  // outdated" flags on the schools touched, and folds the result back
+  // into every list on screen -- same bookkeeping as markVerified, just
+  // for many schools at once instead of one.
+  async function applyBulkVerify() {
+    setBulkVerifyApplying(true);
+    setBulkVerifyApplyError("");
+    setBulkVerifyApplyResult(null);
+    try {
+      const now = new Date().toISOString();
+      const ids = bulkVerifyMatched.map((s) => s.id);
+      for (let i = 0; i < ids.length; i += BATCH_SIZE) {
+        const chunk = ids.slice(i, i + BATCH_SIZE);
+        setBulkVerifyApplyStatus(`Verifying ${i + 1}–${Math.min(i + BATCH_SIZE, ids.length)} of ${ids.length}…`);
+        const upserts = chunk.map((id) => ({ id, verification_status: "verified", last_verified_at: now }));
+        const { error } = await supabase.from("schools").upsert(upserts, { onConflict: "id" });
+        if (error) throw error;
+      }
+
+      const updatedIds = new Set(ids);
+      if (updatedIds.size) {
+        await supabase
+          .from("school_flags")
+          .update({ status: "resolved", resolved_by: user.id, resolved_at: now })
+          .in("school_id", ids)
+          .eq("status", "pending");
+      }
+
+      const merge = { verification_status: "verified", last_verified_at: now };
+      setResult((prev) => {
+        if (!prev) return prev;
+        const nextFlagged = prev.flagged.map((r) => (updatedIds.has(r.school.id) ? { ...r, school: { ...r.school, ...merge } } : r));
+        return { ...prev, flagged: nextFlagged };
+      });
+      setSearchResults((prev) => prev.map((s) => (updatedIds.has(s.id) ? { ...s, ...merge } : s)));
+      setNeedsRecheck((prev) => prev.filter((s) => !updatedIds.has(s.id)));
+      setFlaggedQueue((prev) => prev.filter((f) => !updatedIds.has(f.school_id)));
+
+      setBulkVerifyApplyResult({ count: ids.length });
+      setBulkVerifyMatched([]);
+    } catch (err) {
+      setBulkVerifyApplyError(err.message || "Something went wrong marking these schools verified.");
+    } finally {
+      setBulkVerifyApplying(false);
+      setBulkVerifyApplyStatus("");
     }
   }
 
@@ -1348,6 +1509,70 @@ export default function DataQualityPage() {
               </div>
             )}
           </>
+        )}
+      </div>
+
+      <div className="card" style={{ marginBottom: 14 }}>
+        <h3 style={{ marginBottom: 4 }}>Bulk Mark Verified</h3>
+        <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
+          Already confirmed a batch of schools some other way — a trusted external roster, a phone-verified list? Upload a simple list (one school per row: <code>school_id</code> preferred, or{" "}
+          <code>school_name</code> + <code>state</code>) and mark them all verified at once. No field changes, no editing — just a confirmation.
+        </p>
+        {bulkVerifyError && <div className="notice danger" style={{ marginBottom: 10 }}>{bulkVerifyError}</div>}
+        <input ref={bulkVerifyInputRef} type="file" accept=".csv" onChange={handleBulkVerifyFile} disabled={bulkVerifyParsing || bulkVerifyApplying} />
+        {bulkVerifyParsing && <div className="empty-state" style={{ marginTop: 8 }}>Reading {bulkVerifyFileName}…</div>}
+
+        {bulkVerifyApplyResult && (
+          <div className="notice" style={{ marginTop: 10 }}>
+            Marked {bulkVerifyApplyResult.count} school{bulkVerifyApplyResult.count === 1 ? "" : "s"} verified.
+          </div>
+        )}
+
+        {(bulkVerifyMatched.length > 0 || bulkVerifyUnmatched.length > 0) && !bulkVerifyApplyResult && (
+          <div style={{ marginTop: 10 }}>
+            <div className="grid grid-2" style={{ marginBottom: 10 }}>
+              <div className="stat-card">
+                <div className="label">Matched</div>
+                <div className="num">{bulkVerifyMatched.length}</div>
+                <div className="sub">will be marked verified</div>
+              </div>
+              <div className="stat-card">
+                <div className="label">Unmatched rows</div>
+                <div className="num">{bulkVerifyUnmatched.length}</div>
+                <div className="sub">need school_id or name+state</div>
+              </div>
+            </div>
+
+            {bulkVerifyApplyError && <div className="notice danger" style={{ marginBottom: 10 }}>{bulkVerifyApplyError}</div>}
+
+            {bulkVerifyUnmatched.length > 0 && (
+              <div className="notice danger" style={{ marginBottom: 10 }}>
+                <strong>{bulkVerifyUnmatched.length} row(s) could not be matched:</strong>
+                <div style={{ maxHeight: 140, overflow: "auto", marginTop: 6 }}>
+                  {bulkVerifyUnmatched.slice(0, 50).map((u, i) => (
+                    <div key={i} style={{ fontSize: 12, padding: "3px 0" }}>{u.row}: {u.reason}</div>
+                  ))}
+                  {bulkVerifyUnmatched.length > 50 && <div style={{ fontSize: 12 }}>…and {bulkVerifyUnmatched.length - 50} more.</div>}
+                </div>
+              </div>
+            )}
+
+            {bulkVerifyMatched.length > 0 && (
+              <>
+                <div style={{ maxHeight: 220, overflow: "auto", marginBottom: 10 }}>
+                  {bulkVerifyMatched.slice(0, 100).map((s) => (
+                    <div key={s.id} style={{ fontSize: 12.5, padding: "4px 0", borderBottom: "1px solid #eee" }}>
+                      <strong>{s.name}</strong> — {s.city}, {s.state}
+                    </div>
+                  ))}
+                  {bulkVerifyMatched.length > 100 && <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>…and {bulkVerifyMatched.length - 100} more.</div>}
+                </div>
+                <button className="btn btn-sm btn-gold" onClick={applyBulkVerify} disabled={bulkVerifyApplying}>
+                  {bulkVerifyApplying ? bulkVerifyApplyStatus || "Verifying…" : `Mark ${bulkVerifyMatched.length} School${bulkVerifyMatched.length === 1 ? "" : "s"} Verified`}
+                </button>
+              </>
+            )}
+          </div>
         )}
       </div>
 
