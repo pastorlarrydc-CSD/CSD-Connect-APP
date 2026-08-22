@@ -769,6 +769,7 @@ export default function DataQualityPage() {
         });
         const { error } = await supabase.from("schools").upsert(upserts, { onConflict: "id" });
         if (error) throw error;
+        await logManualVerificationBatch(upserts.map((u) => ({ ...u, via: "bulk correction upload" })));
 
         const changes = [];
         chunk.forEach((row) => {
@@ -948,6 +949,7 @@ export default function DataQualityPage() {
         const upserts = chunk.map((id) => ({ id, verification_status: "verified", last_verified_at: now }));
         const { error } = await supabase.from("schools").upsert(upserts, { onConflict: "id" });
         if (error) throw error;
+        await logManualVerificationBatch(chunk.map((id) => ({ id, via: "Bulk Mark Verified" })));
       }
 
       const updatedIds = new Set(ids);
@@ -1067,6 +1069,61 @@ export default function DataQualityPage() {
     setFlaggedQueue((prev) => prev.filter((f) => f.school_id !== schoolId));
   }
 
+  // The nightly Coach-Change Radar sweep picks its batch from
+  // school_recheck_log (see school_recheck_priority / RECHECK_BATCH_SIZE
+  // above), not from verification_status/last_verified_at -- so without
+  // this, a school just verified by hand here would still show up in
+  // tonight's automated batch. Logging a row here moves it to the back of
+  // that queue exactly like a real website check would. result is
+  // constrained to the same five values the automated checks use (see
+  // school_recheck_log's CHECK constraint) -- "confirmed" is the closest
+  // fit; the [Manual verification] detail prefix is what actually tells
+  // this apart from an automated check (and keeps it out of the "[Automated
+  // nightly sweep]" Coach-Change Radar report above, which filters on that
+  // exact prefix). Best-effort: this is bookkeeping for the nightly
+  // schedule, not the verification itself, so a failure here shouldn't
+  // block or error out the action that's actually marking the school
+  // verified.
+  async function logManualVerification(school) {
+    try {
+      await supabase.from("school_recheck_log").insert({
+        school_id: school.id,
+        checked_by: user.id,
+        website_checked: school.website || null,
+        coach_name_checked: [school.hc_first_name, school.hc_last_name].filter(Boolean).join(" ") || null,
+        result: "confirmed",
+        detail: "[Manual verification] Marked verified by a staff member — not an automated website check.",
+      });
+    } catch (err) {
+      console.error("Could not log manual verification", err);
+    }
+  }
+
+  // Same as logManualVerification, batched for the CSV upload / Bulk Mark
+  // Verified tools -- one insert per chunk instead of one round trip per
+  // school. `rows` is whatever's on hand at the call site (may not include
+  // website/coach name if this particular tool didn't fetch or touch that
+  // field) -- those columns are just informational either way, so a null
+  // there doesn't affect what actually matters: the row existing at all,
+  // so this school drops to the back of tonight's queue.
+  async function logManualVerificationBatch(rows) {
+    if (!rows.length) return;
+    try {
+      await supabase.from("school_recheck_log").insert(
+        rows.map((r) => ({
+          school_id: r.id,
+          checked_by: user.id,
+          website_checked: r.website || null,
+          coach_name_checked: [r.hc_first_name, r.hc_last_name].filter(Boolean).join(" ") || null,
+          result: "confirmed",
+          detail: `[Manual verification] Marked verified via ${r.via || "a bulk tool"} — not an automated website check.`,
+        }))
+      );
+    } catch (err) {
+      console.error("Could not log manual verification batch", err);
+    }
+  }
+
   // Marks a school verified with no field changes -- for a record found
   // via search or a scan that you've actually checked (in person, on the
   // phone, on the school's website) and it's already correct. Same effect
@@ -1083,9 +1140,10 @@ export default function DataQualityPage() {
       const update = { verification_status: "verified", last_verified_at: new Date().toISOString() };
       const { error } = await supabase.from("schools").update(update).eq("id", school.id);
       if (error) throw error;
+      const merged = { ...school, ...update };
+      await logManualVerification(merged);
       await resolvePendingFlags(school.id);
 
-      const merged = { ...school, ...update };
       setResult((prev) => {
         if (!prev) return prev;
         const nextFlagged = prev.flagged.map((r) => (r.school.id === school.id ? { ...r, school: merged } : r));
@@ -1144,13 +1202,14 @@ export default function DataQualityPage() {
         const { error: logError } = await supabase.from("school_change_log").insert(changes);
         if (logError) throw logError;
       }
+      const merged = { ...before, ...update };
+      await logManualVerification(merged);
       await resolvePendingFlags(before.id);
 
       // Reflect the fix locally without a full re-scan: drop the row from
       // the queue if it's no longer actionable, otherwise re-classify it.
       setResult((prev) => {
         if (!prev) return prev;
-        const merged = { ...before, ...update };
         const nextFlagged = prev.flagged.map((r) => (r.school.id === before.id ? { ...r, school: merged } : r));
         const reclass = classifySchool(merged);
         const finalFlagged = reclass.actionable
@@ -1188,6 +1247,7 @@ export default function DataQualityPage() {
       const schoolUpdate = { verification_status: "verified", last_verified_at: new Date().toISOString() };
       const { error: schoolError } = await supabase.from("schools").update(schoolUpdate).eq("id", flag.school_id);
       if (schoolError) throw schoolError;
+      await logManualVerification({ ...flag.schools, id: flag.school_id, ...schoolUpdate });
       setFlaggedQueue((prev) => prev.filter((f) => f.id !== flag.id));
       setNeedsRecheck((prev) => prev.filter((s) => s.id !== flag.school_id));
     } catch (err) {
