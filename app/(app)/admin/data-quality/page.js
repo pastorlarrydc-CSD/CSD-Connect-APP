@@ -1335,7 +1335,7 @@ export default function DataQualityPage() {
                   </div>
                 </div>
                 <div style={{ display: "flex", gap: 6 }}>
-                  <Link href={`/schools/${s.id}`} className="btn btn-sm">Open Profile</Link>
+                  <Link href={`/schools/${s.id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
                   {!isEditing && (
                     <>
                       <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
@@ -1493,7 +1493,7 @@ export default function DataQualityPage() {
                             </div>
                           </div>
                           <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
-                            <Link href={`/schools/${row.school_id}`} className="btn btn-sm">Open Profile</Link>
+                            <Link href={`/schools/${row.school_id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
                             <span style={{ fontSize: 11, color: "#9aa2b1", whiteSpace: "nowrap" }}>
                               {row.checked_at ? new Date(row.checked_at).toLocaleString() : ""}
                             </span>
@@ -1590,7 +1590,7 @@ export default function DataQualityPage() {
                     </div>
                   </div>
                   <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
-                    <Link href={`/schools/${r.school_id}`} className="btn btn-sm">Open Profile</Link>
+                    <Link href={`/schools/${r.school_id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
                     <span style={{ fontSize: 11, color: "#9aa2b1", whiteSpace: "nowrap" }}>
                       {r.last_checked_at ? `Last checked ${new Date(r.last_checked_at).toLocaleDateString()}` : "Never checked"}
                     </span>
@@ -1643,7 +1643,7 @@ export default function DataQualityPage() {
                       </div>
                     </div>
                     <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
-                      <Link href={`/schools/${g.school_id}`} className="btn btn-sm">Open Profile</Link>
+                      <Link href={`/schools/${g.school_id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
                       <span style={{ fontSize: 11, color: "#9aa2b1", whiteSpace: "nowrap" }}>
                         {g.changed_at ? new Date(g.changed_at).toLocaleString() : ""}
                       </span>
@@ -1705,7 +1705,7 @@ export default function DataQualityPage() {
                       </div>
                     </div>
                     <div style={{ display: "flex", gap: 6 }}>
-                      <Link href={`/schools/${s.id}`} className="btn btn-sm">Open Profile</Link>
+                      <Link href={`/schools/${s.id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
                       {!isEditing && (
                         <>
                           <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
@@ -1888,7 +1888,7 @@ export default function DataQualityPage() {
                     </div>
                   </div>
                   <div style={{ display: "flex", gap: 6 }}>
-                    <Link href={`/schools/${flag.school_id}`} className="btn btn-sm">Open Profile</Link>
+                    <Link href={`/schools/${flag.school_id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
                     {!isEditing && s && (
                       <>
                         <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
@@ -2126,7 +2126,7 @@ export default function DataQualityPage() {
                         </div>
                       </div>
                       <div style={{ display: "flex", gap: 6 }}>
-                        <Link href={`/schools/${s.id}`} className="btn btn-sm">Open Profile</Link>
+                        <Link href={`/schools/${s.id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
                         {!isEditing && (
                           <>
                             <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
