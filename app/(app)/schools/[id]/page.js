@@ -117,6 +117,22 @@ export default function SchoolProfilePage() {
   const [websiteSaving, setWebsiteSaving] = useState(false);
   const [websiteError, setWebsiteError] = useState("");
 
+  // Same standalone inline-edit pattern as the website field above --
+  // MaxPreps URL isn't tied to the coach's identity, so it doesn't belong
+  // in the "Mark Coach Change" flow below; this is the one place in the
+  // app a MaxPreps URL can actually be added or fixed on a school record.
+  const [editingMaxpreps, setEditingMaxpreps] = useState(false);
+  const [maxprepsDraft, setMaxprepsDraft] = useState("");
+  const [maxprepsSaving, setMaxprepsSaving] = useState(false);
+  const [maxprepsError, setMaxprepsError] = useState("");
+  // "Find MaxPreps page" -- same Google-search-backed lookup the Data
+  // Quality Quick Fix panel offers (see app/api/schools/[id]/discover-
+  // maxpreps), just reachable from the school's own profile so a MaxPreps
+  // URL can be found and saved without leaving this page.
+  const [discovering, setDiscovering] = useState(false);
+  const [discoverError, setDiscoverError] = useState("");
+  const [suggestions, setSuggestions] = useState([]);
+
   // Staff-only direct edit of the head coach fields -- a lighter, on-page
   // version of the Quick Fix / Mark Coach Change tools on the Data Quality
   // Review page (app/(app)/admin/data-quality/page.js), for when staff are
@@ -424,6 +440,76 @@ export default function SchoolProfilePage() {
     }
   }
 
+  function startEditMaxpreps() {
+    setMaxprepsDraft(school.maxpreps_url || "");
+    setMaxprepsError("");
+    setDiscoverError("");
+    setSuggestions([]);
+    setEditingMaxpreps(true);
+  }
+
+  // Only ever returns candidate links for a human to review and pick from
+  // -- never writes maxpreps_url on its own (see the API route's own
+  // comment for why).
+  async function discoverMaxPreps() {
+    setDiscovering(true);
+    setDiscoverError("");
+    setSuggestions([]);
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const res = await fetch(`/api/schools/${id}/discover-maxpreps`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session?.access_token}` },
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || "Could not search for a MaxPreps page.");
+      setSuggestions(json.candidates || []);
+      if (!json.candidates?.length) setDiscoverError("No MaxPreps page turned up for this school. Try searching MaxPreps directly and paste the link in.");
+    } catch (err) {
+      setDiscoverError(err.message || "Could not search for a MaxPreps page.");
+    } finally {
+      setDiscovering(false);
+    }
+  }
+
+  function pickSuggestion(link) {
+    setMaxprepsDraft(link);
+    setSuggestions([]);
+  }
+
+  async function saveMaxprepsDirect(e) {
+    e.preventDefault();
+    setMaxprepsError("");
+    setMaxprepsSaving(true);
+    try {
+      const newVal = maxprepsDraft.trim() || null;
+      const oldVal = school.maxpreps_url || null;
+      const { error } = await supabase
+        .from("schools")
+        .update({ maxpreps_url: newVal, updated_at: new Date().toISOString() })
+        .eq("id", id);
+      if (error) throw error;
+      if (newVal !== oldVal && user?.id) {
+        await supabase.from("school_change_log").insert({
+          school_id: id,
+          field_name: "maxpreps_url",
+          old_value: oldVal,
+          new_value: newVal,
+          source: "Edited directly by verification staff",
+          changed_by: user.id,
+        });
+      }
+      setEditingMaxpreps(false);
+      load();
+    } catch (err) {
+      setMaxprepsError(err.message || "Could not save this MaxPreps URL.");
+    } finally {
+      setMaxprepsSaving(false);
+    }
+  }
+
   // Resolves every pending "possibly outdated" flag on this school, not
   // just the current viewer's own -- same behavior as resolvePendingFlags
   // on the Data Quality Review page. Called any time staff mark this
@@ -650,12 +736,21 @@ export default function SchoolProfilePage() {
           </div>
 
           <div className="card" style={{ marginBottom: 14 }}>
-            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4, flexWrap: "wrap", gap: 8 }}>
               <h3 style={{ margin: 0 }}>School Info</h3>
-              {isStaff && !editingWebsite && (
-                <button className="btn btn-sm" onClick={startEditWebsite}>
-                  Edit website
-                </button>
+              {isStaff && (
+                <div style={{ display: "flex", gap: 6 }}>
+                  {!editingWebsite && (
+                    <button className="btn btn-sm" onClick={startEditWebsite}>
+                      Edit website
+                    </button>
+                  )}
+                  {!editingMaxpreps && (
+                    <button className="btn btn-sm" onClick={startEditMaxpreps}>
+                      {school.maxpreps_url ? "Edit MaxPreps URL" : "Add MaxPreps URL"}
+                    </button>
+                  )}
+                </div>
               )}
             </div>
             <div className="kv" style={{ marginTop: 10 }}>
@@ -681,6 +776,17 @@ export default function SchoolProfilePage() {
               </div>
               <div className="k">Classification</div>
               <div className="v">{school.classification || "—"}</div>
+              <div className="k">MaxPreps URL</div>
+              <div className="v">
+                {!editingMaxpreps &&
+                  (school.maxpreps_url ? (
+                    <a href={withProtocol(school.maxpreps_url)} target="_blank" rel="noopener noreferrer">
+                      {school.maxpreps_url}
+                    </a>
+                  ) : (
+                    "—"
+                  ))}
+              </div>
             </div>
 
             {editingWebsite && (
@@ -695,6 +801,48 @@ export default function SchoolProfilePage() {
                     {websiteSaving ? "Saving…" : "Save"}
                   </button>
                   <button type="button" className="btn btn-sm" onClick={() => setEditingWebsite(false)} disabled={websiteSaving}>
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {editingMaxpreps && (
+              <form onSubmit={saveMaxprepsDirect} style={{ marginTop: 10, borderTop: "1px solid #eef0f3", paddingTop: 10 }}>
+                {maxprepsError && <div className="notice danger" style={{ marginBottom: 10 }}>{maxprepsError}</div>}
+                <div className="form-field">
+                  <label>MaxPreps URL</label>
+                  <input value={maxprepsDraft} onChange={(e) => setMaxprepsDraft(e.target.value)} placeholder="www.maxpreps.com/school/team/football/roster" />
+                </div>
+                <p style={{ fontSize: 11.5, color: "#9aa5b1", marginTop: -4, marginBottom: 8 }}>
+                  Used as a fallback by Coach-Change Radar when the school&apos;s own website doesn&apos;t confirm the head coach&apos;s name.
+                </p>
+                <div style={{ marginBottom: 8 }}>
+                  <button type="button" className="btn btn-sm" disabled={discovering} onClick={discoverMaxPreps}>
+                    {discovering ? "Searching…" : "Find MaxPreps page"}
+                  </button>
+                  {discoverError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverError}</div>}
+                  {suggestions.length > 0 && (
+                    <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                      {suggestions.map((sugg) => (
+                        <button
+                          type="button"
+                          key={sugg.link}
+                          className="btn btn-sm"
+                          style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
+                          onClick={() => pickSuggestion(sugg.link)}
+                        >
+                          {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button className="btn btn-sm btn-primary" disabled={maxprepsSaving}>
+                    {maxprepsSaving ? "Saving…" : "Save"}
+                  </button>
+                  <button type="button" className="btn btn-sm" onClick={() => setEditingMaxpreps(false)} disabled={maxprepsSaving}>
                     Cancel
                   </button>
                 </div>
