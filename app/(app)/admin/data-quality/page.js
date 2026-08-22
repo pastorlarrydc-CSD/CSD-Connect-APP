@@ -381,7 +381,7 @@ export default function DataQualityPage() {
     const ids = (priority || []).map((r) => r.school_id);
     let schoolById = new Map();
     if (ids.length) {
-      const { data: schoolRows } = await supabase.from("schools").select("id,name,city,state").in("id", ids);
+      const { data: schoolRows } = await supabase.from("schools").select("id,name,city,state,verification_status,last_verified_at").in("id", ids);
       (schoolRows || []).forEach((s) => schoolById.set(s.id, s));
     }
     setUpcomingQueue((priority || []).map((r) => ({ ...r, school: schoolById.get(r.school_id) })));
@@ -770,6 +770,7 @@ export default function DataQualityPage() {
         const { error } = await supabase.from("schools").upsert(upserts, { onConflict: "id" });
         if (error) throw error;
         await logManualVerificationBatch(upserts.map((u) => ({ ...u, via: "bulk correction upload" })));
+        markUpcomingVerified(chunk.map((row) => row.id), { verification_status: "verified", last_verified_at: now });
 
         const changes = [];
         chunk.forEach((row) => {
@@ -950,6 +951,7 @@ export default function DataQualityPage() {
         const { error } = await supabase.from("schools").upsert(upserts, { onConflict: "id" });
         if (error) throw error;
         await logManualVerificationBatch(chunk.map((id) => ({ id, via: "Bulk Mark Verified" })));
+        markUpcomingVerified(chunk, { verification_status: "verified", last_verified_at: now });
       }
 
       const updatedIds = new Set(ids);
@@ -1099,6 +1101,18 @@ export default function DataQualityPage() {
     }
   }
 
+  // Reflects a fresh verification on any row currently shown in the
+  // Upcoming Recheck Queue -- that queue is a point-in-time snapshot (see
+  // loadUpcomingQueue), so without this a school you just checked would
+  // keep sitting there looking untouched until the next full reload. A
+  // school shows the "You verified this" badge below once its
+  // last_verified_at is newer than the last_checked_at this row was
+  // loaded with -- exactly what just happened here.
+  function markUpcomingVerified(schoolIds, patch) {
+    const idSet = schoolIds instanceof Set ? schoolIds : new Set(schoolIds);
+    setUpcomingQueue((prev) => prev.map((r) => (idSet.has(r.school_id) ? { ...r, school: { ...r.school, ...patch } } : r)));
+  }
+
   // Same as logManualVerification, batched for the CSV upload / Bulk Mark
   // Verified tools -- one insert per chunk instead of one round trip per
   // school. `rows` is whatever's on hand at the call site (may not include
@@ -1143,6 +1157,7 @@ export default function DataQualityPage() {
       const merged = { ...school, ...update };
       await logManualVerification(merged);
       await resolvePendingFlags(school.id);
+      markUpcomingVerified([school.id], update);
 
       setResult((prev) => {
         if (!prev) return prev;
@@ -1205,6 +1220,7 @@ export default function DataQualityPage() {
       const merged = { ...before, ...update };
       await logManualVerification(merged);
       await resolvePendingFlags(before.id);
+      markUpcomingVerified([before.id], update);
 
       // Reflect the fix locally without a full re-scan: drop the row from
       // the queue if it's no longer actionable, otherwise re-classify it.
@@ -1248,6 +1264,7 @@ export default function DataQualityPage() {
       const { error: schoolError } = await supabase.from("schools").update(schoolUpdate).eq("id", flag.school_id);
       if (schoolError) throw schoolError;
       await logManualVerification({ ...flag.schools, id: flag.school_id, ...schoolUpdate });
+      markUpcomingVerified([flag.school_id], schoolUpdate);
       setFlaggedQueue((prev) => prev.filter((f) => f.id !== flag.id));
       setNeedsRecheck((prev) => prev.filter((s) => s.id !== flag.school_id));
     } catch (err) {
@@ -1572,11 +1589,23 @@ export default function DataQualityPage() {
           <div className="empty-state">No schools are currently eligible for the nightly sweep — see the coverage numbers above.</div>
         ) : (
           <>
-            {upcomingQueue.slice(0, DISPLAY_CAP).map((r) => (
-              <div className="log-item" key={r.school_id} style={{ paddingBottom: 10 }}>
+            {upcomingQueue.slice(0, DISPLAY_CAP).map((r) => {
+              // "Already handled" means a human verification is on record
+              // more recently than this row's last_checked_at snapshot --
+              // covers both a check made just now (see markUpcomingVerified)
+              // and one already on file from before this list loaded.
+              const alreadyChecked =
+                r.school?.last_verified_at && (!r.last_checked_at || new Date(r.school.last_verified_at) > new Date(r.last_checked_at));
+              return (
+              <div className="log-item" key={r.school_id} style={{ paddingBottom: 10, opacity: alreadyChecked ? 0.7 : 1 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
                   <div>
                     <strong>{r.school?.name || `School #${r.school_id}`}</strong> — {r.school?.city}, {r.school?.state}
+                    {alreadyChecked && (
+                      <span className="badge" style={{ marginLeft: 8, color: "#1a7f37", background: "#e6f4ea" }}>
+                        ✓ You checked this{r.school.last_verified_at ? ` — ${new Date(r.school.last_verified_at).toLocaleDateString()}` : ""}
+                      </span>
+                    )}
                     <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
                       {[r.hc_first_name, r.hc_last_name].filter(Boolean).join(" ") || "no coach on file"}
                       {r.website ? (
@@ -1597,7 +1626,8 @@ export default function DataQualityPage() {
                   </div>
                 </div>
               </div>
-            ))}
+              );
+            })}
             {upcomingQueue.length > DISPLAY_CAP && (
               <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
                 Showing the first {DISPLAY_CAP} of {upcomingQueue.length.toLocaleString()} — download the CSV for the full batch.
