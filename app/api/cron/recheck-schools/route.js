@@ -7,9 +7,10 @@ export const maxDuration = 60;
 // Nightly automated sweep -- Coach-Change Radar. Picks the schools that have
 // gone longest without a recheck (or have never been checked, via the
 // school_recheck_priority view) and runs the same "does the on-file head
-// coach's name still appear on their website -- or, failing that, their
-// MaxPreps roster page" check the manual "Check for updates" button runs,
-// just at scale across the database. Invoked by Vercel Cron (see
+// coach's name still appear on their athletics site, their general
+// website, or -- failing both -- their MaxPreps roster page" check the
+// manual "Check for updates" button runs, just at scale across the
+// database. Invoked by Vercel Cron (see
 // vercel.json) once a night; Vercel automatically attaches
 // `Authorization: Bearer <CRON_SECRET>` using the CRON_SECRET environment
 // variable, and this route rejects anything that doesn't match.
@@ -60,7 +61,7 @@ export async function GET(req) {
 
   const { data: candidates, error: candErr } = await supabase
     .from("school_recheck_priority")
-    .select("school_id, website, hc_first_name, hc_last_name, maxpreps_url")
+    .select("school_id, website, hc_first_name, hc_last_name, maxpreps_url, athletics_url")
     .order("last_checked_at", { ascending: true, nullsFirst: true })
     .limit(BATCH_SIZE);
 
@@ -85,6 +86,7 @@ export async function GET(req) {
         website: c.website,
         hc_last_name: c.hc_last_name,
         maxpreps_url: c.maxpreps_url,
+        athletics_url: c.athletics_url,
       });
       summary[result] = (summary[result] || 0) + 1;
       processed++;
@@ -118,10 +120,13 @@ export async function GET(req) {
             .maybeSingle();
 
           if (!existingFlag) {
+            const sourcesChecked = [c.athletics_url ? "athletics site" : null, c.website ? "school website" : null, c.maxpreps_url ? "MaxPreps" : null]
+              .filter(Boolean)
+              .join(", ");
             await supabase.from("school_flags").insert({
               school_id: c.school_id,
               flagged_by: SYSTEM_USER_ID,
-              reason: `Automated nightly recheck: "${c.hc_last_name}" was not found on ${c.website}${c.maxpreps_url ? " or the MaxPreps roster page on file" : ""} on ${MISS_THRESHOLD} checks in a row. May be outdated -- please verify.`,
+              reason: `Automated nightly recheck: "${c.hc_last_name}" was not found on the ${sourcesChecked} on ${MISS_THRESHOLD} checks in a row. May be outdated -- please verify.`,
             });
             flagsOpened++;
           }
