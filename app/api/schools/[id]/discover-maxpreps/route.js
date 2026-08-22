@@ -65,7 +65,15 @@ export async function POST(req, { params }) {
       return NextResponse.json({ error: "School not found." }, { status: 404 });
     }
 
-    const q = `site:maxpreps.com "${school.name}" ${school.city || ""} ${school.state || ""} football roster`;
+    // Deliberately NOT an exact-phrase match on school.name (no quotes) --
+    // MaxPreps sometimes lists a school under a different name than what's
+    // on file here (e.g. a charter network's own branding vs. the
+    // school's legal/CSD name -- "Andre Agassi College Prep Academy" is
+    // listed on MaxPreps as "Democracy Prep Agassi Campus"). An exact
+    // phrase match would never find that page even though it's the right
+    // school; a plain keyword search lets Google/Serper's own relevance
+    // ranking surface it via the overlapping distinctive terms instead.
+    const q = `site:maxpreps.com ${school.name} ${school.city || ""} ${school.state || ""} football`;
 
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
