@@ -60,6 +60,7 @@ const EDIT_FIELDS = [
   ["hc_cell", "Cell"],
   ["hc_office", "Office"],
   ["maxpreps_url", "MaxPreps URL"],
+  ["athletics_url", "Athletics URL"],
 ];
 
 // A flag opened by the nightly Coach-Change Radar sweep always starts with
@@ -283,7 +284,7 @@ export default function DataQualityPage() {
     setLoadingFlags(true);
     const { data } = await supabase
       .from("school_flags")
-      .select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,maxpreps_url,website,verification_status,confidence_score), colleges:flagged_by_college_id(name)")
+      .select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,maxpreps_url,athletics_url,website,verification_status,confidence_score), colleges:flagged_by_college_id(name)")
       .eq("status", "pending")
       .order("created_at", { ascending: true });
     setFlaggedQueue(data || []);
@@ -372,7 +373,7 @@ export default function DataQualityPage() {
     const cutoff = new Date(Date.now() - RECHECK_CUTOFF_DAYS * 24 * 60 * 60 * 1000).toISOString();
     const { data } = await supabase
       .from("schools")
-      .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,maxpreps_url,website,verification_status,confidence_score,last_verified_at")
+      .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,maxpreps_url,athletics_url,website,verification_status,confidence_score,last_verified_at")
       .eq("verification_status", "verified")
       .lt("last_verified_at", cutoff)
       .order("last_verified_at", { ascending: true })
@@ -690,7 +691,7 @@ export default function DataQualityPage() {
     for (;;) {
       const { data, error } = await supabase
         .from("schools")
-        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,lat,lon,verification_status,maxpreps_url,website,confidence_score")
+        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,lat,lon,verification_status,maxpreps_url,athletics_url,website,confidence_score")
         .order("id", { ascending: true })
         .range(from, from + PAGE_SIZE - 1);
       if (error) throw error;
@@ -711,7 +712,7 @@ export default function DataQualityPage() {
     try {
       const { data, error } = await supabase
         .from("schools")
-        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,maxpreps_url,website,verification_status,confidence_score")
+        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,maxpreps_url,athletics_url,website,verification_status,confidence_score")
         .ilike("name", `%${q}%`)
         .order("name")
         .limit(25);
@@ -1095,6 +1096,7 @@ export default function DataQualityPage() {
       hc_cell: school.hc_cell || "",
       hc_office: school.hc_office || "",
       maxpreps_url: school.maxpreps_url || "",
+      athletics_url: school.athletics_url || "",
     });
   }
 
@@ -1117,6 +1119,7 @@ export default function DataQualityPage() {
       hc_cell: "",
       hc_office: "",
       maxpreps_url: school.maxpreps_url || "",
+      athletics_url: school.athletics_url || "",
     });
   }
 
@@ -1128,7 +1131,7 @@ export default function DataQualityPage() {
     setSuggestions([]);
   }
 
-  // Asks Google's Programmable Search Engine (via our own API route, which
+  // Asks Serper.dev's Google-search proxy (via our own API route, which
   // holds the actual key) where this school's MaxPreps page lives, rather
   // than scraping MaxPreps directly -- see app/api/schools/[id]/discover-
   // maxpreps for why. Only ever returns candidates for a human to pick
