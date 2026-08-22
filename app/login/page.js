@@ -3,6 +3,7 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
+import { checkAuthRateLimit, rateLimitMessage } from "@/lib/authRateLimit";
 
 export default function LoginPage() {
   const supabase = getSupabaseBrowserClient();
@@ -25,6 +26,17 @@ export default function LoginPage() {
     e.preventDefault();
     setError("");
     setSubmitting(true);
+
+    // Basic abuse protection, checked before ever touching Supabase Auth --
+    // see lib/authRateLimit.js and app/api/auth/rate-limit/route.js. Fails
+    // open, so this can never lock out a real sign-in on its own.
+    const rl = await checkAuthRateLimit("login", email);
+    if (!rl.allowed) {
+      setSubmitting(false);
+      setError(rateLimitMessage(rl.retryAfterSeconds, "sign-in"));
+      return;
+    }
+
     const { error: signInError } = await supabase.auth.signInWithPassword({ email, password });
     if (signInError) {
       setSubmitting(false);
