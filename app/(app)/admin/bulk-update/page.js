@@ -21,6 +21,7 @@ const EDIT_FIELDS = [
   ["classification", "Classification"],
   ["phone", "Main phone"],
   ["website", "Website"],
+  ["maxpreps_url", "MaxPreps URL"],
   ["hc_first_name", "HC first name"],
   ["hc_last_name", "HC last name"],
   ["hc_email", "HC email"],
