@@ -58,6 +58,7 @@ export default function AdminPage() {
   const [claimError, setClaimError] = useState("");
 
   const canReview = profile?.role === "verifier" || profile?.role === "sysadmin";
+  const isOwner = profile?.role === "sysadmin";
 
   const loadCorrections = useCallback(async () => {
     if (!canReview) {
@@ -235,6 +236,11 @@ export default function AdminPage() {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
             <h3 style={{ margin: 0 }}>School Claims — Pending ({pendingClaims.length})</h3>
             <div>
+              {isOwner && (
+                <Link href="/admin/business" className="btn btn-sm btn-gold" style={{ marginRight: 8 }}>
+                  Business Dashboard
+                </Link>
+              )}
               <Link href="/admin/leads" className="btn btn-sm btn-primary" style={{ marginRight: 8 }}>
                 College Outreach
               </Link>
