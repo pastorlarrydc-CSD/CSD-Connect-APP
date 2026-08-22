@@ -133,6 +133,17 @@ export default function SchoolProfilePage() {
   const [discoverError, setDiscoverError] = useState("");
   const [suggestions, setSuggestions] = useState([]);
 
+  // Same standalone inline-edit pattern again -- Athletics URL is a
+  // dedicated athletics-department site (its own domain/subdomain, e.g. a
+  // rSchoolToday or SportsEngine site), separate from the school's general
+  // website. Coach-Change Radar checks this FIRST when it's on file (see
+  // lib/schoolRecheck.js) since an athletics site is far more likely to
+  // actually list the head football coach than a school's homepage is.
+  const [editingAthletics, setEditingAthletics] = useState(false);
+  const [athleticsDraft, setAthleticsDraft] = useState("");
+  const [athleticsSaving, setAthleticsSaving] = useState(false);
+  const [athleticsError, setAthleticsError] = useState("");
+
   // Staff-only direct edit of the head coach fields -- a lighter, on-page
   // version of the Quick Fix / Mark Coach Change tools on the Data Quality
   // Review page (app/(app)/admin/data-quality/page.js), for when staff are
@@ -510,6 +521,43 @@ export default function SchoolProfilePage() {
     }
   }
 
+  function startEditAthletics() {
+    setAthleticsDraft(school.athletics_url || "");
+    setAthleticsError("");
+    setEditingAthletics(true);
+  }
+
+  async function saveAthleticsDirect(e) {
+    e.preventDefault();
+    setAthleticsError("");
+    setAthleticsSaving(true);
+    try {
+      const newVal = athleticsDraft.trim() || null;
+      const oldVal = school.athletics_url || null;
+      const { error } = await supabase
+        .from("schools")
+        .update({ athletics_url: newVal, updated_at: new Date().toISOString() })
+        .eq("id", id);
+      if (error) throw error;
+      if (newVal !== oldVal && user?.id) {
+        await supabase.from("school_change_log").insert({
+          school_id: id,
+          field_name: "athletics_url",
+          old_value: oldVal,
+          new_value: newVal,
+          source: "Edited directly by verification staff",
+          changed_by: user.id,
+        });
+      }
+      setEditingAthletics(false);
+      load();
+    } catch (err) {
+      setAthleticsError(err.message || "Could not save this athletics site URL.");
+    } finally {
+      setAthleticsSaving(false);
+    }
+  }
+
   // Resolves every pending "possibly outdated" flag on this school, not
   // just the current viewer's own -- same behavior as resolvePendingFlags
   // on the Data Quality Review page. Called any time staff mark this
@@ -750,6 +798,11 @@ export default function SchoolProfilePage() {
                       {school.maxpreps_url ? "Edit MaxPreps URL" : "Add MaxPreps URL"}
                     </button>
                   )}
+                  {!editingAthletics && (
+                    <button className="btn btn-sm" onClick={startEditAthletics}>
+                      {school.athletics_url ? "Edit Athletics URL" : "Add Athletics URL"}
+                    </button>
+                  )}
                 </div>
               )}
             </div>
@@ -782,6 +835,17 @@ export default function SchoolProfilePage() {
                   (school.maxpreps_url ? (
                     <a href={withProtocol(school.maxpreps_url)} target="_blank" rel="noopener noreferrer">
                       {school.maxpreps_url}
+                    </a>
+                  ) : (
+                    "—"
+                  ))}
+              </div>
+              <div className="k">Athletics URL</div>
+              <div className="v">
+                {!editingAthletics &&
+                  (school.athletics_url ? (
+                    <a href={withProtocol(school.athletics_url)} target="_blank" rel="noopener noreferrer">
+                      {school.athletics_url}
                     </a>
                   ) : (
                     "—"
@@ -843,6 +907,27 @@ export default function SchoolProfilePage() {
                     {maxprepsSaving ? "Saving…" : "Save"}
                   </button>
                   <button type="button" className="btn btn-sm" onClick={() => setEditingMaxpreps(false)} disabled={maxprepsSaving}>
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            )}
+
+            {editingAthletics && (
+              <form onSubmit={saveAthleticsDirect} style={{ marginTop: 10, borderTop: "1px solid #eef0f3", paddingTop: 10 }}>
+                {athleticsError && <div className="notice danger" style={{ marginBottom: 10 }}>{athleticsError}</div>}
+                <div className="form-field">
+                  <label>Athletics URL</label>
+                  <input value={athleticsDraft} onChange={(e) => setAthleticsDraft(e.target.value)} placeholder="www.school.edu/athletics or a separate rSchoolToday/SportsEngine site" />
+                </div>
+                <p style={{ fontSize: 11.5, color: "#9aa5b1", marginTop: -4, marginBottom: 8 }}>
+                  Checked FIRST by Coach-Change Radar, ahead of the school website below -- athletics sites are much more likely to actually list the head coach by name.
+                </p>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button className="btn btn-sm btn-primary" disabled={athleticsSaving}>
+                    {athleticsSaving ? "Saving…" : "Save"}
+                  </button>
+                  <button type="button" className="btn btn-sm" onClick={() => setEditingAthletics(false)} disabled={athleticsSaving}>
                     Cancel
                   </button>
                 </div>
