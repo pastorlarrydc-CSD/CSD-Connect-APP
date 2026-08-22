@@ -2,6 +2,7 @@
 import { useState } from "react";
 import Link from "next/link";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
+import { checkAuthRateLimit, rateLimitMessage } from "@/lib/authRateLimit";
 
 export default function ForgotPasswordPage() {
   const supabase = getSupabaseBrowserClient();
@@ -15,6 +16,17 @@ export default function ForgotPasswordPage() {
     e.preventDefault();
     setError("");
     setSubmitting(true);
+
+    // Basic abuse protection -- see lib/authRateLimit.js. Checked before
+    // Supabase ever sends an email, and fails open so a hiccup here can
+    // never block a real password reset.
+    const rl = await checkAuthRateLimit("forgot_password", email);
+    if (!rl.allowed) {
+      setSubmitting(false);
+      setError(rateLimitMessage(rl.retryAfterSeconds, "password-reset"));
+      return;
+    }
+
     const { error: resetError } = await supabase.auth.resetPasswordForEmail(email.trim(), {
       redirectTo: `${window.location.origin}/reset-password`,
     });
