@@ -25,6 +25,18 @@ const RECHECK_BATCH_SIZE = 500;
 // which is 4:00 AM Central during Daylight Time and 3:00 AM Central during
 // Standard Time. Just used for the plain-English schedule line below.
 const RECHECK_SCHEDULE_LABEL = "every night at 4:00 AM Central (9:00 AM UTC — 3:00 AM Central once clocks fall back)";
+// Today's List -- see its derivation near the render below. Capped well
+// under a full scroll on purpose: the point is a daily list that's
+// actually finishable, not another long queue.
+const TODAYS_LIST_SIZE = 25;
+const TODAYS_LIST_FLAG_CAP = 15;
+// How far back the MaxPreps Opportunities report scans school_recheck_log
+// looking for each school's most recent result -- roughly a week's worth
+// of nightly runs at RECHECK_BATCH_SIZE. This is deliberately a "recent
+// activity" report, not an exhaustive one: the point is surfacing schools
+// the sweep JUST failed to confirm, not every school lacking a MaxPreps
+// URL (most of the database, per the coverage stats above).
+const MAXPREPS_OPP_LOG_SCAN = 4000;
 
 const FILTERS = [
   { key: "all", label: "All actionable issues" },
@@ -253,6 +265,16 @@ export default function DataQualityPage() {
   const [coverageStats, setCoverageStats] = useState(null);
   const [loadingCoverage, setLoadingCoverage] = useState(true);
 
+  // MaxPreps Opportunities -- schools whose most recent Coach-Change Radar
+  // check came back not_found/fetch_error (the primary website check is
+  // currently failing) and that have no MaxPreps URL on file to fall back
+  // to. These are exactly the schools where adding one would make the
+  // nightly sweep actually work again for them.
+  const [maxprepsOpportunities, setMaxprepsOpportunities] = useState([]);
+  const [loadingMaxprepsOpp, setLoadingMaxprepsOpp] = useState(true);
+  const [maxprepsOppExporting, setMaxprepsOppExporting] = useState(false);
+  const [maxprepsOppExportError, setMaxprepsOppExportError] = useState("");
+
   const loadFlags = useCallback(async () => {
     if (!canReview) {
       setLoadingFlags(false);
@@ -417,6 +439,57 @@ export default function DataQualityPage() {
     loadRecheckCoverage();
   }, [loadRecheckCoverage]);
 
+  const loadMaxprepsOpportunities = useCallback(async () => {
+    if (!canReview) {
+      setLoadingMaxprepsOpp(false);
+      return;
+    }
+    setLoadingMaxprepsOpp(true);
+    // No DISTINCT ON / window functions available through the client, so:
+    // pull the most recent log rows overall, then keep only the first
+    // (most recent) row seen per school -- that's each school's current
+    // status. checked_at descending guarantees "first seen" == "latest".
+    const { data: logRows } = await supabase
+      .from("school_recheck_log")
+      .select("school_id, result, checked_at")
+      .order("checked_at", { ascending: false })
+      .limit(MAXPREPS_OPP_LOG_SCAN);
+
+    const latestBySchool = new Map();
+    (logRows || []).forEach((row) => {
+      if (!latestBySchool.has(row.school_id)) latestBySchool.set(row.school_id, row);
+    });
+    const badIds = Array.from(latestBySchool.values())
+      .filter((row) => row.result === "not_found" || row.result === "fetch_error")
+      .map((row) => row.school_id);
+
+    if (!badIds.length) {
+      setMaxprepsOpportunities([]);
+      setLoadingMaxprepsOpp(false);
+      return;
+    }
+
+    const { data: schoolRows } = await supabase
+      .from("schools")
+      .select("id,name,city,state,website,maxpreps_url,hc_first_name,hc_last_name")
+      .in("id", badIds);
+
+    const opportunities = (schoolRows || [])
+      .filter((s) => !s.maxpreps_url || !s.maxpreps_url.trim())
+      .map((s) => {
+        const latest = latestBySchool.get(s.id);
+        return { ...s, lastResult: latest?.result, lastCheckedAt: latest?.checked_at };
+      })
+      .sort((a, b) => new Date(b.lastCheckedAt) - new Date(a.lastCheckedAt));
+
+    setMaxprepsOpportunities(opportunities);
+    setLoadingMaxprepsOpp(false);
+  }, [supabase, canReview]);
+
+  useEffect(() => {
+    loadMaxprepsOpportunities();
+  }, [loadMaxprepsOpportunities]);
+
   function daysSince(dateStr) {
     return Math.floor((Date.now() - new Date(dateStr).getTime()) / (24 * 60 * 60 * 1000));
   }
@@ -475,6 +548,32 @@ export default function DataQualityPage() {
       setUpcomingExportError(err.message || "Could not export this list.");
     } finally {
       setUpcomingExporting(false);
+    }
+  }
+
+  function exportMaxprepsOpportunities() {
+    setMaxprepsOppExportError("");
+    setMaxprepsOppExporting(true);
+    try {
+      const csv = Papa.unparse({
+        fields: ["school_id", "school_name", "city", "state", "website", "hc_first_name", "hc_last_name", "last_result", "last_checked_at"],
+        data: maxprepsOpportunities.map((s) => [
+          s.id,
+          s.name || "",
+          s.city || "",
+          s.state || "",
+          s.website || "",
+          s.hc_first_name || "",
+          s.hc_last_name || "",
+          s.lastResult || "",
+          s.lastCheckedAt ? new Date(s.lastCheckedAt).toISOString() : "",
+        ]),
+      });
+      downloadBlob(csv, `maxpreps_opportunities_${new Date().toISOString().slice(0, 10)}.csv`);
+    } catch (err) {
+      setMaxprepsOppExportError(err.message || "Could not export this list.");
+    } finally {
+      setMaxprepsOppExporting(false);
     }
   }
 
@@ -1299,6 +1398,18 @@ export default function DataQualityPage() {
   const radarFilteredRows = radarFilter === "all" ? radarRows : radarRows.filter((r) => r.result === radarFilter);
   const cycleDays = coverageStats?.eligible ? Math.ceil(coverageStats.eligible / RECHECK_BATCH_SIZE) : null;
 
+  // Today's List -- a short, finishable daily task list instead of an
+  // open-ended scroll through hundreds of rows. Flags come first (someone
+  // already reported or the sweep already detected a possible problem, so
+  // they're the most urgent), then the oldest overdue re-checks fill any
+  // remaining slots up to TODAYS_LIST_SIZE. Both queues are already
+  // sorted oldest-first, and both are live state -- completing an item
+  // here (Confirm Accurate / Mark Verified) removes it from its source
+  // list, which removes it from here too, no separate bookkeeping needed.
+  const todaysFlags = flaggedQueue.slice(0, TODAYS_LIST_FLAG_CAP);
+  const todaysRecheck = needsRecheck.slice(0, Math.max(0, TODAYS_LIST_SIZE - todaysFlags.length));
+  const todaysListTotal = todaysFlags.length + todaysRecheck.length;
+
   return (
     <div className="view">
       <Link href="/admin" className="btn btn-sm" style={{ marginBottom: 12, display: "inline-flex" }}>
@@ -1312,6 +1423,73 @@ export default function DataQualityPage() {
         <button className="btn btn-gold" onClick={runScan} disabled={scanning}>
           {scanning ? "Scanning…" : result ? "Re-scan Database" : "Scan Database"}
         </button>
+      </div>
+
+      <div className="card" style={{ marginBottom: 14 }}>
+        <h3 style={{ marginBottom: 4 }}>Today&apos;s List ({todaysListTotal})</h3>
+        <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
+          A short, finishable list instead of a long scroll — flagged/possibly-outdated schools first (up to {TODAYS_LIST_FLAG_CAP}), then whatever&apos;s most overdue for a re-check fills the rest, up to {TODAYS_LIST_SIZE} total. Clear one and it drops off the list.
+        </p>
+        {flagActionError && <div className="notice danger" style={{ marginBottom: 10 }}>{flagActionError}</div>}
+        {markVerifiedError && <div className="notice danger" style={{ marginBottom: 10 }}>{markVerifiedError}</div>}
+        {loadingFlags || loadingNeedsRecheck ? (
+          <div className="empty-state">Loading…</div>
+        ) : todaysListTotal === 0 ? (
+          <div className="empty-state">Nothing urgent right now — no flags pending, and nothing overdue for a re-check.</div>
+        ) : (
+          <>
+            {todaysFlags.map((flag) => {
+              const s = flag.schools;
+              const isAutomated = (flag.reason || "").startsWith(AUTOMATED_FLAG_PREFIX);
+              return (
+                <div className="log-item" key={`flag-${flag.id}`} style={{ paddingBottom: 10 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+                    <div>
+                      <strong>{s?.name || `School #${flag.school_id}`}</strong> — {s?.city}, {s?.state}
+                      <span
+                        className={isAutomated ? "badge badge-unverified" : "badge"}
+                        style={isAutomated ? { marginLeft: 8 } : { marginLeft: 8, background: "#e8ebf0", color: "#42506b" }}
+                      >
+                        {isAutomated ? "Automated flag" : "Coach-reported flag"}
+                      </span>
+                      <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
+                        {flag.reason ? `"${flag.reason}"` : "No reason given."}
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                      <Link href={`/schools/${flag.school_id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
+                      <button className="btn btn-sm" disabled={flagActionId === flag.id} onClick={() => confirmAccurate(flag)}>
+                        {flagActionId === flag.id ? "Saving…" : "Confirm accurate"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+            {todaysRecheck.map((s) => {
+              const days = daysSince(s.last_verified_at);
+              return (
+                <div className="log-item" key={`recheck-${s.id}`} style={{ paddingBottom: 10 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+                    <div>
+                      <strong>{s.name}</strong> — {s.city}, {s.state}
+                      <span className="badge badge-unverified" style={{ marginLeft: 8 }}>{days}d since verified</span>
+                      <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
+                        {[s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ") || "no coach name"}
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                      <Link href={`/schools/${s.id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
+                      <button className="btn btn-sm" disabled={markingVerifiedId === s.id} onClick={() => markVerified(s)}>
+                        {markingVerifiedId === s.id ? "Marking…" : "Mark Verified"}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </>
+        )}
       </div>
 
       <div className="card" style={{ marginBottom: 14 }}>
@@ -1634,6 +1812,59 @@ export default function DataQualityPage() {
               </div>
             )}
           </>
+        )}
+      </div>
+
+      <div className="card" style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+          <div>
+            <h3 style={{ marginBottom: 4 }}>MaxPreps Opportunities ({maxprepsOpportunities.length})</h3>
+            <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 0 }}>
+              Schools whose most recent automated check came back &quot;Not found&quot; or &quot;Could not load&quot; on their own website, and don&apos;t have a MaxPreps URL on file to fall back to. Add one here and the nightly sweep gets a real second chance to confirm the coach for these.
+            </p>
+          </div>
+          <button className="btn btn-sm" onClick={exportMaxprepsOpportunities} disabled={maxprepsOppExporting || maxprepsOpportunities.length === 0}>
+            {maxprepsOppExporting ? "Exporting…" : "Download CSV"}
+          </button>
+        </div>
+        {maxprepsOppExportError && <div className="notice danger" style={{ marginTop: 10 }}>{maxprepsOppExportError}</div>}
+        {loadingMaxprepsOpp ? (
+          <div className="empty-state" style={{ marginTop: 10 }}>Loading…</div>
+        ) : maxprepsOpportunities.length === 0 ? (
+          <div className="empty-state" style={{ marginTop: 10 }}>Nothing here right now — either recent checks are all coming back confirmed, or the affected schools already have a MaxPreps URL on file.</div>
+        ) : (
+          <div style={{ marginTop: 10 }}>
+            {maxprepsOpportunities.slice(0, DISPLAY_CAP).map((s) => {
+              const meta = RADAR_RESULT_META[s.lastResult] || { label: s.lastResult, color: "#42506b", bg: "#e8ebf0" };
+              return (
+                <div className="log-item" key={s.id} style={{ paddingBottom: 10 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+                    <div>
+                      <strong>{s.name}</strong> — {s.city}, {s.state}
+                      <span style={{ marginLeft: 8, fontSize: 11, fontWeight: 600, padding: "2px 8px", borderRadius: 999, color: meta.color, background: meta.bg }}>
+                        {meta.label}
+                      </span>
+                      <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
+                        {[s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ") || "no coach on file"}
+                        {s.website ? ` · ${s.website}` : " · no website on file"}
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                      <Link href={`/schools/${s.id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Add MaxPreps URL</Link>
+                      <span style={{ fontSize: 11, color: "#9aa2b1", whiteSpace: "nowrap" }}>
+                        {s.lastCheckedAt ? `Checked ${new Date(s.lastCheckedAt).toLocaleDateString()}` : ""}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+            {maxprepsOpportunities.length > DISPLAY_CAP && (
+              <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
+                Showing the first {DISPLAY_CAP} of {maxprepsOpportunities.length.toLocaleString()} — download the CSV for the full list.
+              </div>
+            )}
+          </div>
         )}
       </div>
 
