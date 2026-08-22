@@ -429,6 +429,33 @@ export default function SchoolProfilePage() {
   // on the Data Quality Review page. Called any time staff mark this
   // record verified, whether via Quick Fix, Mark Coach Change, or plain
   // Mark Verified, since all three are a human confirming the record.
+  // The nightly Coach-Change Radar sweep (app/api/cron/recheck-schools)
+  // picks its batch from school_recheck_log, not from
+  // verification_status/last_verified_at -- so without this, a school just
+  // verified by hand here would still show up in tonight's automated
+  // batch. Logging a row here moves it to the back of that queue exactly
+  // like a real website check would. result is constrained to the same
+  // five values the automated checks use (see school_recheck_log's CHECK
+  // constraint) -- "confirmed" is the closest fit; the [Manual
+  // verification] detail prefix is what tells this apart from an
+  // automated check. Best-effort: this is scheduling bookkeeping, not the
+  // verification itself, so a failure here shouldn't block the action
+  // that's actually marking the school verified.
+  async function logManualVerification(merged) {
+    try {
+      await supabase.from("school_recheck_log").insert({
+        school_id: id,
+        checked_by: user.id,
+        website_checked: merged.website || null,
+        coach_name_checked: [merged.hc_first_name, merged.hc_last_name].filter(Boolean).join(" ") || null,
+        result: "confirmed",
+        detail: "[Manual verification] Marked verified by a staff member — not an automated website check.",
+      });
+    } catch (err) {
+      console.error("Could not log manual verification", err);
+    }
+  }
+
   async function resolveAllPendingFlags() {
     await supabase
       .from("school_flags")
@@ -498,6 +525,7 @@ export default function SchoolProfilePage() {
         const { error: logError } = await supabase.from("school_change_log").insert(changes);
         if (logError) throw logError;
       }
+      await logManualVerification({ ...school, ...update });
       await resolveAllPendingFlags();
       setStaffEditing(false);
       setStaffCoachChangeFrom(null);
@@ -513,11 +541,10 @@ export default function SchoolProfilePage() {
     setMarkingVerified(true);
     setMarkVerifiedError("");
     try {
-      const { error } = await supabase
-        .from("schools")
-        .update({ verification_status: "verified", last_verified_at: new Date().toISOString() })
-        .eq("id", id);
+      const update = { verification_status: "verified", last_verified_at: new Date().toISOString() };
+      const { error } = await supabase.from("schools").update(update).eq("id", id);
       if (error) throw error;
+      await logManualVerification({ ...school, ...update });
       await resolveAllPendingFlags();
       load();
     } catch (err) {
