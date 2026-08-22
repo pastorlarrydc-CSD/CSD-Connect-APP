@@ -59,6 +59,9 @@ export default function LandingPage() {
           <small>Collegiate Sports Data · Recruiting Intelligence</small>
         </div>
         <div style={{ display: "flex", gap: 10 }}>
+          <Link href="/submit-prospect" className="btn btn-sm" style={{ background: "transparent", color: "#fff", borderColor: "#ffffff40" }}>
+            HS Coach? Submit a Prospect
+          </Link>
           <Link href="/login" className="btn btn-sm" style={{ background: "transparent", color: "#fff", borderColor: "#ffffff40" }}>
             Sign In
           </Link>
@@ -121,6 +124,11 @@ export default function LandingPage() {
         <Link href="/signup" className="btn btn-gold" style={{ padding: "12px 26px", fontSize: 14.5 }}>
           Create Your Free Account
         </Link>
+      </div>
+
+      <div style={{ textAlign: "center", padding: "0 24px 40px", fontSize: 13, color: "var(--gray-500)" }}>
+        High school coach, AD, or parent? You can{" "}
+        <Link href="/submit-prospect" style={{ fontWeight: 700 }}>submit a prospect</Link> without creating an account.
       </div>
 
       <div className="footer-note">
