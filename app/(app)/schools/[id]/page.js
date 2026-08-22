@@ -143,6 +143,14 @@ export default function SchoolProfilePage() {
   const [athleticsDraft, setAthleticsDraft] = useState("");
   const [athleticsSaving, setAthleticsSaving] = useState(false);
   const [athleticsError, setAthleticsError] = useState("");
+  // "Find athletics page" -- same Serper-backed lookup as "Find MaxPreps
+  // page" above, just not restricted to a single domain (see
+  // app/api/schools/[id]/discover-athletics). Separate state from the
+  // MaxPreps discovery above so the two "Find..." buttons don't clobber
+  // each other's results if both sections happen to be open.
+  const [discoveringAthletics, setDiscoveringAthletics] = useState(false);
+  const [discoverAthleticsError, setDiscoverAthleticsError] = useState("");
+  const [athleticsSuggestions, setAthleticsSuggestions] = useState([]);
 
   // Staff-only direct edit of the head coach fields -- a lighter, on-page
   // version of the Quick Fix / Mark Coach Change tools on the Data Quality
@@ -524,7 +532,40 @@ export default function SchoolProfilePage() {
   function startEditAthletics() {
     setAthleticsDraft(school.athletics_url || "");
     setAthleticsError("");
+    setDiscoverAthleticsError("");
+    setAthleticsSuggestions([]);
     setEditingAthletics(true);
+  }
+
+  // Only ever returns candidate links for a human to review and pick from
+  // -- never writes athletics_url on its own (see the API route's own
+  // comment for why).
+  async function discoverAthletics() {
+    setDiscoveringAthletics(true);
+    setDiscoverAthleticsError("");
+    setAthleticsSuggestions([]);
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const res = await fetch(`/api/schools/${id}/discover-athletics`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session?.access_token}` },
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || "Could not search for an athletics site.");
+      setAthleticsSuggestions(json.candidates || []);
+      if (!json.candidates?.length) setDiscoverAthleticsError("No athletics site turned up for this school. Try searching directly and paste the link in.");
+    } catch (err) {
+      setDiscoverAthleticsError(err.message || "Could not search for an athletics site.");
+    } finally {
+      setDiscoveringAthletics(false);
+    }
+  }
+
+  function pickAthleticsSuggestion(link) {
+    setAthleticsDraft(link);
+    setAthleticsSuggestions([]);
   }
 
   async function saveAthleticsDirect(e) {
@@ -923,6 +964,27 @@ export default function SchoolProfilePage() {
                 <p style={{ fontSize: 11.5, color: "#9aa5b1", marginTop: -4, marginBottom: 8 }}>
                   Checked FIRST by Coach-Change Radar, ahead of the school website below -- athletics sites are much more likely to actually list the head coach by name.
                 </p>
+                <div style={{ marginBottom: 8 }}>
+                  <button type="button" className="btn btn-sm" disabled={discoveringAthletics} onClick={discoverAthletics}>
+                    {discoveringAthletics ? "Searching…" : "Find athletics page"}
+                  </button>
+                  {discoverAthleticsError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverAthleticsError}</div>}
+                  {athleticsSuggestions.length > 0 && (
+                    <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                      {athleticsSuggestions.map((sugg) => (
+                        <button
+                          type="button"
+                          key={sugg.link}
+                          className="btn btn-sm"
+                          style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
+                          onClick={() => pickAthleticsSuggestion(sugg.link)}
+                        >
+                          {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
                 <div style={{ display: "flex", gap: 8 }}>
                   <button className="btn btn-sm btn-primary" disabled={athleticsSaving}>
                     {athleticsSaving ? "Saving…" : "Save"}
