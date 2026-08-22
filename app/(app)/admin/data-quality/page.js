@@ -17,6 +17,14 @@ const RECHECK_LIMIT = 2000;
 // decay happens quietly in the background.
 const RECHECK_CUTOFF_DAYS = 180;
 const RECHECK_STALE_DAYS = 365;
+// Matches BATCH_SIZE in app/api/cron/recheck-schools -- the nightly sweep
+// only ever pulls this many schools per run, oldest-checked first, so this
+// preview shows exactly the batch that will run tonight, in the same order.
+const RECHECK_BATCH_SIZE = 500;
+// The nightly cron fires at "0 9 * * *" (see vercel.json) -- 9:00 AM UTC,
+// which is 4:00 AM Central during Daylight Time and 3:00 AM Central during
+// Standard Time. Just used for the plain-English schedule line below.
+const RECHECK_SCHEDULE_LABEL = "every night at 4:00 AM Central (9:00 AM UTC — 3:00 AM Central once clocks fall back)";
 
 const FILTERS = [
   { key: "all", label: "All actionable issues" },
@@ -88,6 +96,14 @@ function fmtPhone(v) {
   if (!v) return "";
   const digits = String(v).replace(/\D/g, "");
   return digits.length === 10 ? `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}` : v;
+}
+
+// Same helper used on the school profile page (app/(app)/schools/[id]/page.js)
+// -- lets a plain "example.com" saved without a scheme still open as a link.
+function withProtocol(v) {
+  const trimmed = (v || "").trim();
+  if (!trimmed) return null;
+  return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
 
 // Same bands as the confidence-score readout on a school's profile page
@@ -221,6 +237,22 @@ export default function DataQualityPage() {
   const [bulkVerifyApplyError, setBulkVerifyApplyError] = useState("");
   const [bulkVerifyApplyResult, setBulkVerifyApplyResult] = useState(null); // {count}
 
+  // Upcoming Recheck Queue -- a preview of tonight's Coach-Change Radar
+  // batch, pulled straight from the same school_recheck_priority view and
+  // ordering the cron job itself uses, so this is exactly who gets checked
+  // next. Lets Larry get ahead of it: fix a stale website URL before the
+  // sweep runs against it, rather than only reacting after a miss.
+  const [upcomingQueue, setUpcomingQueue] = useState([]);
+  const [loadingUpcoming, setLoadingUpcoming] = useState(true);
+  const [upcomingExporting, setUpcomingExporting] = useState(false);
+  const [upcomingExportError, setUpcomingExportError] = useState("");
+  // Coverage stats for that same eligibility rule (needs a coach last name
+  // on file, plus a website or MaxPreps URL to actually check) -- shown
+  // alongside the queue so it's obvious at a glance how much of the
+  // database the sweep can even reach right now.
+  const [coverageStats, setCoverageStats] = useState(null);
+  const [loadingCoverage, setLoadingCoverage] = useState(true);
+
   const loadFlags = useCallback(async () => {
     if (!canReview) {
       setLoadingFlags(false);
@@ -331,6 +363,60 @@ export default function DataQualityPage() {
     loadNeedsRecheck();
   }, [loadNeedsRecheck]);
 
+  const loadUpcomingQueue = useCallback(async () => {
+    if (!canReview) {
+      setLoadingUpcoming(false);
+      return;
+    }
+    setLoadingUpcoming(true);
+    // school_recheck_priority is the exact same view + ordering
+    // app/api/cron/recheck-schools reads from -- this is tonight's batch,
+    // not an approximation of it.
+    const { data: priority } = await supabase
+      .from("school_recheck_priority")
+      .select("school_id, website, hc_first_name, hc_last_name, maxpreps_url, last_checked_at")
+      .order("last_checked_at", { ascending: true, nullsFirst: true })
+      .limit(RECHECK_BATCH_SIZE);
+
+    const ids = (priority || []).map((r) => r.school_id);
+    let schoolById = new Map();
+    if (ids.length) {
+      const { data: schoolRows } = await supabase.from("schools").select("id,name,city,state").in("id", ids);
+      (schoolRows || []).forEach((s) => schoolById.set(s.id, s));
+    }
+    setUpcomingQueue((priority || []).map((r) => ({ ...r, school: schoolById.get(r.school_id) })));
+    setLoadingUpcoming(false);
+  }, [supabase, canReview]);
+
+  useEffect(() => {
+    loadUpcomingQueue();
+  }, [loadUpcomingQueue]);
+
+  const loadRecheckCoverage = useCallback(async () => {
+    if (!canReview) {
+      setLoadingCoverage(false);
+      return;
+    }
+    setLoadingCoverage(true);
+    const [totalRes, eligibleRes, websiteRes, maxprepsRes] = await Promise.all([
+      supabase.from("schools").select("id", { count: "exact", head: true }),
+      supabase.from("school_recheck_priority").select("school_id", { count: "exact", head: true }),
+      supabase.from("schools").select("id", { count: "exact", head: true }).not("website", "is", null).neq("website", ""),
+      supabase.from("schools").select("id", { count: "exact", head: true }).not("maxpreps_url", "is", null).neq("maxpreps_url", ""),
+    ]);
+    setCoverageStats({
+      total: totalRes.count || 0,
+      eligible: eligibleRes.count || 0,
+      withWebsite: websiteRes.count || 0,
+      withMaxpreps: maxprepsRes.count || 0,
+    });
+    setLoadingCoverage(false);
+  }, [supabase, canReview]);
+
+  useEffect(() => {
+    loadRecheckCoverage();
+  }, [loadRecheckCoverage]);
+
   function daysSince(dateStr) {
     return Math.floor((Date.now() - new Date(dateStr).getTime()) / (24 * 60 * 60 * 1000));
   }
@@ -361,6 +447,34 @@ export default function DataQualityPage() {
       setRecheckExportError(err.message || "Could not export this list.");
     } finally {
       setRecheckExporting(false);
+    }
+  }
+
+  // Exports the full upcoming-batch preview (not capped to what's on
+  // screen) -- one row per school in tonight's Coach-Change Radar run.
+  function exportUpcomingQueue() {
+    setUpcomingExportError("");
+    setUpcomingExporting(true);
+    try {
+      const csv = Papa.unparse({
+        fields: ["school_id", "school_name", "city", "state", "website", "maxpreps_url", "hc_first_name", "hc_last_name", "last_checked_at"],
+        data: upcomingQueue.map((r) => [
+          r.school_id,
+          r.school?.name || "",
+          r.school?.city || "",
+          r.school?.state || "",
+          r.website || "",
+          r.maxpreps_url || "",
+          r.hc_first_name || "",
+          r.hc_last_name || "",
+          r.last_checked_at ? new Date(r.last_checked_at).toISOString() : "never checked",
+        ]),
+      });
+      downloadBlob(csv, `upcoming_recheck_queue_${new Date().toISOString().slice(0, 10)}.csv`);
+    } catch (err) {
+      setUpcomingExportError(err.message || "Could not export this list.");
+    } finally {
+      setUpcomingExporting(false);
     }
   }
 
@@ -1106,6 +1220,7 @@ export default function DataQualityPage() {
   const automatedPendingCount = flaggedQueue.filter((f) => (f.reason || "").startsWith(AUTOMATED_FLAG_PREFIX)).length;
   const confirmedTotal = (radarStats?.counts.confirmed || 0) + (radarStats?.counts.confirmed_maxpreps || 0);
   const radarFilteredRows = radarFilter === "all" ? radarRows : radarRows.filter((r) => r.result === radarFilter);
+  const cycleDays = coverageStats?.eligible ? Math.ceil(coverageStats.eligible / RECHECK_BATCH_SIZE) : null;
 
   return (
     <div className="view">
@@ -1335,6 +1450,99 @@ export default function DataQualityPage() {
                 </>
               )}
             </div>
+          </>
+        )}
+      </div>
+
+      <div className="card" style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+          <div>
+            <h3 style={{ marginBottom: 4 }}>Upcoming Recheck Queue</h3>
+            <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 0 }}>
+              Coach-Change Radar runs automatically {RECHECK_SCHEDULE_LABEL}, checking up to {RECHECK_BATCH_SIZE.toLocaleString()} schools per run — whichever have gone longest without a check. This is that exact batch, in that exact order, so you can review or fix a website below before the sweep gets to it tonight.
+            </p>
+          </div>
+          <button className="btn btn-sm" onClick={exportUpcomingQueue} disabled={upcomingExporting || upcomingQueue.length === 0}>
+            {upcomingExporting ? "Exporting…" : "Download CSV"}
+          </button>
+        </div>
+        {upcomingExportError && <div className="notice danger" style={{ marginTop: 10 }}>{upcomingExportError}</div>}
+
+        {loadingCoverage ? (
+          <div className="empty-state" style={{ marginTop: 10 }}>Loading…</div>
+        ) : coverageStats ? (
+          <div className="grid grid-4" style={{ marginTop: 10, marginBottom: 12 }}>
+            <div className="card stat-card">
+              <div className="label">Total Schools</div>
+              <div className="num">{coverageStats.total.toLocaleString()}</div>
+            </div>
+            <div className="card stat-card">
+              <div className="label">Eligible For Nightly Check</div>
+              <div className="num">{coverageStats.eligible.toLocaleString()}</div>
+              <div className="sub">has a coach name + a website or MaxPreps URL</div>
+            </div>
+            <div className="card stat-card">
+              <div className="label">Website On File</div>
+              <div className="num">{coverageStats.withWebsite.toLocaleString()}</div>
+              <div className="sub">{coverageStats.total ? `${Math.round((coverageStats.withWebsite / coverageStats.total) * 100)}% of all schools` : ""}</div>
+            </div>
+            <div className="card stat-card">
+              <div className="label">MaxPreps URL On File</div>
+              <div className="num">{coverageStats.withMaxpreps.toLocaleString()}</div>
+              <div className="sub">
+                {coverageStats.total
+                  ? coverageStats.withMaxpreps === 0
+                    ? "none yet — the MaxPreps fallback check never fires"
+                    : `${Math.round((coverageStats.withMaxpreps / coverageStats.total) * 100)}% of all schools`
+                  : ""}
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {cycleDays && (
+          <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4, marginBottom: 10 }}>
+            At {RECHECK_BATCH_SIZE.toLocaleString()} schools a night, a full pass through all {coverageStats.eligible.toLocaleString()} eligible schools takes about {cycleDays} night{cycleDays === 1 ? "" : "s"}.
+          </p>
+        )}
+
+        {loadingUpcoming ? (
+          <div className="empty-state">Loading…</div>
+        ) : upcomingQueue.length === 0 ? (
+          <div className="empty-state">No schools are currently eligible for the nightly sweep — see the coverage numbers above.</div>
+        ) : (
+          <>
+            {upcomingQueue.slice(0, DISPLAY_CAP).map((r) => (
+              <div className="log-item" key={r.school_id} style={{ paddingBottom: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+                  <div>
+                    <strong>{r.school?.name || `School #${r.school_id}`}</strong> — {r.school?.city}, {r.school?.state}
+                    <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
+                      {[r.hc_first_name, r.hc_last_name].filter(Boolean).join(" ") || "no coach on file"}
+                      {r.website ? (
+                        <>
+                          {" · "}
+                          <a href={withProtocol(r.website)} target="_blank" rel="noreferrer">{r.website}</a>
+                        </>
+                      ) : (
+                        " · no website on file"
+                      )}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                    <Link href={`/schools/${r.school_id}`} className="btn btn-sm">Open Profile</Link>
+                    <span style={{ fontSize: 11, color: "#9aa2b1", whiteSpace: "nowrap" }}>
+                      {r.last_checked_at ? `Last checked ${new Date(r.last_checked_at).toLocaleDateString()}` : "Never checked"}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            ))}
+            {upcomingQueue.length > DISPLAY_CAP && (
+              <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
+                Showing the first {DISPLAY_CAP} of {upcomingQueue.length.toLocaleString()} — download the CSV for the full batch.
+              </div>
+            )}
           </>
         )}
       </div>
