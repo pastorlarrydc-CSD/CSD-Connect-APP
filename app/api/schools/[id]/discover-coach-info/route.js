@@ -165,7 +165,7 @@ export async function POST(req, { params }) {
     }
 
     const textBlocks = usableBlocks
-      .map((b) => `--- Text from the ${b.label} (${b.url}) ---\n${b.text.slice(0, MAX_CHARS_PER_SOURCE)}`)
+      .map((b) => `--- Text from the ${b.label} (${b.url}) ---\n${b.result.text.slice(0, MAX_CHARS_PER_SOURCE)}`)
       .join("\n\n");
 
     const currentlyOnFile = [
