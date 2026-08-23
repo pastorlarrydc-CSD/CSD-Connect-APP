@@ -13,6 +13,7 @@ const NAV_LINKS = [
   { href: "/map", label: "Territory Map" },
   { href: "/crm", label: "Recruiting CRM" },
   { href: "/prospects", label: "Prospects" },
+  { href: "/events", label: "Events" },
   { href: "/trips", label: "Recruiting Trips" },
   { href: "/territories", label: "Territories" },
   { href: "/reports", label: "Reports" },
