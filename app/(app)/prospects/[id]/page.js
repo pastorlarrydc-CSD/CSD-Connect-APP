@@ -1,5 +1,5 @@
 "use client";
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
@@ -32,6 +32,26 @@ const TAG_OPTIONS = ["Priority", "Sleeper", "Needs Film", "Camp Invite", "Graysh
 // tagged and skimmed without forcing every note into a rigid structure.
 // See prospect_notes.note_category (checked against this same list in the DB).
 const NOTE_CATEGORIES = ["General", "Speed/Athleticism", "Technique", "Football IQ", "Effort/Competitiveness", "Concern", "Big Play"];
+
+// Camps/combines/showcases this athlete is tagged to -- mirrors the same
+// event_type vocabulary and badge styling as app/(app)/events/page.js and
+// app/(app)/events/[id]/page.js so an event reads the same everywhere.
+const EVENT_TYPE_LABEL = { camp: "Camp", combine: "Combine", showcase: "Showcase", tournament: "Tournament", other: "Other" };
+const EVENT_TYPE_BADGE = {
+  camp: "badge-unverified",
+  combine: "badge-contacted",
+  showcase: "badge-watching",
+  tournament: "badge-offered",
+  other: "badge-not-contacted",
+};
+
+function fmtEventDateRange(start, end) {
+  if (!start) return "";
+  const s = new Date(start + "T00:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  if (!end || end === start) return s;
+  const e = new Date(end + "T00:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  return `${s} – ${e}`;
+}
 
 export default function ProspectDetailPage() {
   const { id } = useParams();
@@ -113,8 +133,21 @@ export default function ProspectDetailPage() {
   const [noteSaving, setNoteSaving] = useState(false);
   const [scoutingError, setScoutingError] = useState("");
 
+  // Events this athlete is tagged to (camps/combines/showcases), plus a
+  // lightweight search-and-tag flow so a new event link can be added right
+  // from this page instead of only from the event's own detail page.
+  const [taggedEvents, setTaggedEvents] = useState([]);
+  const [loadingEvents, setLoadingEvents] = useState(true);
+  const [eventsError, setEventsError] = useState("");
+  const [removingEventId, setRemovingEventId] = useState(null);
+  const [eventQuery, setEventQuery] = useState("");
+  const [eventResults, setEventResults] = useState([]);
+  const [addingEventId, setAddingEventId] = useState(null);
+  const eventDebounceRef = useRef(null);
+
   const canManageIntake = profile?.role === "verifier" || profile?.role === "sysadmin" || prospect?.submitted_by === user?.id;
   const canSetRecruitingStatus = !!college?.id;
+  const canModerateEvents = profile?.role === "verifier" || profile?.role === "sysadmin";
 
   const load = useCallback(async () => {
     const { data } = await supabase
@@ -206,6 +239,73 @@ export default function ProspectDetailPage() {
   useEffect(() => {
     loadScouting();
   }, [loadScouting]);
+
+  const loadTaggedEvents = useCallback(async () => {
+    setLoadingEvents(true);
+    setEventsError("");
+    const { data, error } = await supabase
+      .from("prospect_events")
+      .select("id,note,added_by,events(id,name,event_type,event_date,end_date,city,state)")
+      .eq("prospect_id", id)
+      .order("event_date", { foreignTable: "events", ascending: true });
+    if (error) {
+      setEventsError(error.message);
+      setLoadingEvents(false);
+      return;
+    }
+    setTaggedEvents(data || []);
+    setLoadingEvents(false);
+  }, [supabase, id]);
+
+  useEffect(() => {
+    loadTaggedEvents();
+  }, [loadTaggedEvents]);
+
+  function searchEvents(value) {
+    setEventQuery(value);
+    if (eventDebounceRef.current) clearTimeout(eventDebounceRef.current);
+    if (value.trim().length < 2) {
+      setEventResults([]);
+      return;
+    }
+    eventDebounceRef.current = setTimeout(async () => {
+      const { data } = await supabase
+        .from("events")
+        .select("id,name,event_date,end_date")
+        .ilike("name", `%${value.trim()}%`)
+        .order("event_date", { ascending: true })
+        .limit(8);
+      const taggedIds = new Set(taggedEvents.map((te) => te.events?.id));
+      setEventResults((data || []).filter((ev) => !taggedIds.has(ev.id)));
+    }, 250);
+  }
+
+  async function addEventTag(ev) {
+    setAddingEventId(ev.id);
+    try {
+      const { error } = await supabase.from("prospect_events").insert({ prospect_id: Number(id), event_id: ev.id, added_by: user.id });
+      if (error) throw error;
+      setEventQuery("");
+      setEventResults([]);
+      await loadTaggedEvents();
+    } catch (err) {
+      setEventsError(err.message || "Could not tag this event.");
+    } finally {
+      setAddingEventId(null);
+    }
+  }
+
+  async function removeEventTag(linkId, addedBy) {
+    if (!(addedBy === user.id || canModerateEvents)) return;
+    if (!confirm("Remove this event tag?")) return;
+    setRemovingEventId(linkId);
+    try {
+      await supabase.from("prospect_events").delete().eq("id", linkId);
+      await loadTaggedEvents();
+    } finally {
+      setRemovingEventId(null);
+    }
+  }
 
   async function setRating(next) {
     if (!college?.id) return;
@@ -768,6 +868,70 @@ export default function ProspectDetailPage() {
           <div className="card" style={{ marginBottom: 14 }}>
             <h3>Coach Evaluation</h3>
             <p style={{ margin: 0, fontSize: 13.5 }}>{prospect.coach_evaluation || <span className="empty-state">No evaluation submitted.</span>}</p>
+          </div>
+
+          <div className="card" style={{ marginBottom: 14 }}>
+            <h3>Events</h3>
+            <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
+              Camps, combines, and showcases this athlete is tagged to attend.
+            </p>
+            {eventsError && <div className="notice danger" style={{ marginBottom: 10 }}>{eventsError}</div>}
+            {loadingEvents ? (
+              <div className="empty-state">Loading…</div>
+            ) : taggedEvents.length === 0 ? (
+              <div className="empty-state" style={{ marginBottom: 10 }}>Not tagged to any events yet.</div>
+            ) : (
+              <div style={{ marginBottom: 10 }}>
+                {taggedEvents.map((te) =>
+                  te.events ? (
+                    <div className="log-item" key={te.id}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+                        <div>
+                          <Link href={`/events/${te.events.id}`} style={{ fontWeight: 700 }}>
+                            {te.events.name}
+                          </Link>{" "}
+                          <span
+                            className={EVENT_TYPE_BADGE[te.events.event_type]}
+                            style={{ padding: "2px 8px", borderRadius: 20, fontSize: 11, fontWeight: 700, marginLeft: 4 }}
+                          >
+                            {EVENT_TYPE_LABEL[te.events.event_type]}
+                          </span>
+                          <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
+                            {fmtEventDateRange(te.events.event_date, te.events.end_date)}
+                            {(te.events.city || te.events.state) ? ` · ${[te.events.city, te.events.state].filter(Boolean).join(", ")}` : ""}
+                          </div>
+                          {te.note && <div style={{ fontSize: 12, color: "#3c4658", marginTop: 2 }}>{te.note}</div>}
+                        </div>
+                        {(te.added_by === user?.id || canModerateEvents) && (
+                          <button className="btn btn-sm btn-danger" onClick={() => removeEventTag(te.id, te.added_by)} disabled={removingEventId === te.id}>
+                            {removingEventId === te.id ? "…" : "Remove"}
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  ) : null
+                )}
+              </div>
+            )}
+            <div className="form-field">
+              <label>Tag to an Event</label>
+              <input value={eventQuery} onChange={(e) => searchEvents(e.target.value)} placeholder="Search events by name…" />
+            </div>
+            {eventResults.length > 0 && (
+              <div style={{ border: "1px solid var(--gray-200)", borderRadius: 8, maxHeight: 200, overflow: "auto" }}>
+                {eventResults.map((ev) => (
+                  <div key={ev.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "6px 10px", borderBottom: "1px solid var(--gray-100)" }}>
+                    <div style={{ fontSize: 12.5 }}>
+                      {ev.name}
+                      {ev.event_date ? ` · ${fmtEventDateRange(ev.event_date, ev.end_date)}` : ""}
+                    </div>
+                    <button className="btn btn-sm btn-primary" onClick={() => addEventTag(ev)} disabled={addingEventId === ev.id}>
+                      {addingEventId === ev.id ? "Adding…" : "+ Add"}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
 
           <div className="card" style={{ marginBottom: 14 }}>
