@@ -7,7 +7,7 @@ const FETCH_TIMEOUT_MS = 8000;
 const MAX_BYTES = 400_000;
 const MAX_CHARS_PER_SOURCE = 6000;
 const USER_AGENT = "CSD-CoachConnect-Verifier/1.0 (+https://csd-coachconnect)";
-const MODEL = process.env.ANTHROPIC_MODEL || "claude-3-5-haiku-20241022";
+const MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001";
 
 // AI auto-fill for the Quick Fix panel: instead of a human reading a
 // school's athletics site/website by hand to find and retype the head
