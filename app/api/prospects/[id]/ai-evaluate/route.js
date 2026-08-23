@@ -15,7 +15,7 @@ import { getSupabaseAdminClient } from "@/lib/supabase/admin";
 // nothing and runs on every row automatically. This route is the deeper,
 // opt-in AI pass a coach can request for a prospect they're already
 // looking at.
-const MODEL = process.env.ANTHROPIC_MODEL || "claude-3-5-haiku-20241022";
+const MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001";
 const CACHE_WINDOW_MS = 60 * 1000; // avoid double-click / accidental re-spend
 
 const SYSTEM_PROMPT = `You are a football recruiting analyst helping small-college coaches (D2, D3, NAIA, JUCO) quickly evaluate high-school prospects. You will be given structured facts about one athlete -- measurables, offers, coach notes, whether film is on file, and their current school's classification. Write a short, honest scouting take.
