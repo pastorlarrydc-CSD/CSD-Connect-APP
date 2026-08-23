@@ -307,3 +307,17 @@ export default function EventsPage() {
                           {p.label}
                         </option>
                       ))}
+                    </select>
+                    <Link href={`/events/${ev.id}`} className="btn btn-sm">
+                      Details
+                    </Link>
+                  </div>
+                </div>
+              </div>
+            );
+          })
+        )}
+      </div>
+    </div>
+  );
+}
