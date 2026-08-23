@@ -38,6 +38,29 @@ const TODAYS_LIST_FLAG_CAP = 15;
 // URL (most of the database, per the coverage stats above).
 const MAXPREPS_OPP_LOG_SCAN = 4000;
 
+// Caches the last scan's review queue (and current filter/sort) in
+// sessionStorage so leaving this tab -- opening a school profile, an
+// accidental refresh, anything short of closing the tab -- doesn't force
+// a full ~14,600-school re-scan just to get back to where you were.
+// "Open Profile" already opens in a new tab for the same reason; this is
+// the safety net for everything else. Cleared automatically when the tab
+// closes (sessionStorage), and always overwritten by an explicit
+// Re-scan Database.
+const SCAN_CACHE_KEY = "csd_dq_scan_cache_v1";
+const SCAN_CACHE_STALE_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+function fmtRelativeTime(date) {
+  if (!date) return "";
+  const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
+  if (seconds < 60) return "just now";
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  const days = Math.floor(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
+}
+
 const FILTERS = [
   { key: "all", label: "All actionable issues" },
   { key: "no_contact", label: "No contact info" },
@@ -176,7 +199,38 @@ export default function DataQualityPage() {
   // "yes, I checked this, it's still right" without opening the editor.
   const [markingVerifiedId, setMarkingVerifiedId] = useState(null);
   const [markVerifiedError, setMarkVerifiedError] = useState("");
-  const scannedAt = useRef(null);
+  const [scannedAt, setScannedAt] = useState(null);
+
+  // Restore a cached scan (if any) on mount -- see SCAN_CACHE_KEY above.
+  useEffect(() => {
+    try {
+      const raw = sessionStorage.getItem(SCAN_CACHE_KEY);
+      if (!raw) return;
+      const cached = JSON.parse(raw);
+      if (cached?.result) {
+        setResult(cached.result);
+        setScannedAt(cached.scannedAt ? new Date(cached.scannedAt) : null);
+      }
+      if (cached?.filter) setFilter(cached.filter);
+      if (cached?.sortBy) setSortBy(cached.sortBy);
+    } catch {
+      // Corrupt or unavailable cache -- fall back to the normal
+      // "Click Scan Database" empty state, same as if none existed.
+    }
+  }, []);
+
+  // Keep the cache in sync with the live queue -- every scan, Quick Fix,
+  // Mark Verified, Mark Coach Change, and bulk upload/verify all flow
+  // through setResult, so this effect alone covers all of them.
+  useEffect(() => {
+    if (!result) return;
+    try {
+      sessionStorage.setItem(SCAN_CACHE_KEY, JSON.stringify({ result, scannedAt: scannedAt ? scannedAt.toISOString() : null, filter, sortBy }));
+    } catch {
+      // Storage full/unavailable -- the queue still works for this tab,
+      // it just won't survive a reload. Not worth surfacing an error for.
+    }
+  }, [result, scannedAt, filter, sortBy]);
 
   // MaxPreps URL auto-discovery -- only ever active for whichever single
   // row is currently being edited (editingId), same as editValues itself.
@@ -731,7 +785,7 @@ export default function DataQualityPage() {
     try {
       const schools = await fetchAllSchools();
       setResult(classifySchools(schools));
-      scannedAt.current = new Date();
+      setScannedAt(new Date());
     } catch (err) {
       setScanError(err.message || "Could not scan the database.");
     } finally {
@@ -1422,6 +1476,12 @@ export default function DataQualityPage() {
         <div>
           <h1>Data Quality Review</h1>
           <p>Scans every school for outreach-critical problems — missing contact info, malformed emails/phones, orphaned contact info with no coach name.</p>
+          {scannedAt && (
+            <p style={{ fontSize: 12, color: "#9aa2b1", marginTop: 2 }}>
+              Last scanned {fmtRelativeTime(scannedAt)}
+              {Date.now() - scannedAt.getTime() > SCAN_CACHE_STALE_MS ? " — records may have changed since; consider a re-scan." : "."}
+            </p>
+          )}
         </div>
         <button className="btn btn-gold" onClick={runScan} disabled={scanning}>
           {scanning ? "Scanning…" : result ? "Re-scan Database" : "Scan Database"}
