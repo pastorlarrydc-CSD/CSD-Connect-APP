@@ -238,6 +238,12 @@ export default function DataQualityPage() {
   const [discoverError, setDiscoverError] = useState("");
   const [suggestions, setSuggestions] = useState([]);
 
+  // AI coach-info auto-fill -- same "one active row at a time" pattern as
+  // MaxPreps discovery above, since only one row can be in edit mode.
+  const [aiSuggesting, setAiSuggesting] = useState(false);
+  const [aiSuggestError, setAiSuggestError] = useState("");
+  const [aiSuggestInfo, setAiSuggestInfo] = useState(null); // {confidence, source, notes}
+
   // "Find & Edit a School" -- a standalone lookup so any school can be
   // reopened for a Quick Fix at any time, not just ones currently flagged
   // or turned up by a scan. Shares editingId/editValues/saveEdit with the
@@ -1143,6 +1149,8 @@ export default function DataQualityPage() {
     setSaveError("");
     setDiscoverError("");
     setSuggestions([]);
+    setAiSuggestError("");
+    setAiSuggestInfo(null);
     setEditValues({
       hc_first_name: school.hc_first_name || "",
       hc_last_name: school.hc_last_name || "",
@@ -1166,6 +1174,8 @@ export default function DataQualityPage() {
     setSaveError("");
     setDiscoverError("");
     setSuggestions([]);
+    setAiSuggestError("");
+    setAiSuggestInfo(null);
     setEditValues({
       hc_first_name: "",
       hc_last_name: "",
@@ -1183,6 +1193,8 @@ export default function DataQualityPage() {
     setSaveError("");
     setDiscoverError("");
     setSuggestions([]);
+    setAiSuggestError("");
+    setAiSuggestInfo(null);
   }
 
   // Asks Serper.dev's Google-search proxy (via our own API route, which
@@ -1216,6 +1228,42 @@ export default function DataQualityPage() {
   function pickSuggestion(link) {
     setEditValues((prev) => ({ ...prev, maxpreps_url: link }));
     setSuggestions([]);
+  }
+
+  // Reads the school's athletics site/website itself and suggests a head
+  // coach name, email, and phone for the reviewer to confirm -- instead of
+  // opening the site by hand to find and retype it. Never saves anything
+  // on its own; it only pre-fills the Quick Fix inputs. A returned field
+  // stays blank if the AI didn't find it there, so it never overwrites
+  // something already typed with an empty guess.
+  async function suggestCoachInfo(school) {
+    setAiSuggesting(true);
+    setAiSuggestError("");
+    setAiSuggestInfo(null);
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const res = await fetch(`/api/schools/${school.id}/discover-coach-info`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session?.access_token}` },
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || "Could not look up coach info.");
+      setEditValues((prev) => ({
+        ...prev,
+        hc_first_name: json.hc_first_name || prev.hc_first_name,
+        hc_last_name: json.hc_last_name || prev.hc_last_name,
+        hc_email: json.hc_email || prev.hc_email,
+        hc_office: json.hc_office || prev.hc_office,
+        hc_cell: json.hc_cell || prev.hc_cell,
+      }));
+      setAiSuggestInfo({ confidence: json.confidence, source: json.source, notes: json.notes });
+    } catch (err) {
+      setAiSuggestError(err.message || "Could not look up coach info.");
+    } finally {
+      setAiSuggesting(false);
+    }
   }
 
   async function resolvePendingFlags(schoolId) {
@@ -1642,6 +1690,16 @@ export default function DataQualityPage() {
                             {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
                           </button>
                         ))}
+                      </div>
+                    )}
+                    <button type="button" className="btn btn-sm" disabled={aiSuggesting} onClick={() => suggestCoachInfo(s)} style={{ marginLeft: 6 }}>
+                      {aiSuggesting ? "Looking…" : "Suggest Coach Info (AI)"}
+                    </button>
+                    {aiSuggestError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{aiSuggestError}</div>}
+                    {aiSuggestInfo && (
+                      <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
+                        AI suggestion ({aiSuggestInfo.confidence} confidence, from the {aiSuggestInfo.source}) filled into the fields below — review before saving.
+                        {aiSuggestInfo.notes ? ` ${aiSuggestInfo.notes}` : ""}
                       </div>
                     )}
                   </div>
@@ -2080,6 +2138,16 @@ export default function DataQualityPage() {
                             ))}
                           </div>
                         )}
+                        <button type="button" className="btn btn-sm" disabled={aiSuggesting} onClick={() => suggestCoachInfo(s)} style={{ marginLeft: 6 }}>
+                          {aiSuggesting ? "Looking…" : "Suggest Coach Info (AI)"}
+                        </button>
+                        {aiSuggestError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{aiSuggestError}</div>}
+                        {aiSuggestInfo && (
+                          <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
+                            AI suggestion ({aiSuggestInfo.confidence} confidence, from the {aiSuggestInfo.source}) filled into the fields below — review before saving.
+                            {aiSuggestInfo.notes ? ` ${aiSuggestInfo.notes}` : ""}
+                          </div>
+                        )}
                       </div>
                       {saveError && <div className="notice danger" style={{ marginBottom: 8 }}>{saveError}</div>}
                       <div style={{ display: "flex", gap: 8 }}>
@@ -2261,6 +2329,16 @@ export default function DataQualityPage() {
                               {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
                             </button>
                           ))}
+                        </div>
+                      )}
+                      <button type="button" className="btn btn-sm" disabled={aiSuggesting} onClick={() => suggestCoachInfo(s)} style={{ marginLeft: 6 }}>
+                        {aiSuggesting ? "Looking…" : "Suggest Coach Info (AI)"}
+                      </button>
+                      {aiSuggestError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{aiSuggestError}</div>}
+                      {aiSuggestInfo && (
+                        <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
+                          AI suggestion ({aiSuggestInfo.confidence} confidence, from the {aiSuggestInfo.source}) filled into the fields below — review before saving.
+                          {aiSuggestInfo.notes ? ` ${aiSuggestInfo.notes}` : ""}
                         </div>
                       )}
                     </div>
@@ -2502,6 +2580,16 @@ export default function DataQualityPage() {
                                   {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
                                 </button>
                               ))}
+                            </div>
+                          )}
+                          <button type="button" className="btn btn-sm" disabled={aiSuggesting} onClick={() => suggestCoachInfo(s)} style={{ marginLeft: 6 }}>
+                            {aiSuggesting ? "Looking…" : "Suggest Coach Info (AI)"}
+                          </button>
+                          {aiSuggestError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{aiSuggestError}</div>}
+                          {aiSuggestInfo && (
+                            <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
+                              AI suggestion ({aiSuggestInfo.confidence} confidence, from the {aiSuggestInfo.source}) filled into the fields below — review before saving.
+                              {aiSuggestInfo.notes ? ` ${aiSuggestInfo.notes}` : ""}
                             </div>
                           )}
                         </div>
