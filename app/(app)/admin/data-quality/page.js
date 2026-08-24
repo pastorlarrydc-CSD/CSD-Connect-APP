@@ -257,6 +257,14 @@ export default function DataQualityPage() {
   const [discoverError, setDiscoverError] = useState("");
   const [suggestions, setSuggestions] = useState([]);
 
+  // Athletics site auto-discovery -- same idea as MaxPreps discovery above,
+  // just pointed at app/api/schools/[id]/discover-athletics (see that route
+  // for why the search isn't restricted to one domain the way MaxPreps is).
+  // Same "one active row at a time" scoping.
+  const [discoveringAthletics, setDiscoveringAthletics] = useState(false);
+  const [discoverAthleticsError, setDiscoverAthleticsError] = useState("");
+  const [athleticsSuggestions, setAthleticsSuggestions] = useState([]);
+
   // AI coach-info auto-fill -- same "one active row at a time" pattern as
   // MaxPreps discovery above, since only one row can be in edit mode.
   const [aiSuggesting, setAiSuggesting] = useState(false);
@@ -1228,6 +1236,8 @@ export default function DataQualityPage() {
     setSaveError("");
     setDiscoverError("");
     setSuggestions([]);
+    setDiscoverAthleticsError("");
+    setAthleticsSuggestions([]);
     setAiSuggestError("");
     setAiSuggestInfo(null);
     setEditValues({
@@ -1253,6 +1263,8 @@ export default function DataQualityPage() {
     setSaveError("");
     setDiscoverError("");
     setSuggestions([]);
+    setDiscoverAthleticsError("");
+    setAthleticsSuggestions([]);
     setAiSuggestError("");
     setAiSuggestInfo(null);
     setEditValues({
@@ -1272,6 +1284,8 @@ export default function DataQualityPage() {
     setSaveError("");
     setDiscoverError("");
     setSuggestions([]);
+    setDiscoverAthleticsError("");
+    setAthleticsSuggestions([]);
     setAiSuggestError("");
     setAiSuggestInfo(null);
   }
@@ -1307,6 +1321,44 @@ export default function DataQualityPage() {
   function pickSuggestion(link) {
     setEditValues((prev) => ({ ...prev, maxpreps_url: link }));
     setSuggestions([]);
+  }
+
+  // Same idea as discoverMaxPreps above, pointed at a school's own
+  // athletics-department site instead of MaxPreps -- see
+  // app/api/schools/[id]/discover-athletics for why that search isn't
+  // restricted to one domain the way MaxPreps is (an athletics site can
+  // live almost anywhere: a subdomain of the school's own site, or a
+  // third-party host like rSchoolToday or SportsEngine). Same school
+  // profile page already has this exact button; this brings it to the
+  // Quick Fix editor here too, so Athletics URL doesn't have to be found
+  // and typed in by hand. Only ever returns candidates for a human to pick
+  // from; never writes athletics_url on its own.
+  async function discoverAthletics(school) {
+    setDiscoveringAthletics(true);
+    setDiscoverAthleticsError("");
+    setAthleticsSuggestions([]);
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const res = await fetch(`/api/schools/${school.id}/discover-athletics`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session?.access_token}` },
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || "Could not search for an athletics site.");
+      setAthleticsSuggestions(json.candidates || []);
+      if (!json.candidates?.length) setDiscoverAthleticsError("No athletics site turned up for this school. Try searching directly and paste the link in.");
+    } catch (err) {
+      setDiscoverAthleticsError(err.message || "Could not search for an athletics site.");
+    } finally {
+      setDiscoveringAthletics(false);
+    }
+  }
+
+  function pickAthleticsSuggestion(link) {
+    setEditValues((prev) => ({ ...prev, athletics_url: link }));
+    setAthleticsSuggestions([]);
   }
 
   // Reads the school's athletics site/website itself and suggests a head
@@ -1765,6 +1817,25 @@ export default function DataQualityPage() {
                             className="btn btn-sm"
                             style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
                             onClick={() => pickSuggestion(sugg.link)}
+                          >
+                            {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                    <button type="button" className="btn btn-sm" disabled={discoveringAthletics} onClick={() => discoverAthletics(s)} style={{ marginLeft: 6 }}>
+                      {discoveringAthletics ? "Searching…" : "Find Athletics page"}
+                    </button>
+                    {discoverAthleticsError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverAthleticsError}</div>}
+                    {athleticsSuggestions.length > 0 && (
+                      <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                        {athleticsSuggestions.map((sugg) => (
+                          <button
+                            type="button"
+                            key={sugg.link}
+                            className="btn btn-sm"
+                            style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
+                            onClick={() => pickAthleticsSuggestion(sugg.link)}
                           >
                             {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
                           </button>
@@ -2230,6 +2301,25 @@ export default function DataQualityPage() {
                             ))}
                           </div>
                         )}
+                        <button type="button" className="btn btn-sm" disabled={discoveringAthletics} onClick={() => discoverAthletics(s)} style={{ marginLeft: 6 }}>
+                          {discoveringAthletics ? "Searching…" : "Find Athletics page"}
+                        </button>
+                        {discoverAthleticsError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverAthleticsError}</div>}
+                        {athleticsSuggestions.length > 0 && (
+                          <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                            {athleticsSuggestions.map((sugg) => (
+                              <button
+                                type="button"
+                                key={sugg.link}
+                                className="btn btn-sm"
+                                style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
+                                onClick={() => pickAthleticsSuggestion(sugg.link)}
+                              >
+                                {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
                         <button type="button" className="btn btn-sm" disabled={aiSuggesting} onClick={() => suggestCoachInfo(s)} style={{ marginLeft: 6 }}>
                           {aiSuggesting ? "Looking…" : "Suggest Coach Info (AI)"}
                         </button>
@@ -2417,6 +2507,25 @@ export default function DataQualityPage() {
                               className="btn btn-sm"
                               style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
                               onClick={() => pickSuggestion(sugg.link)}
+                            >
+                              {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                      <button type="button" className="btn btn-sm" disabled={discoveringAthletics} onClick={() => discoverAthletics(s)} style={{ marginLeft: 6 }}>
+                        {discoveringAthletics ? "Searching…" : "Find Athletics page"}
+                      </button>
+                      {discoverAthleticsError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverAthleticsError}</div>}
+                      {athleticsSuggestions.length > 0 && (
+                        <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                          {athleticsSuggestions.map((sugg) => (
+                            <button
+                              type="button"
+                              key={sugg.link}
+                              className="btn btn-sm"
+                              style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
+                              onClick={() => pickAthleticsSuggestion(sugg.link)}
                             >
                               {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
                             </button>
@@ -2668,6 +2777,25 @@ export default function DataQualityPage() {
                                   className="btn btn-sm"
                                   style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
                                   onClick={() => pickSuggestion(sugg.link)}
+                                >
+                                  {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                          <button type="button" className="btn btn-sm" disabled={discoveringAthletics} onClick={() => discoverAthletics(s)} style={{ marginLeft: 6 }}>
+                            {discoveringAthletics ? "Searching…" : "Find Athletics page"}
+                          </button>
+                          {discoverAthleticsError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverAthleticsError}</div>}
+                          {athleticsSuggestions.length > 0 && (
+                            <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                              {athleticsSuggestions.map((sugg) => (
+                                <button
+                                  type="button"
+                                  key={sugg.link}
+                                  className="btn btn-sm"
+                                  style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
+                                  onClick={() => pickAthleticsSuggestion(sugg.link)}
                                 >
                                   {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
                                 </button>
