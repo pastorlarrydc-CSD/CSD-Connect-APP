@@ -89,6 +89,8 @@ const EDIT_FIELDS = [
   ["hc_email", "Email"],
   ["hc_cell", "Cell"],
   ["hc_office", "Office"],
+  ["hc_twitter", "Twitter / X handle"],
+  ["hc_facebook", "Facebook page/profile"],
   ["maxpreps_url", "MaxPreps URL"],
   ["athletics_url", "Athletics URL"],
 ];
@@ -138,13 +140,15 @@ const COACH_CHANGE_SOURCE_META = {
 // widened to cover email/cell/office too, since those are logged to
 // school_change_log on every save exactly the same way and deserve the
 // same dated, sortable history instead of going unseen.
-const COACH_CHANGE_TRACKED_FIELDS = ["hc_first_name", "hc_last_name", "hc_email", "hc_cell", "hc_office"];
+const COACH_CHANGE_TRACKED_FIELDS = ["hc_first_name", "hc_last_name", "hc_email", "hc_cell", "hc_office", "hc_twitter", "hc_facebook"];
 const COACH_CHANGE_FIELD_LABELS = {
   hc_first_name: "First name",
   hc_last_name: "Last name",
   hc_email: "Email",
   hc_cell: "Cell",
   hc_office: "Office",
+  hc_twitter: "Twitter / X",
+  hc_facebook: "Facebook",
 };
 
 function fmtPhone(v) {
@@ -426,7 +430,7 @@ export default function DataQualityPage() {
     setLoadingFlags(true);
     const { data } = await supabase
       .from("school_flags")
-      .select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,maxpreps_url,athletics_url,website,verification_status,confidence_score), colleges:flagged_by_college_id(name)")
+      .select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,maxpreps_url,athletics_url,website,verification_status,confidence_score), colleges:flagged_by_college_id(name)")
       .eq("status", "pending")
       .order("created_at", { ascending: true });
     setFlaggedQueue(data || []);
@@ -534,7 +538,7 @@ export default function DataQualityPage() {
     const cutoff = new Date(Date.now() - RECHECK_CUTOFF_DAYS * 24 * 60 * 60 * 1000).toISOString();
     const { data } = await supabase
       .from("schools")
-      .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,maxpreps_url,athletics_url,website,verification_status,confidence_score,last_verified_at")
+      .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,maxpreps_url,athletics_url,website,verification_status,confidence_score,last_verified_at")
       .eq("verification_status", "verified")
       .lt("last_verified_at", cutoff)
       .order("last_verified_at", { ascending: true })
@@ -822,7 +826,7 @@ export default function DataQualityPage() {
     try {
       const rows = result.flagged.filter((r) => filter === "all" || r.issues.some((iss) => iss.code === filter));
       const csv = Papa.unparse({
-        fields: ["school_id", "school_name", "city", "state", "issues", "hc_first_name", "hc_last_name", "hc_email", "hc_cell", "hc_office", "maxpreps_url"],
+        fields: ["school_id", "school_name", "city", "state", "issues", "hc_first_name", "hc_last_name", "hc_email", "hc_cell", "hc_office", "hc_twitter", "hc_facebook", "maxpreps_url"],
         data: rows.map((r) => [
           r.school.id,
           r.school.name || "",
@@ -834,6 +838,8 @@ export default function DataQualityPage() {
           r.school.hc_email || "",
           r.school.hc_cell || "",
           r.school.hc_office || "",
+          r.school.hc_twitter || "",
+          r.school.hc_facebook || "",
           r.school.maxpreps_url || "",
         ]),
       });
@@ -852,7 +858,7 @@ export default function DataQualityPage() {
     for (;;) {
       const { data, error } = await supabase
         .from("schools")
-        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,lat,lon,verification_status,maxpreps_url,athletics_url,website,confidence_score")
+        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,lat,lon,verification_status,maxpreps_url,athletics_url,website,confidence_score")
         .order("id", { ascending: true })
         .range(from, from + PAGE_SIZE - 1);
       if (error) throw error;
@@ -873,7 +879,7 @@ export default function DataQualityPage() {
     try {
       const { data, error } = await supabase
         .from("schools")
-        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,maxpreps_url,athletics_url,website,verification_status,confidence_score")
+        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,maxpreps_url,athletics_url,website,verification_status,confidence_score")
         .ilike("name", `%${q}%`)
         .order("name")
         .limit(25);
@@ -1260,6 +1266,8 @@ export default function DataQualityPage() {
       hc_email: school.hc_email || "",
       hc_cell: school.hc_cell || "",
       hc_office: school.hc_office || "",
+      hc_twitter: school.hc_twitter || "",
+      hc_facebook: school.hc_facebook || "",
       maxpreps_url: school.maxpreps_url || "",
       athletics_url: school.athletics_url || "",
     });
@@ -1287,6 +1295,8 @@ export default function DataQualityPage() {
       hc_email: "",
       hc_cell: "",
       hc_office: "",
+      hc_twitter: "",
+      hc_facebook: "",
       maxpreps_url: school.maxpreps_url || "",
       athletics_url: school.athletics_url || "",
     });
@@ -1402,6 +1412,8 @@ export default function DataQualityPage() {
         hc_email: json.hc_email || prev.hc_email,
         hc_office: json.hc_office || prev.hc_office,
         hc_cell: json.hc_cell || prev.hc_cell,
+        hc_twitter: json.hc_twitter || prev.hc_twitter,
+        hc_facebook: json.hc_facebook || prev.hc_facebook,
       }));
       setAiSuggestInfo({ confidence: json.confidence, source: json.source, notes: json.notes });
     } catch (err) {
@@ -2659,7 +2671,7 @@ export default function DataQualityPage() {
             <div style={{ background: "#f7f8fa", border: "1px solid #dde1e7", borderRadius: 8, padding: 10, marginBottom: 14 }}>
               <div style={{ fontWeight: 600, marginBottom: 4 }}>Upload corrected CSV</div>
               <p style={{ fontSize: 12.5, color: "#697386", marginTop: 0, marginBottom: 8 }}>
-                Edit the downloaded file in Excel or Sheets, then re-upload it here to apply corrections in bulk. Matches rows on <code>school_id</code> (preferred) or <code>school_name</code> + <code>state</code> (+ <code>city</code> to break ties). Reads <code>hc_first_name, hc_last_name, hc_email, hc_cell, hc_office, maxpreps_url</code> — blank cells are left unchanged, and any other column is ignored.
+                Edit the downloaded file in Excel or Sheets, then re-upload it here to apply corrections in bulk. Matches rows on <code>school_id</code> (preferred) or <code>school_name</code> + <code>state</code> (+ <code>city</code> to break ties). Reads <code>hc_first_name, hc_last_name, hc_email, hc_cell, hc_office, hc_twitter, hc_facebook, maxpreps_url</code> — blank cells are left unchanged, and any other column is ignored.
               </p>
               <input ref={uploadInputRef} type="file" accept=".csv" onChange={handleUploadFile} disabled={uploadParsing || uploadApplying} />
               {uploadParsing && <div className="empty-state" style={{ marginTop: 8 }}>Reading {uploadFileName}…</div>}
