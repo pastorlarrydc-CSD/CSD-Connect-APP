@@ -111,19 +111,21 @@ async function searchWeb(query, apiKey) {
   }
 }
 
-const SYSTEM_PROMPT = `You are helping a college football recruiting staff verify high-school program contact information. You will be given search-engine results for the school's football program, and -- when available -- full text read from the school's athletics website and/or general website, plus whatever is currently on file. Find the CURRENT HEAD FOOTBALL COACH's name, email, and phone number, if they appear anywhere in what you're given.
+const SYSTEM_PROMPT = `You are helping a college football recruiting staff verify high-school program contact information. You will be given search-engine results for the school's football program, and -- when available -- full text read from the school's athletics website and/or general website, plus whatever is currently on file. Find the CURRENT HEAD FOOTBALL COACH's name, email, phone number, Twitter/X handle, and Facebook page/profile, if they appear anywhere in what you're given.
 
 Rules:
 - Only extract information about FOOTBALL. Ignore coaches of other sports (basketball, baseball, soccer, track, etc.) even if they're listed right next to the football staff.
 - If a source names an Athletic Director or a general athletics-office contact but no specific football head coach, do NOT use that person's name as the coach -- leave the name fields empty rather than guessing. A general office phone/email is still worth returning as a fallback office contact even with no coach named.
-- Never invent or guess a name, email, or phone number that isn't actually present in what you were given. Return empty strings for anything not found.
+- Never invent or guess a name, email, phone number, Twitter/X handle, or Facebook link that isn't actually present in what you were given. Return empty strings for anything not found.
+- For hc_twitter, only use a handle that is explicitly tied to this specific coach (their own bio, a byline, a "follow me" link next to their name) -- not the school's or program's general athletics/football account. Format it as "@handle". If only a program or team account is mentioned (not the coach personally), leave hc_twitter empty rather than guessing it belongs to the coach.
+- For hc_facebook, the same rule applies: only a link/page clearly belonging to this coach personally, or -- since football coaches often don't keep a separate personal page -- the team's own official Facebook page IS acceptable here as a fallback, but say so in notes (e.g. "team page, not the coach's personal profile") so the reviewer knows which kind of link it is. Give the full URL.
 - Search-result snippets are short and sometimes get cut off mid-sentence -- it's fine to use a name from a snippet (e.g. a "names John Smith new head coach" headline) even without the full article, but set confidence no higher than "medium" when you're relying on a snippet alone rather than full page text.
 - If a source mentions a recent coaching change ("new head coach", "interim head coach", "as of [date]"), prefer the most current name and say so in notes.
 - If different sources disagree on the name, prefer whichever is more recent or more directly tied to the school's own site, and mention the conflict in notes.
 - Only fill hc_cell if a number is explicitly labeled as a cell/mobile/direct line for that coach. Otherwise put any phone number found in hc_office.
 - Set confidence to "high" only when a name is clearly labeled as the football head coach in full page text (not just a search snippet). Use "medium" for real but ambiguous matches, or a clear match found only in a search snippet. Use "low" if you are only partially confident.
 - Respond with ONLY a single JSON object, no other text, in exactly this shape:
-{"hc_first_name": "", "hc_last_name": "", "hc_email": "", "hc_office": "", "hc_cell": "", "confidence": "high", "source": "web search", "notes": "one sentence describing what was found, or why fields were left empty"}`;
+{"hc_first_name": "", "hc_last_name": "", "hc_email": "", "hc_office": "", "hc_cell": "", "hc_twitter": "", "hc_facebook": "", "confidence": "high", "source": "web search", "notes": "one sentence describing what was found, or why fields were left empty"}`;
 
 function parseModelJson(text) {
   const trimmed = (text || "").trim();
@@ -179,7 +181,7 @@ export async function POST(req, { params }) {
 
     const { data: school, error: schoolErr } = await supabase
       .from("schools")
-      .select("id,name,city,state,athletics_url,website,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office")
+      .select("id,name,city,state,athletics_url,website,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook")
       .eq("id", schoolId)
       .maybeSingle();
     if (schoolErr || !school) {
@@ -231,6 +233,8 @@ export async function POST(req, { params }) {
       school.hc_email ? `Email on file: ${school.hc_email}` : "Email on file: none",
       school.hc_cell ? `Cell on file: ${school.hc_cell}` : null,
       school.hc_office ? `Office phone on file: ${school.hc_office}` : null,
+      school.hc_twitter ? `Twitter/X on file: ${school.hc_twitter}` : null,
+      school.hc_facebook ? `Facebook on file: ${school.hc_facebook}` : null,
     ]
       .filter(Boolean)
       .join("\n");
@@ -274,6 +278,8 @@ export async function POST(req, { params }) {
       hc_email: (parsed.hc_email || "").toString().trim(),
       hc_office: (parsed.hc_office || "").toString().trim(),
       hc_cell: (parsed.hc_cell || "").toString().trim(),
+      hc_twitter: (parsed.hc_twitter || "").toString().trim(),
+      hc_facebook: (parsed.hc_facebook || "").toString().trim(),
       confidence: ["high", "medium", "low"].includes(parsed.confidence) ? parsed.confidence : "low",
       source: (parsed.source || defaultSource || "web search").toString(),
       notes: (parsed.notes || "").toString().trim(),
