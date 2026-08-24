@@ -114,9 +114,10 @@ const RADAR_FILTERS = [
 ];
 
 // Every "source" string that can end up on a school_change_log row touching
-// hc_first_name/hc_last_name -- see the Coach Change History card below.
-// Anything not listed here still shows up, just with a plain gray badge
-// carrying the raw source text, so a new write path never goes missing.
+// hc_first_name/hc_last_name/hc_email/hc_cell/hc_office -- see the Coach
+// Change History card below. Anything not listed here still shows up, just
+// with a plain gray badge carrying the raw source text, so a new write path
+// never goes missing.
 const COACH_CHANGE_SOURCE_META = {
   "Head coach change (manual)": { label: "Marked coach change", color: "#0b5fff", bg: "#e8f0ff" },
   "Data quality review (quick fix)": { label: "Quick fix", color: "#697386", bg: "#f0f1f4" },
@@ -126,7 +127,18 @@ const COACH_CHANGE_SOURCE_META = {
   "Bulk correction upload (Data Quality)": { label: "Bulk upload", color: "#8a6100", bg: "#fff4dc" },
   "Bulk school update (CSV)": { label: "Bulk update tool", color: "#8a6100", bg: "#fff4dc" },
 };
-const COACH_CHANGE_FIELD_LABELS = { hc_first_name: "First name", hc_last_name: "Last name" };
+// Every field this card tracks -- originally just the coach's name, now
+// widened to cover email/cell/office too, since those are logged to
+// school_change_log on every save exactly the same way and deserve the
+// same dated, sortable history instead of going unseen.
+const COACH_CHANGE_TRACKED_FIELDS = ["hc_first_name", "hc_last_name", "hc_email", "hc_cell", "hc_office"];
+const COACH_CHANGE_FIELD_LABELS = {
+  hc_first_name: "First name",
+  hc_last_name: "Last name",
+  hc_email: "Email",
+  hc_cell: "Cell",
+  hc_office: "Office",
+};
 
 function fmtPhone(v) {
   if (!v) return "";
@@ -274,15 +286,18 @@ export default function DataQualityPage() {
   const [uploadApplyStatus, setUploadApplyStatus] = useState("");
   const [uploadApplyResult, setUploadApplyResult] = useState(null); // {schools, fields}
 
-  // Coach Change History -- every hc_first_name/hc_last_name entry ever
-  // written to school_change_log, however it got there (Quick Fix, the
-  // "Mark Coach Change" button below, a bulk upload/update, or an approved
-  // coach-submitted correction), grouped so a name change made in one save
-  // shows as one entry instead of two.
+  // Coach Change History -- every name/email/cell/office entry ever written
+  // to school_change_log, however it got there (Quick Fix, the "Mark Coach
+  // Change" button below, a bulk upload/update, or an approved
+  // coach-submitted correction), grouped so several fields changed in one
+  // save show as one dated entry instead of several. Defaults to newest
+  // first; coachChangeSort flips that for whoever wants to work oldest-first
+  // instead (e.g. clearing out a long-untouched backlog in order).
   const [coachChanges, setCoachChanges] = useState([]);
   const [loadingCoachChanges, setLoadingCoachChanges] = useState(true);
   const [coachChangeExporting, setCoachChangeExporting] = useState(false);
   const [coachChangeExportError, setCoachChangeExportError] = useState("");
+  const [coachChangeSort, setCoachChangeSort] = useState("newest");
 
   // Needs Re-check -- verified schools whose last_verified_at has aged past
   // the recency bands the confidence-score trigger cares about (see
@@ -401,13 +416,13 @@ export default function DataQualityPage() {
     const { data } = await supabase
       .from("school_change_log")
       .select("id, school_id, field_name, old_value, new_value, source, changed_at, schools(name,city,state)")
-      .in("field_name", ["hc_first_name", "hc_last_name"])
+      .in("field_name", COACH_CHANGE_TRACKED_FIELDS)
       .order("changed_at", { ascending: false })
       .limit(2000);
 
-    // A single save writes hc_first_name and hc_last_name as separate rows
-    // sharing the same changed_at (one insert statement, one transaction
-    // timestamp) -- group them back into one entry per save.
+    // A single save writes each changed field (name, email, cell, office)
+    // as its own row sharing the same changed_at (one insert statement, one
+    // transaction timestamp) -- group them back into one entry per save.
     const groups = new Map();
     (data || []).forEach((row) => {
       const key = `${row.school_id}|${row.changed_at}`;
@@ -423,6 +438,11 @@ export default function DataQualityPage() {
   useEffect(() => {
     loadCoachChanges();
   }, [loadCoachChanges]);
+
+  // Newest-first is the order coachChanges already comes in (see
+  // loadCoachChanges above) -- oldest-first is just that list reversed,
+  // recomputed on every render so flipping the dropdown needs no re-fetch.
+  const sortedCoachChanges = coachChangeSort === "oldest" ? [...coachChanges].reverse() : coachChanges;
 
   const loadNeedsRecheck = useCallback(async () => {
     if (!canReview) {
@@ -647,7 +667,7 @@ export default function DataQualityPage() {
     try {
       const csv = Papa.unparse({
         fields: ["school_name", "city", "state", "field", "old_value", "new_value", "source", "changed_at"],
-        data: coachChanges.flatMap((g) =>
+        data: sortedCoachChanges.flatMap((g) =>
           g.fields.map((f) => [
             g.schools?.name || "",
             g.schools?.city || "",
@@ -987,7 +1007,7 @@ export default function DataQualityPage() {
         setFlaggedQueue((prev) => prev.filter((f) => !updatedIds.has(f.school_id)));
       }
 
-      if (uploadPreview.some((row) => row.fields.some((f) => f.field === "hc_first_name" || f.field === "hc_last_name"))) {
+      if (uploadPreview.some((row) => row.fields.some((f) => COACH_CHANGE_TRACKED_FIELDS.includes(f.field)))) {
         loadCoachChanges();
       }
       setUploadApplyResult({
@@ -1443,7 +1463,7 @@ export default function DataQualityPage() {
       // Freshly verified -- no longer stale, so it drops out of the Needs
       // Re-check queue without waiting on a reload.
       setNeedsRecheck((prev) => prev.filter((s) => s.id !== before.id));
-      if (changes.some((c) => c.field_name === "hc_first_name" || c.field_name === "hc_last_name")) {
+      if (changes.some((c) => COACH_CHANGE_TRACKED_FIELDS.includes(c.field_name))) {
         loadCoachChanges();
       }
       setEditingId(null);
@@ -1994,21 +2014,34 @@ export default function DataQualityPage() {
           <div>
             <h3 style={{ marginBottom: 4 }}>Coach Change History</h3>
             <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 0 }}>
-              Every recorded head coach name change, however it was made — &quot;Mark Coach Change,&quot; a Quick Fix, a bulk upload, or an approved coach-submitted correction.
+              Every recorded head coach update — name, email, cell, or office phone — dated and tagged with how it was made: &quot;Mark Coach Change,&quot; a Quick Fix, a bulk upload, or an approved coach-submitted correction.
             </p>
           </div>
-          <button className="btn btn-sm" onClick={exportCoachChanges} disabled={coachChangeExporting || coachChanges.length === 0}>
-            {coachChangeExporting ? "Exporting…" : "Download CSV"}
-          </button>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <label style={{ fontSize: 12.5, color: "#697386" }}>
+              Sort:{" "}
+              <select
+                value={coachChangeSort}
+                onChange={(e) => setCoachChangeSort(e.target.value)}
+                style={{ fontSize: 12.5, padding: "3px 6px" }}
+              >
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
+              </select>
+            </label>
+            <button className="btn btn-sm" onClick={exportCoachChanges} disabled={coachChangeExporting || coachChanges.length === 0}>
+              {coachChangeExporting ? "Exporting…" : "Download CSV"}
+            </button>
+          </div>
         </div>
         {coachChangeExportError && <div className="notice danger" style={{ marginTop: 10 }}>{coachChangeExportError}</div>}
         {loadingCoachChanges ? (
           <div className="empty-state" style={{ marginTop: 10 }}>Loading…</div>
-        ) : coachChanges.length === 0 ? (
+        ) : sortedCoachChanges.length === 0 ? (
           <div className="empty-state" style={{ marginTop: 10 }}>No coach changes recorded yet.</div>
         ) : (
           <div style={{ maxHeight: 360, overflow: "auto", marginTop: 10 }}>
-            {coachChanges.slice(0, 100).map((g) => {
+            {sortedCoachChanges.slice(0, 100).map((g) => {
               const meta = COACH_CHANGE_SOURCE_META[g.source] || { label: g.source || "Unknown source", color: "#697386", bg: "#f0f1f4" };
               return (
                 <div className="log-item" key={`${g.school_id}|${g.changed_at}`} style={{ paddingBottom: 10 }}>
