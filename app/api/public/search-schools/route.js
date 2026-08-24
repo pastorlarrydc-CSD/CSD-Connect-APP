@@ -13,6 +13,10 @@ import { getSupabaseAdminClient } from "@/lib/supabase/admin";
 // GET-only, read-only, no write path here at all. Query length is capped
 // at 2 characters minimum (same as the in-app version) so this can't be
 // used to page through the entire schools table one character at a time.
+//
+// A closed school (see the add_school_closed_status migration) is excluded
+// here too -- a high school coach filling out this public form shouldn't be
+// able to submit a prospect against a school that no longer exists.
 export async function GET(req) {
   try {
     const { searchParams } = new URL(req.url);
@@ -25,6 +29,7 @@ export async function GET(req) {
     const { data, error } = await supabase
       .from("schools")
       .select("id,name,city,state")
+      .eq("is_closed", false)
       .ilike("name", `%${q}%`)
       .order("name", { ascending: true })
       .limit(8);
