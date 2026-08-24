@@ -8,28 +8,45 @@ const MAX_BYTES = 400_000;
 const MAX_CHARS_PER_SOURCE = 6000;
 const USER_AGENT = "CSD-CoachConnect-Verifier/1.0 (+https://csd-coachconnect)";
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-haiku-4-5-20251001";
+const SEARCH_RESULT_COUNT = 8;
 
 // AI auto-fill for the Quick Fix panel: instead of a human reading a
-// school's athletics site/website by hand to find and retype the head
-// football coach's name, email, and phone, this reads the page(s) itself
-// and hands back a suggestion for the reviewer to confirm (or correct)
-// before saving. Same non-authoritative contract as "Find MaxPreps page"
-// and "Find athletics page" -- this NEVER writes to the schools table on
-// its own; the reviewer still has to review the suggestion and click
-// Save & Mark Verified.
+// school's site by hand (or Googling it) to find and retype the head
+// football coach's name, email, and phone, this looks it up itself and
+// hands back a suggestion for the reviewer to confirm (or correct) before
+// saving. Same non-authoritative contract as "Find MaxPreps page" and
+// "Find athletics page" -- this NEVER writes to the schools table on its
+// own; the reviewer still has to review the suggestion and click Save &
+// Mark Verified.
 //
-// Deliberately reads ONLY athletics_url and website -- never maxpreps_url.
-// MaxPreps' Terms of Use prohibit scraping/crawling its own site (see the
-// discover-maxpreps route for the fuller explanation of why that route
-// only ever searches for a MaxPreps link instead of touching MaxPreps
-// itself), and MaxPreps team pages rarely carry a coach's email/phone
-// anyway -- a school's own athletics or general site is a far better
-// source for actual contact information, and it's the site CSD has an
-// unambiguous right to read.
+// A web search (via Serper.dev, same search proxy the MaxPreps/athletics
+// discovery buttons already use) is now the PRIMARY source, run on every
+// click regardless of what's on file. Originally this route only read the
+// school's saved athletics_url/website -- but that meant it flatly
+// couldn't help on any school missing one of those (a hard "add a website
+// first" dead end), and even when a URL WAS on file, a stale or wrong one
+// silently sank the whole lookup with no fallback. A live search sidesteps
+// both problems: it works whether or not anything is saved, and it isn't
+// undone by one bad URL. When athletics_url/website ARE on file, that page
+// is still fetched too and handed to the model alongside the search
+// results -- a school's own staff directory is usually the best place to
+// find an actual email address, so it's kept as a bonus source rather than
+// the single point of failure it used to be.
 //
-// Costs a real Anthropic API call, so -- same as the two Serper-backed
-// discovery routes -- this is gated to verifier/sysadmin and only ever
-// runs when a human clicks the button. Never on a schedule, never in bulk.
+// Deliberately never fetches maxpreps.com itself -- MaxPreps' Terms of Use
+// prohibit scraping/crawling its own site (see the discover-maxpreps route
+// for the fuller explanation). A MaxPreps result CAN still show up as a
+// search snippet below, same as it can in a Google search anyone would run
+// by hand -- that's Serper's own indexed summary, not us reading the page
+// -- but its two-line snippet rarely carries an email/phone anyway, so a
+// school's own athletics or general site (when reachable) remains the best
+// source for actual contact info.
+//
+// Costs a real Anthropic call plus a Serper search on every click, so --
+// same as the other AI/search-backed discovery routes -- this is gated to
+// verifier/sysadmin and only ever runs when a human clicks the button.
+// Never on a schedule, never in bulk (see the batch-coach-info-discovery
+// spec for the overnight/bulk version of this idea).
 
 function htmlToText(html) {
   // Same approach as lib/schoolRecheck.js's stripToText, but deliberately
@@ -67,17 +84,46 @@ async function fetchPageText(url) {
   }
 }
 
-const SYSTEM_PROMPT = `You are helping a college football recruiting staff verify high-school program contact information. You will be given raw text read from a school's athletics website and/or general website, plus whatever is currently on file. Find the CURRENT HEAD FOOTBALL COACH's name, email, and phone number, if they appear anywhere in the text.
+// Runs the live web search that now anchors this route. Best-effort: a
+// Serper hiccup here shouldn't sink the whole lookup if a school page did
+// fetch successfully, so this returns an empty array on failure instead of
+// throwing -- the caller decides whether anything usable came back overall.
+async function searchWeb(query, apiKey) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const res = await fetch("https://google.serper.dev/search", {
+      method: "POST",
+      headers: { "X-API-KEY": apiKey, "Content-Type": "application/json" },
+      body: JSON.stringify({ q: query, num: SEARCH_RESULT_COUNT }),
+      signal: controller.signal,
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) return [];
+    return (payload.organic || [])
+      .filter((item) => item.title && item.link)
+      .slice(0, SEARCH_RESULT_COUNT)
+      .map((item) => ({ title: item.title, link: item.link, snippet: item.snippet || "" }));
+  } catch (_) {
+    return [];
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+const SYSTEM_PROMPT = `You are helping a college football recruiting staff verify high-school program contact information. You will be given search-engine results for the school's football program, and -- when available -- full text read from the school's athletics website and/or general website, plus whatever is currently on file. Find the CURRENT HEAD FOOTBALL COACH's name, email, and phone number, if they appear anywhere in what you're given.
 
 Rules:
 - Only extract information about FOOTBALL. Ignore coaches of other sports (basketball, baseball, soccer, track, etc.) even if they're listed right next to the football staff.
-- If the page names an Athletic Director or a general athletics-office contact but no specific football head coach, do NOT use that person's name as the coach -- leave the name fields empty rather than guessing. A general office phone/email is still worth returning as a fallback office contact even with no coach named.
-- Never invent or guess a name, email, or phone number that isn't actually present in the text. Return empty strings for anything not found.
-- If the text mentions a recent coaching change ("new head coach", "interim head coach", "as of [date]"), prefer the most current name and say so in notes.
+- If a source names an Athletic Director or a general athletics-office contact but no specific football head coach, do NOT use that person's name as the coach -- leave the name fields empty rather than guessing. A general office phone/email is still worth returning as a fallback office contact even with no coach named.
+- Never invent or guess a name, email, or phone number that isn't actually present in what you were given. Return empty strings for anything not found.
+- Search-result snippets are short and sometimes get cut off mid-sentence -- it's fine to use a name from a snippet (e.g. a "names John Smith new head coach" headline) even without the full article, but set confidence no higher than "medium" when you're relying on a snippet alone rather than full page text.
+- If a source mentions a recent coaching change ("new head coach", "interim head coach", "as of [date]"), prefer the most current name and say so in notes.
+- If different sources disagree on the name, prefer whichever is more recent or more directly tied to the school's own site, and mention the conflict in notes.
 - Only fill hc_cell if a number is explicitly labeled as a cell/mobile/direct line for that coach. Otherwise put any phone number found in hc_office.
-- Set confidence to "high" only when a name is clearly labeled as the football head coach. Use "medium" for real but ambiguous matches (e.g. no clear title, or inferred from a roster/schedule page). Use "low" if you are only partially confident.
+- Set confidence to "high" only when a name is clearly labeled as the football head coach in full page text (not just a search snippet). Use "medium" for real but ambiguous matches, or a clear match found only in a search snippet. Use "low" if you are only partially confident.
 - Respond with ONLY a single JSON object, no other text, in exactly this shape:
-{"hc_first_name": "", "hc_last_name": "", "hc_email": "", "hc_office": "", "hc_cell": "", "confidence": "high", "source": "athletics site", "notes": "one sentence describing what was found, or why fields were left empty"}`;
+{"hc_first_name": "", "hc_last_name": "", "hc_email": "", "hc_office": "", "hc_cell": "", "confidence": "high", "source": "web search", "notes": "one sentence describing what was found, or why fields were left empty"}`;
 
 function parseModelJson(text) {
   const trimmed = (text || "").trim();
@@ -123,6 +169,13 @@ export async function POST(req, { params }) {
         { status: 500 }
       );
     }
+    const serperKey = process.env.SERPER_API_KEY;
+    if (!serperKey) {
+      return NextResponse.json(
+        { error: "AI coach-info lookup isn't fully configured yet -- SERPER_API_KEY needs to be added in Vercel Project Settings -> Environment Variables (sign up free at serper.dev)." },
+        { status: 500 }
+      );
+    }
 
     const { data: school, error: schoolErr } = await supabase
       .from("schools")
@@ -135,38 +188,43 @@ export async function POST(req, { params }) {
 
     const athleticsUrl = withProtocol(school.athletics_url);
     const websiteUrl = withProtocol(school.website);
-    if (!athleticsUrl && !websiteUrl) {
-      return NextResponse.json(
-        { error: "This school has no athletics site or general website on file to read from. Add one via Quick Fix, then try again." },
-        { status: 400 }
-      );
-    }
-
     const sources = [];
     if (athleticsUrl) sources.push({ label: "athletics site", url: school.athletics_url, fetchUrl: athleticsUrl });
     if (websiteUrl) sources.push({ label: "general website", url: school.website, fetchUrl: websiteUrl });
 
-    const fetched = await Promise.all(
-      sources.map(async (src) => {
-        const result = await fetchPageText(src.fetchUrl);
-        return { ...src, result };
-      })
-    );
+    // No exact-phrase quoting around school.name, same reasoning as the
+    // athletics/MaxPreps searches -- a school's public-facing name in
+    // search results sometimes differs slightly from the legal/CSD name.
+    const searchQuery = `${school.name} ${school.city || ""} ${school.state || ""} head football coach`;
+
+    const [fetched, searchResults] = await Promise.all([
+      Promise.all(
+        sources.map(async (src) => {
+          const result = await fetchPageText(src.fetchUrl);
+          return { ...src, result };
+        })
+      ),
+      searchWeb(searchQuery, serperKey),
+    ]);
 
     const usableBlocks = fetched.filter((f) => f.result.ok && f.result.text);
-    if (usableBlocks.length === 0) {
-      const failure = fetched[0];
-      const reason = failure?.result?.timedOut
-        ? "took too long to respond"
-        : failure?.result?.httpStatus
-        ? `responded with HTTP ${failure.result.httpStatus}`
-        : "could not be reached";
-      return NextResponse.json({ error: `Could not read this school's site right now -- it ${reason}. Try again in a moment, or check the URL on file.` }, { status: 502 });
+    if (usableBlocks.length === 0 && searchResults.length === 0) {
+      return NextResponse.json(
+        { error: "Couldn't find anything about this school's football staff online right now. Try again in a moment, or add a website/athletics URL via Quick Fix." },
+        { status: 502 }
+      );
     }
 
-    const textBlocks = usableBlocks
-      .map((b) => `--- Text from the ${b.label} (${b.url}) ---\n${b.result.text.slice(0, MAX_CHARS_PER_SOURCE)}`)
-      .join("\n\n");
+    const pageTextBlocks = usableBlocks.map(
+      (b) => `--- Full text from the ${b.label} (${b.url}) ---\n${b.result.text.slice(0, MAX_CHARS_PER_SOURCE)}`
+    );
+    const searchBlock =
+      searchResults.length > 0
+        ? `--- Web search results for "${searchQuery}" ---\n${searchResults
+            .map((r, i) => `${i + 1}. ${r.title} (${r.link})\n   ${r.snippet}`)
+            .join("\n")}`
+        : null;
+    const textBlocks = [...pageTextBlocks, searchBlock].filter(Boolean).join("\n\n");
 
     const currentlyOnFile = [
       school.hc_first_name || school.hc_last_name ? `Head coach on file: ${[school.hc_first_name, school.hc_last_name].filter(Boolean).join(" ")}` : "Head coach on file: none",
@@ -208,6 +266,8 @@ export async function POST(req, { params }) {
       return NextResponse.json({ error: "Could not parse the AI response. Please try again." }, { status: 502 });
     }
 
+    const defaultSource = [...usableBlocks.map((b) => b.label), searchResults.length > 0 ? "web search" : null].filter(Boolean).join(" + ");
+
     return NextResponse.json({
       hc_first_name: (parsed.hc_first_name || "").toString().trim(),
       hc_last_name: (parsed.hc_last_name || "").toString().trim(),
@@ -215,7 +275,7 @@ export async function POST(req, { params }) {
       hc_office: (parsed.hc_office || "").toString().trim(),
       hc_cell: (parsed.hc_cell || "").toString().trim(),
       confidence: ["high", "medium", "low"].includes(parsed.confidence) ? parsed.confidence : "low",
-      source: (parsed.source || usableBlocks.map((b) => b.label).join(" + ")).toString(),
+      source: (parsed.source || defaultSource || "web search").toString(),
       notes: (parsed.notes || "").toString().trim(),
     });
   } catch (err) {
