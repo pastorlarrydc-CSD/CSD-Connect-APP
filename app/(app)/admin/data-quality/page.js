@@ -49,6 +49,13 @@ const MAXPREPS_OPP_LOG_SCAN = 4000;
 const SCAN_CACHE_KEY = "csd_dq_scan_cache_v1";
 const SCAN_CACHE_STALE_MS = 6 * 60 * 60 * 1000; // 6 hours
 
+// Same idea as SCAN_CACHE_KEY, for the "Find & Edit a School" search below
+// -- the search box, its results, and whichever one (if any) has its Quick
+// Fix editor open. Without this, leaving the tab (a back-button press, an
+// accidental refresh -- "Open Profile" itself already opens in a new tab)
+// meant losing the search and landing back on an empty box.
+const FIND_SCHOOL_CACHE_KEY = "csd_dq_find_school_cache_v1";
+
 function fmtRelativeTime(date) {
   if (!date) return "";
   const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
@@ -266,6 +273,58 @@ export default function DataQualityPage() {
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
   const [hasSearched, setHasSearched] = useState(false);
+
+  // Restore the last "Find & Edit a School" search (and, if one was open,
+  // its Quick Fix editor) on mount -- see FIND_SCHOOL_CACHE_KEY above.
+  useEffect(() => {
+    try {
+      const raw = sessionStorage.getItem(FIND_SCHOOL_CACHE_KEY);
+      if (!raw) return;
+      const cached = JSON.parse(raw);
+      if (cached?.schoolQuery) setSchoolQuery(cached.schoolQuery);
+      if (Array.isArray(cached?.searchResults)) setSearchResults(cached.searchResults);
+      if (cached?.hasSearched) setHasSearched(true);
+      // Only reopen the editor if it belongs to one of the restored search
+      // results -- editingId is shared with the Flagged and Scan Results
+      // lists above, and neither of those is what's being restored here.
+      if (cached?.editingId != null && Array.isArray(cached?.searchResults) && cached.searchResults.some((s) => s.id === cached.editingId)) {
+        setEditingId(cached.editingId);
+        setEditValues(cached.editValues || {});
+        setCoachChangeFrom(cached.coachChangeFrom || null);
+        setAiSuggestInfo(cached.aiSuggestInfo || null);
+      }
+    } catch {
+      // Corrupt or unavailable cache -- fall back to the normal empty
+      // search box, same as if none existed.
+    }
+  }, []);
+
+  // Keep the cache in sync with the search box, its results, and whichever
+  // one (if any) has its Quick Fix editor open. Only captures
+  // editingId/editValues/coachChangeFrom/aiSuggestInfo when the open editor
+  // actually belongs to a search result, so editing a Flagged or Scan
+  // Results row elsewhere on this page doesn't get mistakenly saved here.
+  useEffect(() => {
+    try {
+      const editingASearchResult = editingId != null && searchResults.some((s) => s.id === editingId);
+      sessionStorage.setItem(
+        FIND_SCHOOL_CACHE_KEY,
+        JSON.stringify({
+          schoolQuery,
+          searchResults,
+          hasSearched,
+          editingId: editingASearchResult ? editingId : null,
+          editValues: editingASearchResult ? editValues : null,
+          coachChangeFrom: editingASearchResult ? coachChangeFrom : null,
+          aiSuggestInfo: editingASearchResult ? aiSuggestInfo : null,
+        })
+      );
+    } catch {
+      // Storage full/unavailable -- search still works for this tab, it
+      // just won't survive leaving and coming back. Not worth surfacing an
+      // error for.
+    }
+  }, [schoolQuery, searchResults, hasSearched, editingId, editValues, coachChangeFrom, aiSuggestInfo]);
 
   // Data-quality scan CSV export/import -- lets Larry pull the whole
   // review queue into Excel/Sheets, fix records there, and bring the
@@ -1369,7 +1428,7 @@ export default function DataQualityPage() {
   // places that don't have a flag to confirm against. Doesn't touch
   // confidence_score directly -- the database recalculates that on its own
   // the moment verification_status/last_verified_at change (see the
-  // trg_set_school_confidence_score trigger), so the on-screen % badge may
+  // trigger note in markVerified below), so the on-screen % badge may
   // lag a beat until the next search or scan picks up the fresh value.
   async function markVerified(school) {
     setMarkingVerifiedId(school.id);
