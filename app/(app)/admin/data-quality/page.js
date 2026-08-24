@@ -511,6 +511,20 @@ export default function DataQualityPage() {
   // recomputed on every render so flipping the dropdown needs no re-fetch.
   const sortedCoachChanges = coachChangeSort === "oldest" ? [...coachChanges].reverse() : coachChanges;
 
+  // Quick lookup of the most recent coach-field change per school, built
+  // from the same coachChanges log the Coach Change History card below
+  // reads from. Lets every editable row -- Find & Edit a School, Needs
+  // Re-check, Flagged, and the Review Queue -- show a "you already changed
+  // this" badge, so working through a list doesn't risk re-entering a
+  // coach that was already recorded (either via Mark Coach Change or a
+  // Quick Fix that happened to touch a coach field). coachChanges already
+  // comes back newest-first from loadCoachChanges, so the first entry seen
+  // per school here is its most recent change.
+  const recentCoachChangeBySchool = new Map();
+  coachChanges.forEach((g) => {
+    if (!recentCoachChangeBySchool.has(g.school_id)) recentCoachChangeBySchool.set(g.school_id, g);
+  });
+
   const loadNeedsRecheck = useCallback(async () => {
     if (!canReview) {
       setLoadingNeedsRecheck(false);
@@ -1765,6 +1779,11 @@ export default function DataQualityPage() {
                   <span style={{ fontSize: 11, fontWeight: 600, color: confidenceColor(s.confidence_score ?? 0), marginLeft: 8 }}>
                     {s.confidence_score ?? 0}% confidence
                   </span>
+                  {recentCoachChangeBySchool.has(s.id) && (
+                    <span className="badge" style={{ marginLeft: 8, color: "#1a7f37", background: "#e6f4ea" }}>
+                      ✓ Coach changed {fmtRelativeTime(new Date(recentCoachChangeBySchool.get(s.id).changed_at))}
+                    </span>
+                  )}
                   <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
                     {[s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ") || "no coach name"}
                     {s.hc_email ? ` · ${s.hc_email}` : ""}
@@ -2242,6 +2261,11 @@ export default function DataQualityPage() {
                         <span style={{ fontSize: 11, fontWeight: 600, color: confidenceColor(s.confidence_score ?? 0) }}>
                           {s.confidence_score ?? 0}% confidence
                         </span>
+                        {recentCoachChangeBySchool.has(s.id) && (
+                          <span className="badge" style={{ marginLeft: 8, color: "#1a7f37", background: "#e6f4ea" }}>
+                            ✓ Coach changed {fmtRelativeTime(new Date(recentCoachChangeBySchool.get(s.id).changed_at))}
+                          </span>
+                        )}
                       </div>
                       <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
                         {[s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ") || "no name"}
@@ -2446,9 +2470,16 @@ export default function DataQualityPage() {
                         {isAutomated ? "Automated · Coach-Change Radar" : "Manual flag"}
                       </span>
                       {s && (
-                        <span style={{ fontSize: 11, fontWeight: 600, color: confidenceColor(s.confidence_score ?? 0) }}>
-                          {s.confidence_score ?? 0}% confidence
-                        </span>
+                        <>
+                          <span style={{ fontSize: 11, fontWeight: 600, color: confidenceColor(s.confidence_score ?? 0) }}>
+                            {s.confidence_score ?? 0}% confidence
+                          </span>
+                          {recentCoachChangeBySchool.has(s.id) && (
+                            <span className="badge" style={{ marginLeft: 8, color: "#1a7f37", background: "#e6f4ea" }}>
+                              ✓ Coach changed {fmtRelativeTime(new Date(recentCoachChangeBySchool.get(s.id).changed_at))}
+                            </span>
+                          )}
+                        </>
                       )}
                     </div>
                     <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
@@ -2718,6 +2749,11 @@ export default function DataQualityPage() {
                         <span style={{ fontSize: 11, fontWeight: 600, color: confidenceColor(s.confidence_score ?? 0), marginLeft: 8 }}>
                           {s.confidence_score ?? 0}% confidence
                         </span>
+                        {recentCoachChangeBySchool.has(s.id) && (
+                          <span className="badge" style={{ marginLeft: 8, color: "#1a7f37", background: "#e6f4ea" }}>
+                            ✓ Coach changed {fmtRelativeTime(new Date(recentCoachChangeBySchool.get(s.id).changed_at))}
+                          </span>
+                        )}
                         <div style={{ marginTop: 4, display: "flex", flexWrap: "wrap", gap: 6 }}>
                           {row.issues
                             .filter((iss) => iss.actionable)
