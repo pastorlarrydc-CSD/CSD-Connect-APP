@@ -69,9 +69,17 @@ export async function POST(req, { params }) {
     }
     const resultsText = await resultsRes.text();
 
-    const rows = [];
+    // Each result line updates an EXISTING item row (created back in the
+    // "start run" step, one per school) -- so this is always an update,
+    // never an insert. Deliberately not using upsert(): coach_info_batch_items
+    // has other required columns (batch_run_id, school_id) that aren't known
+    // here, and Postgres validates NOT NULL constraints against the full
+    // candidate row on the insert path of an upsert even when the row will
+    // end up just being updated. A plain update() only ever touches the
+    // columns listed below, so it can't trip that.
     let succeeded = 0;
     let failed = 0;
+    let saveErr = null;
     for (const line of resultsText.split("\n")) {
       const trimmed = line.trim();
       if (!trimmed) continue;
@@ -85,28 +93,29 @@ export async function POST(req, { params }) {
       if (!match) continue;
       const itemId = Number(match[1]);
 
+      let patch;
       if (entry.result?.type === "succeeded") {
         const rawText = entry.result.message?.content?.[0]?.text || "";
         const parsed = parseModelJson(rawText);
         if (parsed) {
-          rows.push({ id: itemId, batch_run_id: runId, suggestion: normalizeSuggestion(parsed, "batch AI lookup"), suggestion_error: null });
+          patch = { suggestion: normalizeSuggestion(parsed, "batch AI lookup"), suggestion_error: null };
           succeeded++;
         } else {
-          rows.push({ id: itemId, batch_run_id: runId, suggestion: null, suggestion_error: "Could not parse the AI's response for this school." });
+          patch = { suggestion: null, suggestion_error: "Could not parse the AI's response for this school." };
           failed++;
         }
       } else {
         const kind = entry.result?.type || "unknown";
-        rows.push({ id: itemId, batch_run_id: runId, suggestion: null, suggestion_error: `Anthropic reported this request as "${kind}" -- it did not produce a suggestion.` });
+        patch = { suggestion: null, suggestion_error: `Anthropic reported this request as "${kind}" -- it did not produce a suggestion.` };
         failed++;
       }
+
+      const { error: itemErr } = await supabase.from("coach_info_batch_items").update(patch).eq("id", itemId);
+      if (itemErr && !saveErr) saveErr = itemErr;
     }
 
-    if (rows.length > 0) {
-      const { error: upsertErr } = await supabase.from("coach_info_batch_items").upsert(rows, { onConflict: "id" });
-      if (upsertErr) {
-        return NextResponse.json({ error: upsertErr.message || "Downloaded results but could not save them." }, { status: 500 });
-      }
+    if (saveErr) {
+      return NextResponse.json({ error: saveErr.message || "Downloaded results but could not save all of them." }, { status: 500 });
     }
 
     const { error: updateErr } = await supabase
