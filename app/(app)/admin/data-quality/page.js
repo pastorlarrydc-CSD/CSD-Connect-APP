@@ -274,6 +274,21 @@ export default function DataQualityPage() {
   const [aiSuggesting, setAiSuggesting] = useState(false);
   const [aiSuggestError, setAiSuggestError] = useState("");
   const [aiSuggestInfo, setAiSuggestInfo] = useState(null); // {confidence, source, notes}
+  const [discoveringSocial, setDiscoveringSocial] = useState(false);
+  const [discoverSocialError, setDiscoverSocialError] = useState("");
+  const [socialSuggestions, setSocialSuggestions] = useState({ twitter: [], facebook: [] });
+
+  // Lets a reviewer bookmark a school to revisit later -- an uncertain AI
+  // suggestion, a social link that might belong to the wrong person,
+  // anything worth a second look that is not a "fix it right now" issue.
+  // Independent of the Quick Fix editor (isEditing/editValues) -- this is
+  // its own small inline form, keyed by school id like editingId is.
+  const [reviewDraftId, setReviewDraftId] = useState(null);
+  const [reviewDraftNote, setReviewDraftNote] = useState("");
+  const [markingReviewId, setMarkingReviewId] = useState(null);
+  const [markReviewError, setMarkReviewError] = useState("");
+  const [reviewMarked, setReviewMarked] = useState([]);
+  const [loadingReviewMarked, setLoadingReviewMarked] = useState(true);
 
   // "Find & Edit a School" -- a standalone lookup so any school can be
   // reopened for a Quick Fix at any time, not just ones currently flagged
@@ -430,7 +445,7 @@ export default function DataQualityPage() {
     setLoadingFlags(true);
     const { data } = await supabase
       .from("school_flags")
-      .select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,maxpreps_url,athletics_url,website,verification_status,confidence_score), colleges:flagged_by_college_id(name)")
+      .select("*, schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,needs_review,needs_review_note,needs_review_marked_at,maxpreps_url,athletics_url,website,verification_status,confidence_score), colleges:flagged_by_college_id(name)")
       .eq("status", "pending")
       .order("created_at", { ascending: true });
     setFlaggedQueue(data || []);
@@ -538,7 +553,7 @@ export default function DataQualityPage() {
     const cutoff = new Date(Date.now() - RECHECK_CUTOFF_DAYS * 24 * 60 * 60 * 1000).toISOString();
     const { data } = await supabase
       .from("schools")
-      .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,maxpreps_url,athletics_url,website,verification_status,confidence_score,last_verified_at")
+      .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,needs_review,needs_review_note,needs_review_marked_at,maxpreps_url,athletics_url,website,verification_status,confidence_score,last_verified_at")
       .eq("verification_status", "verified")
       .lt("last_verified_at", cutoff)
       .order("last_verified_at", { ascending: true })
@@ -550,6 +565,26 @@ export default function DataQualityPage() {
   useEffect(() => {
     loadNeedsRecheck();
   }, [loadNeedsRecheck]);
+
+  const loadReviewMarked = useCallback(async () => {
+    if (!canReview) {
+      setLoadingReviewMarked(false);
+      return;
+    }
+    setLoadingReviewMarked(true);
+    const { data } = await supabase
+      .from("schools")
+      .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,maxpreps_url,athletics_url,website,verification_status,confidence_score,needs_review_note,needs_review_marked_at")
+      .eq("needs_review", true)
+      .order("needs_review_marked_at", { ascending: false })
+      .limit(RECHECK_LIMIT);
+    setReviewMarked(data || []);
+    setLoadingReviewMarked(false);
+  }, [supabase, canReview]);
+
+  useEffect(() => {
+    loadReviewMarked();
+  }, [loadReviewMarked]);
 
   const loadUpcomingQueue = useCallback(async () => {
     if (!canReview) {
@@ -858,7 +893,7 @@ export default function DataQualityPage() {
     for (;;) {
       const { data, error } = await supabase
         .from("schools")
-        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,lat,lon,verification_status,maxpreps_url,athletics_url,website,confidence_score")
+        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,needs_review,needs_review_note,needs_review_marked_at,lat,lon,verification_status,maxpreps_url,athletics_url,website,confidence_score")
         .order("id", { ascending: true })
         .range(from, from + PAGE_SIZE - 1);
       if (error) throw error;
@@ -879,7 +914,7 @@ export default function DataQualityPage() {
     try {
       const { data, error } = await supabase
         .from("schools")
-        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,maxpreps_url,athletics_url,website,verification_status,confidence_score")
+        .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,needs_review,needs_review_note,needs_review_marked_at,maxpreps_url,athletics_url,website,verification_status,confidence_score")
         .ilike("name", `%${q}%`)
         .order("name")
         .limit(25);
@@ -1258,6 +1293,8 @@ export default function DataQualityPage() {
     setSuggestions([]);
     setDiscoverAthleticsError("");
     setAthleticsSuggestions([]);
+    setDiscoverSocialError("");
+    setSocialSuggestions({ twitter: [], facebook: [] });
     setAiSuggestError("");
     setAiSuggestInfo(null);
     setEditValues({
@@ -1287,6 +1324,8 @@ export default function DataQualityPage() {
     setSuggestions([]);
     setDiscoverAthleticsError("");
     setAthleticsSuggestions([]);
+    setDiscoverSocialError("");
+    setSocialSuggestions({ twitter: [], facebook: [] });
     setAiSuggestError("");
     setAiSuggestInfo(null);
     setEditValues({
@@ -1310,6 +1349,8 @@ export default function DataQualityPage() {
     setSuggestions([]);
     setDiscoverAthleticsError("");
     setAthleticsSuggestions([]);
+    setDiscoverSocialError("");
+    setSocialSuggestions({ twitter: [], facebook: [] });
     setAiSuggestError("");
     setAiSuggestInfo(null);
   }
@@ -1421,6 +1462,45 @@ export default function DataQualityPage() {
     } finally {
       setAiSuggesting(false);
     }
+  }
+
+  // Dedicated search for the coach's Twitter/X and Facebook, instead of
+  // hoping the athletics/website fetch or the general search happens to
+  // surface one as visible text (see discover-coach-info's htmlToText --
+  // it strips all HTML including hrefs, so an icon-only social link is
+  // invisible to that passive extraction). Runs two targeted Serper
+  // searches scoped to the coach's own name plus the school, one per
+  // platform, and hands back candidates for a human to pick from -- same
+  // non-authoritative, pick-a-link pattern as Find MaxPreps/Find
+  // Athletics, not another AI call. Needs a coach name to search on, so
+  // results will be empty/poor until first/last name is filled in (from
+  // Suggest Coach Info, Mark Coach Change, or typed in by hand).
+  async function discoverSocial(school) {
+    setDiscoveringSocial(true);
+    setDiscoverSocialError("");
+    setSocialSuggestions({ twitter: [], facebook: [] });
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const res = await fetch(`/api/schools/${school.id}/discover-social`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session?.access_token}` },
+        body: JSON.stringify({ hc_first_name: editValues.hc_first_name, hc_last_name: editValues.hc_last_name }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || "Could not search for social media.");
+      setSocialSuggestions({ twitter: json.twitter || [], facebook: json.facebook || [] });
+      if (!json.twitter?.length && !json.facebook?.length) setDiscoverSocialError("Nothing turned up for either platform. Try searching directly and paste the link in.");
+    } catch (err) {
+      setDiscoverSocialError(err.message || "Could not search for social media.");
+    } finally {
+      setDiscoveringSocial(false);
+    }
+  }
+  function pickSocialSuggestion(field, link) {
+    setEditValues((prev) => ({ ...prev, [field]: link }));
+    setSocialSuggestions((prev) => ({ ...prev, [field === "hc_twitter" ? "twitter" : "facebook"]: [] }));
   }
 
   async function resolvePendingFlags(schoolId) {
@@ -1537,6 +1617,72 @@ export default function DataQualityPage() {
       setMarkVerifiedError(err.message || "Could not mark this school verified.");
     } finally {
       setMarkingVerifiedId(null);
+    }
+  }
+
+  // Lets a reviewer bookmark a school to come back to -- for anything
+  // short of an actual data problem worth a Quick Fix right now: an AI
+  // suggestion that felt uncertain, a social link that might belong to
+  // the wrong person, a school worth a second pair of eyes. Distinct from
+  // the automated "Flagged as Possibly Outdated" queue (Coach-Change
+  // Radar / coach-submitted corrections) -- this is purely a human's own
+  // "come back to this" marker, with an optional note so whoever picks it
+  // up later knows what to check. Direct write to schools, same as
+  // markVerified above (verifier/sysadmin have RLS write access).
+  function startMarkForReview(school) {
+    setReviewDraftId(school.id);
+    setReviewDraftNote("");
+    setMarkReviewError("");
+  }
+  function cancelMarkForReview() {
+    setReviewDraftId(null);
+    setReviewDraftNote("");
+  }
+  async function saveMarkForReview(school) {
+    setMarkingReviewId(school.id);
+    setMarkReviewError("");
+    try {
+      const update = {
+        needs_review: true,
+        needs_review_note: reviewDraftNote.trim() || null,
+        needs_review_marked_at: new Date().toISOString(),
+        needs_review_marked_by: user.id,
+      };
+      const { error } = await supabase.from("schools").update(update).eq("id", school.id);
+      if (error) throw error;
+      setSearchResults((prev) => prev.map((s) => (s.id === school.id ? { ...s, ...update } : s)));
+      setNeedsRecheck((prev) => prev.map((s) => (s.id === school.id ? { ...s, ...update } : s)));
+      setResult((prev) => {
+        if (!prev) return prev;
+        return { ...prev, flagged: prev.flagged.map((r) => (r.school?.id === school.id ? { ...r, school: { ...r.school, ...update } } : r)) };
+      });
+      setReviewDraftId(null);
+      setReviewDraftNote("");
+      loadReviewMarked();
+    } catch (err) {
+      setMarkReviewError(err.message || "Could not mark this school for review.");
+    } finally {
+      setMarkingReviewId(null);
+    }
+  }
+  async function unmarkForReview(school) {
+    setMarkingReviewId(school.id);
+    setMarkReviewError("");
+    try {
+      const update = { needs_review: false, needs_review_note: null, needs_review_marked_at: null, needs_review_marked_by: null };
+      const { error } = await supabase.from("schools").update(update).eq("id", school.id);
+      if (error) throw error;
+      setSearchResults((prev) => prev.map((s) => (s.id === school.id ? { ...s, ...update } : s)));
+      setNeedsRecheck((prev) => prev.map((s) => (s.id === school.id ? { ...s, ...update } : s)));
+      setResult((prev) => {
+        if (!prev) return prev;
+        return { ...prev, flagged: prev.flagged.map((r) => (r.school?.id === school.id ? { ...r, school: { ...r.school, ...update } } : r)) };
+      });
+      setReviewMarked((prev) => prev.filter((s) => s.id !== school.id));
+    } catch (err) {
+      setMarkReviewError(err.message || "Could not unmark this school.");
+    } finally {
+      setMarkingReviewId(null);
     }
   }
 
@@ -1803,6 +1949,11 @@ export default function DataQualityPage() {
                       ✓ Coach changed {fmtRelativeTime(new Date(recentCoachChangeBySchool.get(s.id).changed_at))}
                     </span>
                   )}
+                  {s.needs_review && (
+                    <span className="badge" style={{ marginLeft: 8, color: "#8a6100", background: "#fff4dc" }} title={s.needs_review_note || "Marked for review"}>
+                      🔖 Marked for review
+                    </span>
+                  )}
                   <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
                     {[s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ") || "no coach name"}
                     {s.hc_email ? ` · ${s.hc_email}` : ""}
@@ -1815,6 +1966,15 @@ export default function DataQualityPage() {
                     <>
                       <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
                       <button className="btn btn-sm" onClick={() => startCoachChange(s)}>Mark Coach Change</button>
+                      {s.needs_review ? (
+                        <button className="btn btn-sm" disabled={markingReviewId === s.id} onClick={() => unmarkForReview(s)}>
+                          {markingReviewId === s.id ? "Updating…" : "Unmark Review"}
+                        </button>
+                      ) : (
+                        <button className="btn btn-sm" disabled={markingReviewId === s.id} onClick={() => startMarkForReview(s)}>
+                          Mark for Review
+                        </button>
+                      )}
                       <button className="btn btn-sm" disabled={markingVerifiedId === s.id} onClick={() => markVerified(s)}>
                         {markingVerifiedId === s.id ? "Marking…" : "Mark Verified"}
                       </button>
@@ -1828,6 +1988,26 @@ export default function DataQualityPage() {
                   Recording a new head coach at <strong>{s.name}</strong>. Outgoing: {[coachChangeFrom.hc_first_name, coachChangeFrom.hc_last_name].filter(Boolean).join(" ") || "no name on file"}
                   {coachChangeFrom.hc_email ? ` · ${coachChangeFrom.hc_email}` : ""}
                   {coachChangeFrom.hc_cell ? ` · ${fmtPhone(coachChangeFrom.hc_cell)}` : ""}. Fields left blank below will be cleared, not carried over.
+                </div>
+              )}
+              {reviewDraftId === s.id && (
+                <div className="notice" style={{ marginTop: 8, fontSize: 12.5 }}>
+                  <div style={{ marginBottom: 6 }}>What should the next person check on <strong>{s.name}</strong>? (optional)</div>
+                  <input
+                    value={reviewDraftNote}
+                    onChange={(e) => setReviewDraftNote(e.target.value)}
+                    placeholder="e.g. double-check this Twitter handle"
+                    style={{ width: "100%", marginBottom: 8 }}
+                  />
+                  {markReviewError && <div style={{ color: "#b3261e", marginBottom: 8 }}>{markReviewError}</div>}
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button className="btn btn-sm btn-gold" disabled={markingReviewId === s.id} onClick={() => saveMarkForReview(s)}>
+                      {markingReviewId === s.id ? "Saving…" : "Save"}
+                    </button>
+                    <button type="button" className="btn btn-sm" onClick={cancelMarkForReview} disabled={markingReviewId === s.id}>
+                      Cancel
+                    </button>
+                  </div>
                 </div>
               )}
 
@@ -1888,6 +2068,38 @@ export default function DataQualityPage() {
                       <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
                         AI suggestion ({aiSuggestInfo.confidence} confidence, from the {aiSuggestInfo.source}) filled into the fields below — review before saving.
                         {aiSuggestInfo.notes ? ` ${aiSuggestInfo.notes}` : ""}
+                      </div>
+                    )}
+                    <button type="button" className="btn btn-sm" disabled={discoveringSocial} onClick={() => discoverSocial(s)} style={{ marginLeft: 6 }}>
+                      {discoveringSocial ? "Searching…" : "Find Social Media"}
+                    </button>
+                    {discoverSocialError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverSocialError}</div>}
+                    {(socialSuggestions.twitter.length > 0 || socialSuggestions.facebook.length > 0) && (
+                      <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 10 }}>
+                        {socialSuggestions.twitter.length > 0 && (
+                          <div>
+                            <div style={{ fontSize: 11, fontWeight: 600, color: "#697386", marginBottom: 4 }}>TWITTER / X RESULTS</div>
+                            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                              {socialSuggestions.twitter.map((sugg) => (
+                                <button type="button" key={sugg.link} className="btn btn-sm" style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }} onClick={() => pickSocialSuggestion("hc_twitter", sugg.link)}>
+                                  {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
+                        {socialSuggestions.facebook.length > 0 && (
+                          <div>
+                            <div style={{ fontSize: 11, fontWeight: 600, color: "#697386", marginBottom: 4 }}>FACEBOOK RESULTS</div>
+                            <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                              {socialSuggestions.facebook.map((sugg) => (
+                                <button type="button" key={sugg.link} className="btn btn-sm" style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }} onClick={() => pickSocialSuggestion("hc_facebook", sugg.link)}>
+                                  {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
@@ -2285,6 +2497,11 @@ export default function DataQualityPage() {
                             ✓ Coach changed {fmtRelativeTime(new Date(recentCoachChangeBySchool.get(s.id).changed_at))}
                           </span>
                         )}
+                        {s.needs_review && (
+                          <span className="badge" style={{ marginLeft: 8, color: "#8a6100", background: "#fff4dc" }} title={s.needs_review_note || "Marked for review"}>
+                            🔖 Marked for review
+                          </span>
+                        )}
                       </div>
                       <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
                         {[s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ") || "no name"}
@@ -2298,6 +2515,15 @@ export default function DataQualityPage() {
                         <>
                           <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
                           <button className="btn btn-sm" onClick={() => startCoachChange(s)}>Mark Coach Change</button>
+                          {s.needs_review ? (
+                            <button className="btn btn-sm" disabled={markingReviewId === s.id} onClick={() => unmarkForReview(s)}>
+                              {markingReviewId === s.id ? "Updating…" : "Unmark Review"}
+                            </button>
+                          ) : (
+                            <button className="btn btn-sm" disabled={markingReviewId === s.id} onClick={() => startMarkForReview(s)}>
+                              Mark for Review
+                            </button>
+                          )}
                           <button className="btn btn-sm" disabled={markingVerifiedId === s.id} onClick={() => markVerified(s)}>
                             {markingVerifiedId === s.id ? "Marking…" : "Mark Verified"}
                           </button>
@@ -2311,6 +2537,26 @@ export default function DataQualityPage() {
                       Recording a new head coach at <strong>{s.name}</strong>. Outgoing: {[coachChangeFrom.hc_first_name, coachChangeFrom.hc_last_name].filter(Boolean).join(" ") || "no name on file"}
                       {coachChangeFrom.hc_email ? ` · ${coachChangeFrom.hc_email}` : ""}
                       {coachChangeFrom.hc_cell ? ` · ${fmtPhone(coachChangeFrom.hc_cell)}` : ""}. Fields left blank below will be cleared, not carried over.
+                    </div>
+                  )}
+                  {reviewDraftId === s.id && (
+                    <div className="notice" style={{ marginTop: 8, fontSize: 12.5 }}>
+                      <div style={{ marginBottom: 6 }}>What should the next person check on <strong>{s.name}</strong>? (optional)</div>
+                      <input
+                        value={reviewDraftNote}
+                        onChange={(e) => setReviewDraftNote(e.target.value)}
+                        placeholder="e.g. double-check this Twitter handle"
+                        style={{ width: "100%", marginBottom: 8 }}
+                      />
+                      {markReviewError && <div style={{ color: "#b3261e", marginBottom: 8 }}>{markReviewError}</div>}
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button className="btn btn-sm btn-gold" disabled={markingReviewId === s.id} onClick={() => saveMarkForReview(s)}>
+                          {markingReviewId === s.id ? "Saving…" : "Save"}
+                        </button>
+                        <button type="button" className="btn btn-sm" onClick={cancelMarkForReview} disabled={markingReviewId === s.id}>
+                          Cancel
+                        </button>
+                      </div>
                     </div>
                   )}
 
@@ -2373,6 +2619,38 @@ export default function DataQualityPage() {
                             {aiSuggestInfo.notes ? ` ${aiSuggestInfo.notes}` : ""}
                           </div>
                         )}
+                        <button type="button" className="btn btn-sm" disabled={discoveringSocial} onClick={() => discoverSocial(s)} style={{ marginLeft: 6 }}>
+                          {discoveringSocial ? "Searching…" : "Find Social Media"}
+                        </button>
+                        {discoverSocialError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverSocialError}</div>}
+                        {(socialSuggestions.twitter.length > 0 || socialSuggestions.facebook.length > 0) && (
+                          <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 10 }}>
+                            {socialSuggestions.twitter.length > 0 && (
+                              <div>
+                                <div style={{ fontSize: 11, fontWeight: 600, color: "#697386", marginBottom: 4 }}>TWITTER / X RESULTS</div>
+                                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                                  {socialSuggestions.twitter.map((sugg) => (
+                                    <button type="button" key={sugg.link} className="btn btn-sm" style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }} onClick={() => pickSocialSuggestion("hc_twitter", sugg.link)}>
+                                      {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                            {socialSuggestions.facebook.length > 0 && (
+                              <div>
+                                <div style={{ fontSize: 11, fontWeight: 600, color: "#697386", marginBottom: 4 }}>FACEBOOK RESULTS</div>
+                                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                                  {socialSuggestions.facebook.map((sugg) => (
+                                    <button type="button" key={sugg.link} className="btn btn-sm" style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }} onClick={() => pickSocialSuggestion("hc_facebook", sugg.link)}>
+                                      {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
                       </div>
                       {saveError && <div className="notice danger" style={{ marginBottom: 8 }}>{saveError}</div>}
                       <div style={{ display: "flex", gap: 8 }}>
@@ -2391,6 +2669,179 @@ export default function DataQualityPage() {
             {needsRecheck.length > DISPLAY_CAP && (
               <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
                 Showing the oldest {DISPLAY_CAP} of {needsRecheck.length.toLocaleString()} — download the CSV for the full list.
+              </div>
+            )}
+          </>
+        )}
+      </div>
+      <div className="card" style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+          <div>
+            <h3 style={{ marginBottom: 4 }}>Marked for Review ({reviewMarked.length})</h3>
+            <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
+              Schools a reviewer bookmarked to come back to — an uncertain AI suggestion, a link that might belong to the wrong person, anything worth a second look. Not automated; these only show up here because someone clicked "Mark for Review." Most recently marked first.
+            </p>
+          </div>
+        </div>
+        {markReviewError && <div className="notice danger" style={{ marginBottom: 10 }}>{markReviewError}</div>}
+        {loadingReviewMarked ? (
+          <div className="empty-state">Loading…</div>
+        ) : reviewMarked.length === 0 ? (
+          <div className="empty-state">Nothing marked right now — click "Mark for Review" on any school to bookmark it here.</div>
+        ) : (
+          <>
+            {reviewMarked.slice(0, DISPLAY_CAP).map((s) => {
+              const isEditing = editingId === s.id;
+              return (
+                <div className="log-item" key={s.id} style={{ paddingBottom: 12 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+                    <div>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                        <strong>{s.name}</strong> — {s.city}, {s.state}
+                        <span style={{ fontSize: 11, fontWeight: 600, color: confidenceColor(s.confidence_score ?? 0) }}>
+                          {s.confidence_score ?? 0}% confidence
+                        </span>
+                        {recentCoachChangeBySchool.has(s.id) && (
+                          <span className="badge" style={{ marginLeft: 8, color: "#1a7f37", background: "#e6f4ea" }}>
+                            ✓ Coach changed {fmtRelativeTime(new Date(recentCoachChangeBySchool.get(s.id).changed_at))}
+                          </span>
+                        )}
+                        {s.needs_review_marked_at && (
+                          <span className="badge" style={{ marginLeft: 8, color: "#8a6100", background: "#fff4dc" }}>
+                            🔖 Marked {fmtRelativeTime(new Date(s.needs_review_marked_at))}
+                          </span>
+                        )}
+                      </div>
+                      <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
+                        {[s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ") || "no coach name"}
+                        {s.hc_email ? ` · ${s.hc_email}` : ""}
+                        {s.hc_cell ? ` · ${fmtPhone(s.hc_cell)}` : ""}
+                      </div>
+                      {s.needs_review_note && (
+                        <div style={{ fontSize: 12.5, color: "#8a6100", marginTop: 4, fontStyle: "italic" }}>
+                          “{s.needs_review_note}”
+                        </div>
+                      )}
+                    </div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <Link href={`/schools/${s.id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
+                      {!isEditing && (
+                        <>
+                          <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
+                          <button className="btn btn-sm" onClick={() => startCoachChange(s)}>Mark Coach Change</button>
+                          <button className="btn btn-sm" disabled={markingReviewId === s.id} onClick={() => unmarkForReview(s)}>
+                            {markingReviewId === s.id ? "Updating…" : "Unmark Review"}
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
+
+                  {isEditing && coachChangeFrom?.id === s.id && (
+                    <div className="notice" style={{ marginTop: 8, fontSize: 12.5 }}>
+                      Recording a new head coach at <strong>{s.name}</strong>. Outgoing: {[coachChangeFrom.hc_first_name, coachChangeFrom.hc_last_name].filter(Boolean).join(" ") || "no name on file"}
+                      {coachChangeFrom.hc_email ? ` · ${coachChangeFrom.hc_email}` : ""}
+                      {coachChangeFrom.hc_cell ? ` · ${fmtPhone(coachChangeFrom.hc_cell)}` : ""}. Fields left blank below will be cleared, not carried over.
+                    </div>
+                  )}
+
+                  {isEditing && (
+                    <div style={{ background: "#f7f8fa", border: "1px solid #dde1e7", borderRadius: 8, padding: 10, marginTop: 8 }}>
+                      <div className="grid grid-2" style={{ marginBottom: 8 }}>
+                        {EDIT_FIELDS.map(([field, label]) => (
+                          <div className="form-field" key={field} style={{ marginBottom: 0 }}>
+                            <label>{label}</label>
+                            <input value={editValues[field] || ""} onChange={(e) => setEditValues((prev) => ({ ...prev, [field]: e.target.value }))} />
+                          </div>
+                        ))}
+                      </div>
+                      <div style={{ marginBottom: 8 }}>
+                        <button type="button" className="btn btn-sm" disabled={discovering} onClick={() => discoverMaxPreps(s)}>
+                          {discovering ? "Searching…" : "Find MaxPreps page"}
+                        </button>
+                        {discoverError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverError}</div>}
+                        {suggestions.length > 0 && (
+                          <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                            {suggestions.map((sugg) => (
+                              <button type="button" key={sugg.link} className="btn btn-sm" style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }} onClick={() => pickSuggestion(sugg.link)}>
+                                {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                        <button type="button" className="btn btn-sm" disabled={discoveringAthletics} onClick={() => discoverAthletics(s)} style={{ marginLeft: 6 }}>
+                          {discoveringAthletics ? "Searching…" : "Find Athletics page"}
+                        </button>
+                        {discoverAthleticsError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverAthleticsError}</div>}
+                        {athleticsSuggestions.length > 0 && (
+                          <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                            {athleticsSuggestions.map((sugg) => (
+                              <button type="button" key={sugg.link} className="btn btn-sm" style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }} onClick={() => pickAthleticsSuggestion(sugg.link)}>
+                                {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                        <button type="button" className="btn btn-sm" disabled={aiSuggesting} onClick={() => suggestCoachInfo(s)} style={{ marginLeft: 6 }}>
+                          {aiSuggesting ? "Looking…" : "Suggest Coach Info (AI)"}
+                        </button>
+                        {aiSuggestError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{aiSuggestError}</div>}
+                        {aiSuggestInfo && (
+                          <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
+                            AI suggestion ({aiSuggestInfo.confidence} confidence, from the {aiSuggestInfo.source}) filled into the fields below — review before saving.
+                            {aiSuggestInfo.notes ? ` ${aiSuggestInfo.notes}` : ""}
+                          </div>
+                        )}
+                        <button type="button" className="btn btn-sm" disabled={discoveringSocial} onClick={() => discoverSocial(s)} style={{ marginLeft: 6 }}>
+                          {discoveringSocial ? "Searching…" : "Find Social Media"}
+                        </button>
+                        {discoverSocialError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverSocialError}</div>}
+                        {(socialSuggestions.twitter.length > 0 || socialSuggestions.facebook.length > 0) && (
+                          <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 10 }}>
+                            {socialSuggestions.twitter.length > 0 && (
+                              <div>
+                                <div style={{ fontSize: 11, fontWeight: 600, color: "#697386", marginBottom: 4 }}>TWITTER / X RESULTS</div>
+                                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                                  {socialSuggestions.twitter.map((sugg) => (
+                                    <button type="button" key={sugg.link} className="btn btn-sm" style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }} onClick={() => pickSocialSuggestion("hc_twitter", sugg.link)}>
+                                      {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                            {socialSuggestions.facebook.length > 0 && (
+                              <div>
+                                <div style={{ fontSize: 11, fontWeight: 600, color: "#697386", marginBottom: 4 }}>FACEBOOK RESULTS</div>
+                                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                                  {socialSuggestions.facebook.map((sugg) => (
+                                    <button type="button" key={sugg.link} className="btn btn-sm" style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }} onClick={() => pickSocialSuggestion("hc_facebook", sugg.link)}>
+                                      {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                      {saveError && <div className="notice danger" style={{ marginBottom: 8 }}>{saveError}</div>}
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
+                          {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : "Save & Mark Verified"}
+                        </button>
+                        <button type="button" className="btn btn-sm" onClick={cancelEdit} disabled={saving === s.id}>
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+            {reviewMarked.length > DISPLAY_CAP && (
+              <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
+                Showing the most recently marked {DISPLAY_CAP} of {reviewMarked.length.toLocaleString()}.
               </div>
             )}
           </>
@@ -2498,6 +2949,11 @@ export default function DataQualityPage() {
                               ✓ Coach changed {fmtRelativeTime(new Date(recentCoachChangeBySchool.get(s.id).changed_at))}
                             </span>
                           )}
+                          {s.needs_review && (
+                            <span className="badge" style={{ marginLeft: 8, color: "#8a6100", background: "#fff4dc" }} title={s.needs_review_note || "Marked for review"}>
+                              🔖 Marked for review
+                            </span>
+                          )}
                         </>
                       )}
                     </div>
@@ -2517,6 +2973,15 @@ export default function DataQualityPage() {
                       <>
                         <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
                         <button className="btn btn-sm" onClick={() => startCoachChange(s)}>Mark Coach Change</button>
+                        {s.needs_review ? (
+                          <button className="btn btn-sm" disabled={markingReviewId === s.id} onClick={() => unmarkForReview(s)}>
+                            {markingReviewId === s.id ? "Updating…" : "Unmark Review"}
+                          </button>
+                        ) : (
+                          <button className="btn btn-sm" disabled={markingReviewId === s.id} onClick={() => startMarkForReview(s)}>
+                            Mark for Review
+                          </button>
+                        )}
                       </>
                     )}
                     <button className="btn btn-sm" disabled={flagActionId === flag.id} onClick={() => confirmAccurate(flag)}>
@@ -2530,6 +2995,26 @@ export default function DataQualityPage() {
                     Recording a new head coach at <strong>{s.name}</strong>. Outgoing: {[coachChangeFrom.hc_first_name, coachChangeFrom.hc_last_name].filter(Boolean).join(" ") || "no name on file"}
                     {coachChangeFrom.hc_email ? ` · ${coachChangeFrom.hc_email}` : ""}
                     {coachChangeFrom.hc_cell ? ` · ${fmtPhone(coachChangeFrom.hc_cell)}` : ""}. Fields left blank below will be cleared, not carried over.
+                  </div>
+                )}
+                {s && reviewDraftId === s.id && (
+                  <div className="notice" style={{ marginTop: 8, fontSize: 12.5 }}>
+                    <div style={{ marginBottom: 6 }}>What should the next person check on <strong>{s.name}</strong>? (optional)</div>
+                    <input
+                      value={reviewDraftNote}
+                      onChange={(e) => setReviewDraftNote(e.target.value)}
+                      placeholder="e.g. double-check this Twitter handle"
+                      style={{ width: "100%", marginBottom: 8 }}
+                    />
+                    {markReviewError && <div style={{ color: "#b3261e", marginBottom: 8 }}>{markReviewError}</div>}
+                    <div style={{ display: "flex", gap: 8 }}>
+                      <button className="btn btn-sm btn-gold" disabled={markingReviewId === s.id} onClick={() => saveMarkForReview(s)}>
+                        {markingReviewId === s.id ? "Saving…" : "Save"}
+                      </button>
+                      <button type="button" className="btn btn-sm" onClick={cancelMarkForReview} disabled={markingReviewId === s.id}>
+                        Cancel
+                      </button>
+                    </div>
                   </div>
                 )}
 
@@ -2590,6 +3075,38 @@ export default function DataQualityPage() {
                         <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
                           AI suggestion ({aiSuggestInfo.confidence} confidence, from the {aiSuggestInfo.source}) filled into the fields below — review before saving.
                           {aiSuggestInfo.notes ? ` ${aiSuggestInfo.notes}` : ""}
+                        </div>
+                      )}
+                      <button type="button" className="btn btn-sm" disabled={discoveringSocial} onClick={() => discoverSocial(s)} style={{ marginLeft: 6 }}>
+                        {discoveringSocial ? "Searching…" : "Find Social Media"}
+                      </button>
+                      {discoverSocialError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverSocialError}</div>}
+                      {(socialSuggestions.twitter.length > 0 || socialSuggestions.facebook.length > 0) && (
+                        <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 10 }}>
+                          {socialSuggestions.twitter.length > 0 && (
+                            <div>
+                              <div style={{ fontSize: 11, fontWeight: 600, color: "#697386", marginBottom: 4 }}>TWITTER / X RESULTS</div>
+                              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                                {socialSuggestions.twitter.map((sugg) => (
+                                  <button type="button" key={sugg.link} className="btn btn-sm" style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }} onClick={() => pickSocialSuggestion("hc_twitter", sugg.link)}>
+                                    {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          )}
+                          {socialSuggestions.facebook.length > 0 && (
+                            <div>
+                              <div style={{ fontSize: 11, fontWeight: 600, color: "#697386", marginBottom: 4 }}>FACEBOOK RESULTS</div>
+                              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                                {socialSuggestions.facebook.map((sugg) => (
+                                  <button type="button" key={sugg.link} className="btn btn-sm" style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }} onClick={() => pickSocialSuggestion("hc_facebook", sugg.link)}>
+                                    {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
@@ -2773,6 +3290,11 @@ export default function DataQualityPage() {
                             ✓ Coach changed {fmtRelativeTime(new Date(recentCoachChangeBySchool.get(s.id).changed_at))}
                           </span>
                         )}
+                        {s.needs_review && (
+                          <span className="badge" style={{ marginLeft: 8, color: "#8a6100", background: "#fff4dc" }} title={s.needs_review_note || "Marked for review"}>
+                            🔖 Marked for review
+                          </span>
+                        )}
                         <div style={{ marginTop: 4, display: "flex", flexWrap: "wrap", gap: 6 }}>
                           {row.issues
                             .filter((iss) => iss.actionable)
@@ -2789,6 +3311,15 @@ export default function DataQualityPage() {
                           <>
                             <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
                             <button className="btn btn-sm" onClick={() => startCoachChange(s)}>Mark Coach Change</button>
+                            {s.needs_review ? (
+                              <button className="btn btn-sm" disabled={markingReviewId === s.id} onClick={() => unmarkForReview(s)}>
+                                {markingReviewId === s.id ? "Updating…" : "Unmark Review"}
+                              </button>
+                            ) : (
+                              <button className="btn btn-sm" disabled={markingReviewId === s.id} onClick={() => startMarkForReview(s)}>
+                                Mark for Review
+                              </button>
+                            )}
                             <button className="btn btn-sm" disabled={markingVerifiedId === s.id} onClick={() => markVerified(s)}>
                               {markingVerifiedId === s.id ? "Marking…" : "Mark Verified"}
                             </button>
@@ -2802,6 +3333,26 @@ export default function DataQualityPage() {
                         Recording a new head coach at <strong>{s.name}</strong>. Outgoing: {[coachChangeFrom.hc_first_name, coachChangeFrom.hc_last_name].filter(Boolean).join(" ") || "no name on file"}
                         {coachChangeFrom.hc_email ? ` · ${coachChangeFrom.hc_email}` : ""}
                         {coachChangeFrom.hc_cell ? ` · ${fmtPhone(coachChangeFrom.hc_cell)}` : ""}. Fields left blank below will be cleared, not carried over.
+                      </div>
+                    )}
+                    {reviewDraftId === s.id && (
+                      <div className="notice" style={{ marginTop: 8, fontSize: 12.5 }}>
+                        <div style={{ marginBottom: 6 }}>What should the next person check on <strong>{s.name}</strong>? (optional)</div>
+                        <input
+                          value={reviewDraftNote}
+                          onChange={(e) => setReviewDraftNote(e.target.value)}
+                          placeholder="e.g. double-check this Twitter handle"
+                          style={{ width: "100%", marginBottom: 8 }}
+                        />
+                        {markReviewError && <div style={{ color: "#b3261e", marginBottom: 8 }}>{markReviewError}</div>}
+                        <div style={{ display: "flex", gap: 8 }}>
+                          <button className="btn btn-sm btn-gold" disabled={markingReviewId === s.id} onClick={() => saveMarkForReview(s)}>
+                            {markingReviewId === s.id ? "Saving…" : "Save"}
+                          </button>
+                          <button type="button" className="btn btn-sm" onClick={cancelMarkForReview} disabled={markingReviewId === s.id}>
+                            Cancel
+                          </button>
+                        </div>
                       </div>
                     )}
 
@@ -2865,6 +3416,38 @@ export default function DataQualityPage() {
                             <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
                               AI suggestion ({aiSuggestInfo.confidence} confidence, from the {aiSuggestInfo.source}) filled into the fields below — review before saving.
                               {aiSuggestInfo.notes ? ` ${aiSuggestInfo.notes}` : ""}
+                            </div>
+                          )}
+                          <button type="button" className="btn btn-sm" disabled={discoveringSocial} onClick={() => discoverSocial(s)} style={{ marginLeft: 6 }}>
+                            {discoveringSocial ? "Searching…" : "Find Social Media"}
+                          </button>
+                          {discoverSocialError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverSocialError}</div>}
+                          {(socialSuggestions.twitter.length > 0 || socialSuggestions.facebook.length > 0) && (
+                            <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 10 }}>
+                              {socialSuggestions.twitter.length > 0 && (
+                                <div>
+                                  <div style={{ fontSize: 11, fontWeight: 600, color: "#697386", marginBottom: 4 }}>TWITTER / X RESULTS</div>
+                                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                                    {socialSuggestions.twitter.map((sugg) => (
+                                      <button type="button" key={sugg.link} className="btn btn-sm" style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }} onClick={() => pickSocialSuggestion("hc_twitter", sugg.link)}>
+                                        {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
+                              {socialSuggestions.facebook.length > 0 && (
+                                <div>
+                                  <div style={{ fontSize: 11, fontWeight: 600, color: "#697386", marginBottom: 4 }}>FACEBOOK RESULTS</div>
+                                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                                    {socialSuggestions.facebook.map((sugg) => (
+                                      <button type="button" key={sugg.link} className="btn btn-sm" style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }} onClick={() => pickSocialSuggestion("hc_facebook", sugg.link)}>
+                                        {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                                      </button>
+                                    ))}
+                                  </div>
+                                </div>
+                              )}
                             </div>
                           )}
                         </div>
