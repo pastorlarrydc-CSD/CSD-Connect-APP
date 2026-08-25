@@ -89,15 +89,15 @@ export async function POST(req, { params }) {
         const rawText = entry.result.message?.content?.[0]?.text || "";
         const parsed = parseModelJson(rawText);
         if (parsed) {
-          rows.push({ id: itemId, suggestion: normalizeSuggestion(parsed, "batch AI lookup"), suggestion_error: null });
+          rows.push({ id: itemId, batch_run_id: runId, suggestion: normalizeSuggestion(parsed, "batch AI lookup"), suggestion_error: null });
           succeeded++;
         } else {
-          rows.push({ id: itemId, suggestion: null, suggestion_error: "Could not parse the AI's response for this school." });
+          rows.push({ id: itemId, batch_run_id: runId, suggestion: null, suggestion_error: "Could not parse the AI's response for this school." });
           failed++;
         }
       } else {
         const kind = entry.result?.type || "unknown";
-        rows.push({ id: itemId, suggestion: null, suggestion_error: `Anthropic reported this request as "${kind}" -- it did not produce a suggestion.` });
+        rows.push({ id: itemId, batch_run_id: runId, suggestion: null, suggestion_error: `Anthropic reported this request as "${kind}" -- it did not produce a suggestion.` });
         failed++;
       }
     }
