@@ -259,8 +259,11 @@ export default function AdminPage() {
               <Link href="/admin/bulk-update" className="btn btn-sm btn-primary" style={{ marginRight: 8 }}>
                 Bulk Update Schools (CSV)
               </Link>
-              <Link href="/admin/bulk-maxpreps" className="btn btn-sm btn-primary">
+              <Link href="/admin/bulk-maxpreps" className="btn btn-sm btn-primary" style={{ marginRight: 8 }}>
                 Bulk MaxPreps Discovery
+              </Link>
+              <Link href="/admin/bulk-athletics" className="btn btn-sm btn-primary">
+                Bulk Athletics Discovery
               </Link>
             </div>
           </div>
