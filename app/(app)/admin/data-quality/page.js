@@ -1555,7 +1555,14 @@ export default function DataQualityPage() {
       const changes = [];
       const update = { verification_status: "verified", last_verified_at: new Date().toISOString() };
       EDIT_FIELDS.forEach(([field]) => {
-        const newVal = editValues[field].trim() || null;
+        // Defensive default: a browser can still be holding an older cached
+        // editValues object (see the Find & Edit a School persistence
+        // effect below) saved before this field existed on EDIT_FIELDS --
+        // that cached object simply won't have this key, so editValues[field]
+        // comes back undefined rather than "". Falling back to "" here means
+        // a stale cache just treats a newly-added field as blank instead of
+        // crashing the save on .trim() of undefined.
+        const newVal = (editValues[field] || "").trim() || null;
         const oldVal = before[field] || null;
         if (newVal !== oldVal) {
           update[field] = newVal;
@@ -1830,7 +1837,7 @@ export default function DataQualityPage() {
                     {EDIT_FIELDS.map(([field, label]) => (
                       <div className="form-field" key={field} style={{ marginBottom: 0 }}>
                         <label>{label}</label>
-                        <input value={editValues[field]} onChange={(e) => setEditValues((prev) => ({ ...prev, [field]: e.target.value }))} />
+                        <input value={editValues[field] || ""} onChange={(e) => setEditValues((prev) => ({ ...prev, [field]: e.target.value }))} />
                       </div>
                     ))}
                   </div>
@@ -2313,7 +2320,7 @@ export default function DataQualityPage() {
                         {EDIT_FIELDS.map(([field, label]) => (
                           <div className="form-field" key={field} style={{ marginBottom: 0 }}>
                             <label>{label}</label>
-                            <input value={editValues[field]} onChange={(e) => setEditValues((prev) => ({ ...prev, [field]: e.target.value }))} />
+                            <input value={editValues[field] || ""} onChange={(e) => setEditValues((prev) => ({ ...prev, [field]: e.target.value }))} />
                           </div>
                         ))}
                       </div>
@@ -2532,7 +2539,7 @@ export default function DataQualityPage() {
                       {EDIT_FIELDS.map(([field, label]) => (
                         <div className="form-field" key={field} style={{ marginBottom: 0 }}>
                           <label>{label}</label>
-                          <input value={editValues[field]} onChange={(e) => setEditValues((prev) => ({ ...prev, [field]: e.target.value }))} />
+                          <input value={editValues[field] || ""} onChange={(e) => setEditValues((prev) => ({ ...prev, [field]: e.target.value }))} />
                         </div>
                       ))}
                     </div>
@@ -2805,7 +2812,7 @@ export default function DataQualityPage() {
                             <div className="form-field" key={field} style={{ marginBottom: 0 }}>
                               <label>{label}</label>
                               <input
-                                value={editValues[field]}
+                                value={editValues[field] || ""}
                                 onChange={(e) => setEditValues((prev) => ({ ...prev, [field]: e.target.value }))}
                               />
                             </div>
