@@ -59,6 +59,16 @@ export async function GET(req) {
   const startedAt = Date.now();
   const supabase = getSupabaseAdminClient();
 
+  // Kill switch -- lets the sweep be paused/resumed from the
+  // system_settings table (e.g. by CSD support) without a code change or
+  // redeploy. Missing row = treated as enabled, so this table being absent
+  // or not yet seeded never silently disables the sweep.
+  const { data: radarSetting } = await supabase.from("system_settings").select("value").eq("key", "coach_radar_enabled").maybeSingle();
+  if (radarSetting && radarSetting.value === false) {
+    console.log("cron recheck-schools: skipped -- coach_radar_enabled is false in system_settings");
+    return NextResponse.json({ skipped: true, reason: "Coach-Change Radar is currently suspended (system_settings.coach_radar_enabled = false)." });
+  }
+
   const { data: candidates, error: candErr } = await supabase
     .from("school_recheck_priority")
     .select("school_id, website, hc_first_name, hc_last_name, maxpreps_url, athletics_url")
