@@ -98,10 +98,11 @@ const EDIT_FIELDS = [
 // A flag opened by the nightly Coach-Change Radar sweep always starts with
 // one of these exact prefixes (see app/api/cron/recheck-schools) -- used to
 // tell those apart from flags a coach raised by hand from a school profile
-// page. Two prefixes because two independent automated checks open flags:
-// the coach-name miss-streak check ("Automated nightly recheck...") and the
+// page. Three prefixes because three independent automated checks open
+// flags: the coach-name miss-streak check ("Automated nightly recheck..."),
+// the weak-match streak check ("Automated weak-match recheck..."), and the
 // email format/domain sanity check ("Automated email check...").
-const AUTOMATED_FLAG_PREFIXES = ["Automated nightly recheck", "Automated email check"];
+const AUTOMATED_FLAG_PREFIXES = ["Automated nightly recheck", "Automated weak-match recheck", "Automated email check"];
 function isAutomatedFlag(reason) {
   return AUTOMATED_FLAG_PREFIXES.some((prefix) => (reason || "").startsWith(prefix));
 }
