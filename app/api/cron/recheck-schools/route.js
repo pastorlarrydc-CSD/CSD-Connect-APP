@@ -41,6 +41,17 @@ export const maxDuration = 60;
 // opened for a streak, it won't open a second one on top of a still-pending
 // automated flag for the same school.
 //
+// "confirmed_weak" gets the same streak treatment, on its own separate
+// counter and its own separate flag prefix. A weak confirmation means the
+// coach's LAST name was found on the site but the first name wasn't
+// confirmed nearby -- that's real, if partial, evidence the on-file coach
+// is probably still right (a different coach entirely wouldn't share the
+// last name at all), so a single weak hit -- or even a couple -- is much
+// more likely to be a nickname, a "Coach Smith"-only roster listing, or a
+// formatting quirk than genuine staleness. WEAK_STREAK_THRESHOLD is
+// therefore set higher than MISS_THRESHOLD: it takes longer, sustained
+// disagreement before this is worth a human's attention.
+//
 // Processes up to BATCH_SIZE candidates per run, but stops picking up new
 // work once TIME_BUDGET_MS has elapsed so it always finishes comfortably
 // within maxDuration -- whatever doesn't get to this run just rises to the
@@ -49,6 +60,7 @@ const BATCH_SIZE = 500;
 const CONCURRENCY = 8;
 const TIME_BUDGET_MS = 50_000;
 const MISS_THRESHOLD = 2; // consecutive nightly "not_found" results before opening a flag
+const WEAK_STREAK_THRESHOLD = 4; // consecutive nightly "confirmed_weak" results before opening a flag -- higher than MISS_THRESHOLD, see note above
 
 const SYSTEM_USER_ID = "d24ad753-f759-479d-8958-fae8f995faa1"; // CSD sysadmin account (Larry)
 
@@ -104,6 +116,7 @@ export async function GET(req) {
   const summary = { confirmed: 0, confirmed_weak: 0, confirmed_maxpreps: 0, not_found: 0, no_website: 0, no_coach_on_file: 0, fetch_error: 0 };
   let processed = 0;
   let flagsOpened = 0;
+  let weakFlagsOpened = 0;
   let emailFlagsOpened = 0;
   let cursor = 0;
 
@@ -172,6 +185,38 @@ export async function GET(req) {
             flagsOpened++;
           }
         }
+      } else if (result === "confirmed_weak") {
+        const { data: recentChecks } = await supabase
+          .from("school_recheck_log")
+          .select("result, checked_at")
+          .eq("school_id", c.school_id)
+          .order("checked_at", { ascending: false })
+          .limit(WEAK_STREAK_THRESHOLD);
+
+        const weakStreak =
+          recentChecks?.length === WEAK_STREAK_THRESHOLD && recentChecks.every((row) => row.result === "confirmed_weak");
+
+        if (weakStreak) {
+          const { data: existingWeakFlag } = await supabase
+            .from("school_flags")
+            .select("id")
+            .eq("school_id", c.school_id)
+            .eq("status", "pending")
+            .ilike("reason", "Automated weak-match recheck%")
+            .maybeSingle();
+
+          if (!existingWeakFlag) {
+            const sourcesChecked = [c.athletics_url ? "athletics site" : null, c.website ? "school website" : null, c.maxpreps_url ? "MaxPreps" : null]
+              .filter(Boolean)
+              .join(", ");
+            await supabase.from("school_flags").insert({
+              school_id: c.school_id,
+              flagged_by: SYSTEM_USER_ID,
+              reason: `Automated weak-match recheck: only the last name "${c.hc_last_name}" (not the first name) has been confirmed on the ${sourcesChecked} on ${WEAK_STREAK_THRESHOLD} checks in a row. Could be a different coach with the same last name, or a nickname/formatting mismatch -- please verify.`,
+            });
+            weakFlagsOpened++;
+          }
+        }
       }
 
       // Email deliverability doesn't need a miss-streak -- a malformed
@@ -208,6 +253,7 @@ export async function GET(req) {
     stopped_early: cursor < candidates.length,
     duration_ms: Date.now() - startedAt,
     flags_opened: flagsOpened,
+    weak_flags_opened: weakFlagsOpened,
     email_flags_opened: emailFlagsOpened,
     summary,
   };
