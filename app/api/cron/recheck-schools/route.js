@@ -15,10 +15,14 @@ export const maxDuration = 60;
 // `Authorization: Bearer <CRON_SECRET>` using the CRON_SECRET environment
 // variable, and this route rejects anything that doesn't match.
 //
-// Deliberately conservative, same as the manual route: never writes to the
-// schools table itself. Every check is logged to school_recheck_log so the
-// data is there to review (attributed to CSD's own sysadmin account, since
-// there's no human to credit an automated check to).
+// Deliberately conservative, same as the manual route: never edits any of
+// a school's own fields (name, coach info, URLs, verification_status,
+// etc.) -- that stays entirely human-driven. Every check is logged to
+// school_recheck_log so the data is there to review (attributed to CSD's
+// own sysadmin account, since there's no human to credit an automated
+// check to). The one exception is confidence_score, which is a derived
+// number the database recomputes on its own -- see the note near the
+// bottom of the worker loop.
 //
 // Two independent accuracy checks run per school, in parallel: the coach
 // name check above (now cross-referencing the first name too, when one's
@@ -51,6 +55,15 @@ export const maxDuration = 60;
 // formatting quirk than genuine staleness. WEAK_STREAK_THRESHOLD is
 // therefore set higher than MISS_THRESHOLD: it takes longer, sustained
 // disagreement before this is worth a human's attention.
+//
+// Every school this sweep touches also gets its confidence_score
+// recomputed (see the touch_school_confidence_score RPC call at the end
+// of the worker loop). That score's underlying formula
+// (compute_school_confidence_score, in the database) now factors in each
+// school's own recheck history and any pending automated flag on top of
+// its on-file fields -- so a school that keeps confirming cleanly earns a
+// bonus, and one sitting on an unresolved flag gets marked down, until
+// this sweep -- or a human -- resolves it.
 //
 // Processes up to BATCH_SIZE candidates per run, but stops picking up new
 // work once TIME_BUDGET_MS has elapsed so it always finishes comfortably
@@ -118,6 +131,7 @@ export async function GET(req) {
   let flagsOpened = 0;
   let weakFlagsOpened = 0;
   let emailFlagsOpened = 0;
+  let confidenceUpdated = 0;
   let cursor = 0;
 
   async function worker() {
@@ -242,6 +256,21 @@ export async function GET(req) {
           emailFlagsOpened++;
         }
       }
+
+      // confidence_score is computed by a database trigger
+      // (compute_school_confidence_score) that now factors in this
+      // school's own recheck history and any pending automated flag, not
+      // just its on-file fields -- but that trigger only fires on a write
+      // to the schools row itself, and nothing above this point writes to
+      // schools (this sweep only ever inserts into school_recheck_log /
+      // school_flags -- see the non-authoritative note at the top of this
+      // file). So the score would otherwise sit stale between manual
+      // edits, blind to everything this sweep just found. Call the RPC
+      // helper to force a recompute for this one school now that its
+      // recheck_log/flags state is current -- it doesn't edit any of the
+      // school's own fields, just lets the existing trigger redo its math.
+      const { error: touchErr } = await supabase.rpc("touch_school_confidence_score", { p_school_id: c.school_id });
+      if (!touchErr) confidenceUpdated++;
     }
   }
 
@@ -255,6 +284,7 @@ export async function GET(req) {
     flags_opened: flagsOpened,
     weak_flags_opened: weakFlagsOpened,
     email_flags_opened: emailFlagsOpened,
+    confidence_scores_updated: confidenceUpdated,
     summary,
   };
   console.log("cron recheck-schools:", JSON.stringify(result));
