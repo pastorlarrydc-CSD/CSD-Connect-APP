@@ -42,6 +42,8 @@ function confidenceColor(score) {
 
 const RECHECK_RESULT_LABEL = {
   confirmed: "Head coach confirmed on the school's website.",
+  confirmed_weak: "Last name found on the school's website, but the first name wasn't found nearby — lower confidence, worth a quick glance.",
+  confirmed_maxpreps: "Head coach confirmed on MaxPreps (no website or athletics site to check directly).",
   not_found: "Head coach was NOT found on the school's website — flagged for a verifier.",
   no_website: "No website on file for this school, so nothing to check.",
   no_coach_on_file: "No head coach on file to check against the website.",
@@ -50,6 +52,8 @@ const RECHECK_RESULT_LABEL = {
 
 const RECHECK_RESULT_CLASS = {
   confirmed: "notice",
+  confirmed_weak: "notice",
+  confirmed_maxpreps: "notice",
   not_found: "notice danger",
   no_website: "notice",
   no_coach_on_file: "notice",
