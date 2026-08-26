@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
-import { checkSchoolCoach } from "@/lib/schoolRecheck";
+import { checkSchoolCoach, checkEmailDeliverability } from "@/lib/schoolRecheck";
 
 export const maxDuration = 60;
 
@@ -19,6 +19,16 @@ export const maxDuration = 60;
 // schools table itself. Every check is logged to school_recheck_log so the
 // data is there to review (attributed to CSD's own sysadmin account, since
 // there's no human to credit an automated check to).
+//
+// Two independent accuracy checks run per school, in parallel: the coach
+// name check above (now cross-referencing the first name too, when one's
+// on file -- see NAME_PROXIMITY_WINDOW in lib/schoolRecheck.js, which
+// downgrades a last-name-only match to "confirmed_weak" instead of a full
+// "confirmed"), and a no-send email deliverability sanity check
+// (checkEmailDeliverability) that flags an obviously-malformed address or
+// a domain that doesn't resolve at all. Neither check ever writes to
+// schools directly -- a bad email opens a flag in the same queue a coach-
+// name miss does, for a human to review and fix.
 //
 // In practice most school websites are the school's homepage, not a
 // staff/roster page, so a single "not found" is very often just the coach's
@@ -71,7 +81,7 @@ export async function GET(req) {
 
   const { data: candidates, error: candErr } = await supabase
     .from("school_recheck_priority")
-    .select("school_id, website, hc_first_name, hc_last_name, maxpreps_url, athletics_url")
+    .select("school_id, website, hc_first_name, hc_last_name, hc_email, maxpreps_url, athletics_url")
     // Primary sort is staleness (never-checked schools first). Almost all
     // never-checked schools tie on that (last_checked_at is NULL for all of
     // them), so a second tiebreaker matters: prefer schools that have an
@@ -91,9 +101,10 @@ export async function GET(req) {
     return NextResponse.json({ error: "Could not load candidate schools." }, { status: 500 });
   }
 
-  const summary = { confirmed: 0, confirmed_maxpreps: 0, not_found: 0, no_website: 0, no_coach_on_file: 0, fetch_error: 0 };
+  const summary = { confirmed: 0, confirmed_weak: 0, confirmed_maxpreps: 0, not_found: 0, no_website: 0, no_coach_on_file: 0, fetch_error: 0 };
   let processed = 0;
   let flagsOpened = 0;
+  let emailFlagsOpened = 0;
   let cursor = 0;
 
   async function worker() {
@@ -103,12 +114,21 @@ export async function GET(req) {
       if (i >= candidates.length) return;
       const c = candidates[i];
 
-      const { result, detail } = await checkSchoolCoach({
-        website: c.website,
-        hc_last_name: c.hc_last_name,
-        maxpreps_url: c.maxpreps_url,
-        athletics_url: c.athletics_url,
-      });
+      // The coach-name check and the email deliverability check are
+      // independent of each other (different target, different failure
+      // modes) -- run them concurrently instead of one after the other so
+      // adding the email check doesn't roughly double this worker's time
+      // per school.
+      const [{ result, detail }, emailCheck] = await Promise.all([
+        checkSchoolCoach({
+          website: c.website,
+          hc_first_name: c.hc_first_name,
+          hc_last_name: c.hc_last_name,
+          maxpreps_url: c.maxpreps_url,
+          athletics_url: c.athletics_url,
+        }),
+        checkEmailDeliverability(c.hc_email),
+      ]);
       summary[result] = (summary[result] || 0) + 1;
       processed++;
 
@@ -153,6 +173,30 @@ export async function GET(req) {
           }
         }
       }
+
+      // Email deliverability doesn't need a miss-streak -- a malformed
+      // address or a dead domain today will still be wrong tomorrow, no
+      // benefit in waiting for repeated misses the way a flaky website
+      // fetch does. Still dedupes against an already-pending flag so a
+      // still-broken email doesn't get re-flagged every single night.
+      if (!emailCheck.ok && !emailCheck.skipped) {
+        const { data: existingEmailFlag } = await supabase
+          .from("school_flags")
+          .select("id")
+          .eq("school_id", c.school_id)
+          .eq("status", "pending")
+          .ilike("reason", "Automated email check%")
+          .maybeSingle();
+
+        if (!existingEmailFlag) {
+          await supabase.from("school_flags").insert({
+            school_id: c.school_id,
+            flagged_by: SYSTEM_USER_ID,
+            reason: `Automated email check: ${emailCheck.detail} Please verify or update this school's head coach email.`,
+          });
+          emailFlagsOpened++;
+        }
+      }
     }
   }
 
@@ -164,6 +208,7 @@ export async function GET(req) {
     stopped_early: cursor < candidates.length,
     duration_ms: Date.now() - startedAt,
     flags_opened: flagsOpened,
+    email_flags_opened: emailFlagsOpened,
     summary,
   };
   console.log("cron recheck-schools:", JSON.stringify(result));
