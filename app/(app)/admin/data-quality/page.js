@@ -96,15 +96,26 @@ const EDIT_FIELDS = [
 ];
 
 // A flag opened by the nightly Coach-Change Radar sweep always starts with
-// this exact text (see app/api/cron/recheck-schools) -- used to tell those
-// apart from flags a coach raised by hand from a school profile page.
-const AUTOMATED_FLAG_PREFIX = "Automated nightly recheck";
+// one of these exact prefixes (see app/api/cron/recheck-schools) -- used to
+// tell those apart from flags a coach raised by hand from a school profile
+// page. Two prefixes because two independent automated checks open flags:
+// the coach-name miss-streak check ("Automated nightly recheck...") and the
+// email format/domain sanity check ("Automated email check...").
+const AUTOMATED_FLAG_PREFIXES = ["Automated nightly recheck", "Automated email check"];
+function isAutomatedFlag(reason) {
+  return AUTOMATED_FLAG_PREFIXES.some((prefix) => (reason || "").startsWith(prefix));
+}
 
-// Every result code checkSchoolCoach/checkSchoolCoach can return (see
-// lib/schoolRecheck.js), with how each shows up in the Coach-Change Radar
-// report below -- label, filter option, and pill color.
+// Every result code checkSchoolCoach can return (see lib/schoolRecheck.js),
+// with how each shows up in the Coach-Change Radar report below -- label,
+// filter option, and pill color. confirmed_weak is the same "found"
+// outcome as confirmed, just lower confidence -- the coach's last name was
+// on the page but their first name wasn't found nearby to back it up -- so
+// it gets its own softer amber color rather than sharing confirmed's green
+// or not_found's red.
 const RADAR_RESULT_META = {
   confirmed: { label: "Confirmed", color: "#1a7f37", bg: "#e6f4ea" },
+  confirmed_weak: { label: "Confirmed (low confidence)", color: "#8a6100", bg: "#fff4dc" },
   confirmed_maxpreps: { label: "Confirmed (MaxPreps)", color: "#1a7f37", bg: "#e6f4ea" },
   not_found: { label: "Not found", color: "#b3261e", bg: "#fbe9e7" },
   fetch_error: { label: "Could not load", color: "#8a6100", bg: "#fff4dc" },
@@ -119,6 +130,7 @@ const RADAR_FILTERS = [
   { key: "no_website", label: "No website on file" },
   { key: "no_coach_on_file", label: "No coach on file" },
   { key: "confirmed", label: "Confirmed" },
+  { key: "confirmed_weak", label: "Confirmed (low confidence)" },
   { key: "confirmed_maxpreps", label: "Confirmed (MaxPreps)" },
 ];
 
@@ -1808,8 +1820,9 @@ export default function DataQualityPage() {
       : filteredRows;
   const visibleRows = sortedRows.slice(0, DISPLAY_CAP);
   const visibleTotal = filteredRows.length;
-  const automatedPendingCount = flaggedQueue.filter((f) => (f.reason || "").startsWith(AUTOMATED_FLAG_PREFIX)).length;
-  const confirmedTotal = (radarStats?.counts.confirmed || 0) + (radarStats?.counts.confirmed_maxpreps || 0);
+  const automatedPendingCount = flaggedQueue.filter((f) => isAutomatedFlag(f.reason)).length;
+  const confirmedTotal =
+    (radarStats?.counts.confirmed || 0) + (radarStats?.counts.confirmed_weak || 0) + (radarStats?.counts.confirmed_maxpreps || 0);
   const radarFilteredRows = radarFilter === "all" ? radarRows : radarRows.filter((r) => r.result === radarFilter);
   const cycleDays = coverageStats?.eligible ? Math.ceil(coverageStats.eligible / RECHECK_BATCH_SIZE) : null;
 
@@ -1861,7 +1874,7 @@ export default function DataQualityPage() {
           <>
             {todaysFlags.map((flag) => {
               const s = flag.schools;
-              const isAutomated = (flag.reason || "").startsWith(AUTOMATED_FLAG_PREFIX);
+              const isAutomated = isAutomatedFlag(flag.reason);
               return (
                 <div className="log-item" key={`flag-${flag.id}`} style={{ paddingBottom: 10 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
@@ -2138,7 +2151,14 @@ export default function DataQualityPage() {
             <div className="card stat-card">
               <div className="label">Confirmed</div>
               <div className="num">{confirmedTotal.toLocaleString()}</div>
-              <div className="sub">{radarStats.counts.confirmed_maxpreps ? `${radarStats.counts.confirmed_maxpreps} via MaxPreps fallback` : "coach name matched on file"}</div>
+              <div className="sub">
+                {[
+                  radarStats.counts.confirmed_weak ? `${radarStats.counts.confirmed_weak} low-confidence` : null,
+                  radarStats.counts.confirmed_maxpreps ? `${radarStats.counts.confirmed_maxpreps} via MaxPreps fallback` : null,
+                ]
+                  .filter(Boolean)
+                  .join(", ") || "coach name matched on file"}
+              </div>
             </div>
             <div className="card stat-card">
               <div className="label">Not Found</div>
@@ -2926,7 +2946,7 @@ export default function DataQualityPage() {
           flaggedQueue.map((flag) => {
             const s = flag.schools;
             const isEditing = editingId === s?.id;
-            const isAutomated = (flag.reason || "").startsWith(AUTOMATED_FLAG_PREFIX);
+            const isAutomated = isAutomatedFlag(flag.reason);
             return (
               <div className="log-item" key={flag.id} style={{ paddingBottom: 12 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
