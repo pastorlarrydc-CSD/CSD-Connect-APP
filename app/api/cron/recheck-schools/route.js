@@ -72,7 +72,18 @@ export async function GET(req) {
   const { data: candidates, error: candErr } = await supabase
     .from("school_recheck_priority")
     .select("school_id, website, hc_first_name, hc_last_name, maxpreps_url, athletics_url")
+    // Primary sort is staleness (never-checked schools first). Almost all
+    // never-checked schools tie on that (last_checked_at is NULL for all of
+    // them), so a second tiebreaker matters: prefer schools that have an
+    // Athletics URL on file, since checkSchoolCoach() reads that source
+    // FIRST and it's the highest-confidence check available. Without this,
+    // newly-improved schools (e.g. from a Bulk Athletics Discovery pass)
+    // have no better odds of coming up soon than any other school in a
+    // 12,000+ never-checked backlog. Final school_id tiebreaker just keeps
+    // the batch order deterministic run to run.
     .order("last_checked_at", { ascending: true, nullsFirst: true })
+    .order("has_athletics_url", { ascending: false })
+    .order("school_id", { ascending: true })
     .limit(BATCH_SIZE);
 
   if (candErr) {
