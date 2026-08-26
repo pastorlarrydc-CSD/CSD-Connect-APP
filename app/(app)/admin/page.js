@@ -268,8 +268,11 @@ export default function AdminPage() {
               <Link href="/admin/bulk-social" className="btn btn-sm btn-primary" style={{ marginRight: 8 }}>
                 Bulk Social Media Discovery
               </Link>
-              <Link href="/admin/batch-coach-info" className="btn btn-sm btn-primary">
+              <Link href="/admin/batch-coach-info" className="btn btn-sm btn-primary" style={{ marginRight: 8 }}>
                 Batch Coach-Info Discovery
+              </Link>
+              <Link href="/admin/batch-athletics" className="btn btn-sm btn-primary">
+                Batch Athletics-URL Discovery
               </Link>
             </div>
           </div>
