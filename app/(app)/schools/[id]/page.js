@@ -109,16 +109,24 @@ export default function SchoolProfilePage() {
   const [recheckResult, setRecheckResult] = useState(null);
   const [recheckError, setRecheckError] = useState("");
 
-  // Mark School Closed -- a soft-close (see the add_school_closed_status
-  // migration), not a delete: closed schools stay in the database with all
-  // their history intact, but drop out of Search/Map/the public
-  // prospect-submission form. Fully reversible via Reopen School.
+  // Mark School Closed / Football Program Discontinued -- both a soft-close
+  // (see the add_school_closed_status migration), not a delete: closed
+  // schools stay in the database with all their history intact, but drop
+  // out of Search/Map/the public prospect-submission form. Fully reversible
+  // via Reopen School. closeCategory distinguishes the two ("school_closed"
+  // vs "football_discontinued" -- see the add_school_closed_category
+  // migration) so a school that's still open but cut football can be
+  // tracked and reported on separately from one that closed outright, even
+  // though both hide the same way today.
   const [showCloseForm, setShowCloseForm] = useState(false);
+  const [closeCategory, setCloseCategory] = useState("school_closed");
   const [closeReason, setCloseReason] = useState("");
   const [markingClosed, setMarkingClosed] = useState(false);
   const [markClosedError, setMarkClosedError] = useState("");
   const [reopening, setReopening] = useState(false);
   const [reopenError, setReopenError] = useState("");
+
+  const CLOSE_CATEGORY_LABEL = { school_closed: "Marked closed", football_discontinued: "Football program discontinued" };
 
   const isOwner = !!(profile?.school_id && school?.id && Number(profile.school_id) === Number(school.id));
   const canClaim = profile?.role === "hs_coach" && !profile?.school_id;
@@ -755,19 +763,22 @@ export default function SchoolProfilePage() {
     try {
       const now = new Date().toISOString();
       const reason = closeReason.trim();
-      const update = { is_closed: true, closed_at: now, closed_by: user.id, closed_reason: reason || null };
+      const isFootballOnly = closeCategory === "football_discontinued";
+      const update = { is_closed: true, closed_at: now, closed_by: user.id, closed_reason: reason || null, closed_category: closeCategory };
       const { error } = await supabase.from("schools").update(update).eq("id", id);
       if (error) throw error;
+      const label = isFootballOnly ? "Football program discontinued (manual)" : "Marked closed (manual)";
       await supabase.from("school_change_log").insert({
         school_id: id,
         field_name: "is_closed",
         old_value: "false",
         new_value: "true",
-        source: reason ? `Marked closed (manual): ${reason}` : "Marked closed (manual)",
+        source: reason ? `${label}: ${reason}` : label,
         changed_by: user.id,
       });
       setShowCloseForm(false);
       setCloseReason("");
+      setCloseCategory("school_closed");
       load();
     } catch (err) {
       setMarkClosedError(err.message || "Could not mark this school closed.");
@@ -783,7 +794,7 @@ export default function SchoolProfilePage() {
     setReopening(true);
     setReopenError("");
     try {
-      const update = { is_closed: false, closed_at: null, closed_by: null, closed_reason: null };
+      const update = { is_closed: false, closed_at: null, closed_by: null, closed_reason: null, closed_category: null };
       const { error } = await supabase.from("schools").update(update).eq("id", id);
       if (error) throw error;
       await supabase.from("school_change_log").insert({
@@ -818,7 +829,8 @@ export default function SchoolProfilePage() {
             {school.name}
             {school.is_closed && (
               <span className="badge badge-private" style={{ marginLeft: 10, verticalAlign: "middle" }}>
-                Closed{school.closed_at ? ` ${new Date(school.closed_at).toLocaleDateString()}` : ""}
+                {school.closed_category === "football_discontinued" ? "Football program discontinued" : "Closed"}
+                {school.closed_at ? ` ${new Date(school.closed_at).toLocaleDateString()}` : ""}
               </span>
             )}
           </h1>
@@ -826,7 +838,9 @@ export default function SchoolProfilePage() {
             {school.city}, {school.state} {school.zip} · {school.school_type} {school.classification ? `· ${school.classification}` : ""}
           </p>
           {school.is_closed && school.closed_reason && (
-            <p style={{ fontSize: 12.5, color: "#697386", marginTop: 2 }}>Closed: {school.closed_reason}</p>
+            <p style={{ fontSize: 12.5, color: "#697386", marginTop: 2 }}>
+              {school.closed_category === "football_discontinued" ? "Football program discontinued" : "Closed"}: {school.closed_reason}
+            </p>
           )}
         </div>
       </div>
@@ -911,7 +925,8 @@ export default function SchoolProfilePage() {
                 {school.is_closed ? (
                   <>
                     <div className="notice danger" style={{ marginBottom: 8 }}>
-                      Marked closed{school.closed_at ? ` on ${new Date(school.closed_at).toLocaleDateString()}` : ""}
+                      {CLOSE_CATEGORY_LABEL[school.closed_category] || CLOSE_CATEGORY_LABEL.school_closed}
+                      {school.closed_at ? ` on ${new Date(school.closed_at).toLocaleDateString()}` : ""}
                       {school.closed_reason ? ` — ${school.closed_reason}` : ""}. Hidden from Search, the Map, and the public prospect-submission form.
                     </div>
                     {reopenError && <div className="notice danger" style={{ marginBottom: 8 }}>{reopenError}</div>}
@@ -920,9 +935,14 @@ export default function SchoolProfilePage() {
                     </button>
                   </>
                 ) : !showCloseForm ? (
-                  <button className="btn btn-sm" onClick={() => setShowCloseForm(true)}>
-                    Mark School Closed
-                  </button>
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    <button className="btn btn-sm" onClick={() => { setCloseCategory("school_closed"); setShowCloseForm(true); }}>
+                      Mark School Closed
+                    </button>
+                    <button className="btn btn-sm" onClick={() => { setCloseCategory("football_discontinued"); setShowCloseForm(true); }}>
+                      Football Program Discontinued
+                    </button>
+                  </div>
                 ) : (
                   <form onSubmit={closeSchool}>
                     {markClosedError && <div className="notice danger" style={{ marginBottom: 8 }}>{markClosedError}</div>}
@@ -931,15 +951,26 @@ export default function SchoolProfilePage() {
                       <input
                         value={closeReason}
                         onChange={(e) => setCloseReason(e.target.value)}
-                        placeholder="Consolidated with Example High School, closed permanently, etc."
+                        placeholder={
+                          closeCategory === "football_discontinued"
+                            ? "Dropped football after 2025 season, low roster numbers, etc."
+                            : "Consolidated with Example High School, closed permanently, etc."
+                        }
                       />
                     </div>
                     <p style={{ fontSize: 11.5, color: "#9aa5b1", marginTop: -4, marginBottom: 8 }}>
+                      {closeCategory === "football_discontinued"
+                        ? "For a school that's still open but has cut its football program. "
+                        : ""}
                       This hides the school from Search, the Map, and the public prospect-submission form — it stays visible anywhere it&apos;s already linked (a college&apos;s board/watchlist, a prospect&apos;s record), and can be reversed anytime with &quot;Reopen School.&quot;
                     </p>
                     <div style={{ display: "flex", gap: 8 }}>
                       <button className="btn btn-sm btn-gold" disabled={markingClosed}>
-                        {markingClosed ? "Marking closed…" : "Confirm: Mark Closed"}
+                        {markingClosed
+                          ? "Saving…"
+                          : closeCategory === "football_discontinued"
+                          ? "Confirm: Football Program Discontinued"
+                          : "Confirm: Mark Closed"}
                       </button>
                       <button
                         type="button"
@@ -947,6 +978,7 @@ export default function SchoolProfilePage() {
                         onClick={() => {
                           setShowCloseForm(false);
                           setCloseReason("");
+                          setCloseCategory("school_closed");
                           setMarkClosedError("");
                         }}
                         disabled={markingClosed}
