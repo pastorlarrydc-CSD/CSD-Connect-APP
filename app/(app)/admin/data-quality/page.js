@@ -257,6 +257,21 @@ export default function DataQualityPage() {
   const [radarUrlErrors, setRadarUrlErrors] = useState({});
   const [radarUrlSavedIds, setRadarUrlSavedIds] = useState(new Set());
 
+  // Progress tab -- a live, always-current answer to "where am I at on the
+  // full 14,600-school sweep," separate from Coach-Change Radar (which is
+  // about keeping already-good records from going stale, not building out
+  // the ones that never had web-presence data at all). pageTab switches
+  // between the two views on this same page; everything below only loads
+  // once the Progress tab is actually opened.
+  const [pageTab, setPageTab] = useState("radar"); // "radar" | "progress"
+  const [progressStats, setProgressStats] = useState(null);
+  const [progressToday, setProgressToday] = useState(null);
+  const [progressPace, setProgressPace] = useState([]);
+  const [progressBatchRuns, setProgressBatchRuns] = useState([]);
+  const [loadingProgress, setLoadingProgress] = useState(false);
+  const [progressError, setProgressError] = useState("");
+  const [progressLoadedAt, setProgressLoadedAt] = useState(null);
+
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState("");
   const [result, setResult] = useState(null); // { flagged, counts, totalFlagged, totalScanned }
@@ -696,6 +711,122 @@ export default function DataQualityPage() {
   useEffect(() => {
     loadRecheckCoverage();
   }, [loadRecheckCoverage]);
+
+  // Progress tab data -- one lean query against schools for the four
+  // coverage dimensions (reusing hasFullCoachRecord/isBlank so this can
+  // never quietly disagree with Coach-Change Radar or the digest email
+  // about what "done" means), plus school_change_log for today's activity
+  // and a 7-day pace, plus the two AI batch-run tables so an in-flight
+  // run shows up without leaving this page to check Supabase or Vercel.
+  const DIMENSION_LABELS = {
+    coach_info: "Coach Info",
+    athletics_url: "Athletics URL",
+    maxpreps_url: "MaxPreps URL",
+    social: "Social Handle",
+  };
+  const fieldToDimension = (fieldName) => {
+    if (fieldName === "hc_first_name" || fieldName === "hc_last_name" || fieldName === "hc_email") return "coach_info";
+    if (fieldName === "athletics_url") return "athletics_url";
+    if (fieldName === "maxpreps_url") return "maxpreps_url";
+    if (fieldName === "hc_twitter" || fieldName === "hc_facebook") return "social";
+    return null;
+  };
+  const normalizeSource = (source) => (source || "Unknown").startsWith("Duplicate cleanup") ? "Duplicate cleanup" : source || "Unknown";
+
+  const loadProgress = useCallback(async () => {
+    if (!canReview) {
+      setLoadingProgress(false);
+      return;
+    }
+    setLoadingProgress(true);
+    setProgressError("");
+    try {
+      const startOfToday = new Date();
+      startOfToday.setHours(0, 0, 0, 0);
+      const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+
+      const [coverageRes, todayRes, weekRes, athleticsRunsRes, coachInfoRunsRes] = await Promise.all([
+        supabase.from("schools").select("hc_first_name,hc_last_name,hc_email,athletics_url,maxpreps_url,hc_twitter,hc_facebook"),
+        supabase.from("school_change_log").select("field_name, source").gte("changed_at", startOfToday.toISOString()),
+        supabase.from("school_change_log").select("field_name, changed_at").gte("changed_at", sevenDaysAgo.toISOString()),
+        supabase.from("athletics_batch_runs").select("id, status, requested_count, fetched_count, created_at").order("created_at", { ascending: false }).limit(5),
+        supabase.from("coach_info_batch_runs").select("id, status, requested_count, fetched_count, created_at").order("created_at", { ascending: false }).limit(5),
+      ]);
+      if (coverageRes.error) throw coverageRes.error;
+      if (todayRes.error) throw todayRes.error;
+      if (weekRes.error) throw weekRes.error;
+
+      const rows = coverageRes.data || [];
+      const total = rows.length;
+      let coachInfo = 0, athletics = 0, maxpreps = 0, social = 0, fullyComplete = 0;
+      rows.forEach((s) => {
+        if (!isBlank(s.hc_first_name) && !isBlank(s.hc_last_name) && !isBlank(s.hc_email)) coachInfo++;
+        if (!isBlank(s.athletics_url)) athletics++;
+        if (!isBlank(s.maxpreps_url)) maxpreps++;
+        if (!isBlank(s.hc_twitter) || !isBlank(s.hc_facebook)) social++;
+        if (hasFullCoachRecord(s)) fullyComplete++;
+      });
+      const pct = (n) => (total ? Math.round((n / total) * 1000) / 10 : 0);
+      setProgressStats({
+        total,
+        coachInfo, coachInfoPct: pct(coachInfo), coachInfoGap: total - coachInfo,
+        athletics, athleticsPct: pct(athletics), athleticsGap: total - athletics,
+        maxpreps, maxprepsPct: pct(maxpreps), maxprepsGap: total - maxpreps,
+        social, socialPct: pct(social), socialGap: total - social,
+        fullyComplete, fullyCompletePct: pct(fullyComplete),
+      });
+
+      const byDim = {};
+      const bySourceMap = new Map();
+      (todayRes.data || []).forEach((row) => {
+        const dim = fieldToDimension(row.field_name);
+        if (dim) byDim[dim] = (byDim[dim] || 0) + 1;
+        const src = normalizeSource(row.source);
+        bySourceMap.set(src, (bySourceMap.get(src) || 0) + 1);
+      });
+      setProgressToday({
+        total: (todayRes.data || []).length,
+        byDim,
+        bySource: Array.from(bySourceMap.entries()).sort((a, b) => b[1] - a[1]),
+      });
+
+      const weekByDim = {};
+      (weekRes.data || []).forEach((row) => {
+        const dim = fieldToDimension(row.field_name);
+        if (dim) weekByDim[dim] = (weekByDim[dim] || 0) + 1;
+      });
+      const gaps = { coach_info: total - coachInfo, athletics_url: total - athletics, maxpreps_url: total - maxpreps, social: total - social };
+      const pace = Object.keys(DIMENSION_LABELS).map((key) => {
+        const weekCount = weekByDim[key] || 0;
+        const gap = gaps[key] || 0;
+        let projection = "—";
+        if (weekCount > 0) {
+          const weeks = gap / weekCount;
+          projection = weeks < 1 ? "< 1 week" : weeks > 104 ? "2+ years at this pace" : `~${Math.round(weeks)} wk${Math.round(weeks) === 1 ? "" : "s"}`;
+        } else if (gap === 0) {
+          projection = "Done";
+        }
+        return { key, label: DIMENSION_LABELS[key], gap, weekCount, projection };
+      });
+      setProgressPace(pace);
+
+      const runs = [
+        ...(athleticsRunsRes.data || []).map((r) => ({ ...r, kind: "Athletics URL (AI)" })),
+        ...(coachInfoRunsRes.data || []).map((r) => ({ ...r, kind: "Coach Info (AI)" })),
+      ].sort((a, b) => new Date(b.created_at) - new Date(a.created_at)).slice(0, 6);
+      setProgressBatchRuns(runs);
+
+      setProgressLoadedAt(new Date());
+    } catch (err) {
+      setProgressError(err.message || "Could not load progress data.");
+    } finally {
+      setLoadingProgress(false);
+    }
+  }, [supabase, canReview]);
+
+  useEffect(() => {
+    if (pageTab === "progress" && !progressStats) loadProgress();
+  }, [pageTab, progressStats, loadProgress]);
 
   const loadMaxprepsOpportunities = useCallback(async () => {
     if (!canReview) {
@@ -1998,6 +2129,170 @@ export default function DataQualityPage() {
         </button>
       </div>
 
+      <div style={{ display: "flex", gap: 8, marginBottom: 16 }}>
+        <button className={pageTab === "radar" ? "btn btn-gold btn-sm" : "btn btn-sm"} onClick={() => setPageTab("radar")}>
+          Coach-Change Radar &amp; Tools
+        </button>
+        <button className={pageTab === "progress" ? "btn btn-gold btn-sm" : "btn btn-sm"} onClick={() => setPageTab("progress")}>
+          Progress
+        </button>
+      </div>
+
+      {pageTab === "progress" && (
+        <div>
+          <div className="card" style={{ marginBottom: 14, display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+            <div>
+              <h3 style={{ marginBottom: 2 }}>Database Coverage</h3>
+              <p style={{ fontSize: 12.5, color: "#697386", margin: 0 }}>
+                {progressLoadedAt ? `Live as of ${fmtRelativeTime(progressLoadedAt)}` : loadingProgress ? "Loading…" : "Not loaded yet."}
+              </p>
+            </div>
+            <button className="btn btn-sm" onClick={loadProgress} disabled={loadingProgress}>
+              {loadingProgress ? "Refreshing…" : "Refresh"}
+            </button>
+          </div>
+
+          {progressError && <div className="notice danger" style={{ marginBottom: 14 }}>{progressError}</div>}
+
+          <div className="grid grid-4" style={{ marginBottom: 14 }}>
+            <div className="card stat-card">
+              <div className="num">{progressStats ? progressStats.total.toLocaleString() : "—"}</div>
+              <div className="label">Total Schools</div>
+            </div>
+            <div className="card stat-card">
+              <div className="num">{progressStats ? `${progressStats.coachInfoPct}%` : "—"}</div>
+              <div className="label">Coach Info</div>
+              {progressStats && <div className="sub">{progressStats.coachInfoGap.toLocaleString()} remaining</div>}
+            </div>
+            <div className="card stat-card">
+              <div className="num">{progressStats ? `${progressStats.athleticsPct}%` : "—"}</div>
+              <div className="label">Athletics URL</div>
+              {progressStats && <div className="sub">{progressStats.athleticsGap.toLocaleString()} remaining</div>}
+            </div>
+            <div className="card stat-card">
+              <div className="num">{progressStats ? `${progressStats.maxprepsPct}%` : "—"}</div>
+              <div className="label">MaxPreps URL</div>
+              {progressStats && <div className="sub">{progressStats.maxprepsGap.toLocaleString()} remaining</div>}
+            </div>
+          </div>
+
+          <div className="grid grid-2" style={{ marginBottom: 14 }}>
+            <div className="card stat-card">
+              <div className="num">{progressStats ? `${progressStats.socialPct}%` : "—"}</div>
+              <div className="label">Social Handle</div>
+              {progressStats && <div className="sub">{progressStats.socialGap.toLocaleString()} remaining</div>}
+            </div>
+            <div className="card stat-card">
+              <div className="num">{progressStats ? `${progressStats.fullyCompletePct}%` : "—"}</div>
+              <div className="label">Fully Complete</div>
+              {progressStats && <div className="sub">{progressStats.fullyComplete.toLocaleString()} schools</div>}
+            </div>
+          </div>
+
+          <div className="card" style={{ marginBottom: 14 }}>
+            <h3>Today&apos;s Activity {progressToday ? `(${progressToday.total})` : ""}</h3>
+            {loadingProgress && !progressToday ? (
+              <div className="empty-state">Loading…</div>
+            ) : !progressToday || progressToday.total === 0 ? (
+              <div className="empty-state">No changes logged yet today.</div>
+            ) : (
+              <>
+                <div className="grid grid-4" style={{ marginBottom: 12 }}>
+                  <div className="stat-card">
+                    <div className="num" style={{ fontSize: 20 }}>{progressToday.byDim.coach_info || 0}</div>
+                    <div className="label">Coach Info</div>
+                  </div>
+                  <div className="stat-card">
+                    <div className="num" style={{ fontSize: 20 }}>{progressToday.byDim.athletics_url || 0}</div>
+                    <div className="label">Athletics</div>
+                  </div>
+                  <div className="stat-card">
+                    <div className="num" style={{ fontSize: 20 }}>{progressToday.byDim.maxpreps_url || 0}</div>
+                    <div className="label">MaxPreps</div>
+                  </div>
+                  <div className="stat-card">
+                    <div className="num" style={{ fontSize: 20 }}>{progressToday.byDim.social || 0}</div>
+                    <div className="label">Social</div>
+                  </div>
+                </div>
+                {progressToday.bySource.map(([src, n]) => (
+                  <div key={src} className="log-item" style={{ display: "flex", justifyContent: "space-between" }}>
+                    <span>{src}</span>
+                    <strong>{n}</strong>
+                  </div>
+                ))}
+              </>
+            )}
+          </div>
+
+          <div className="card" style={{ marginBottom: 14 }}>
+            <h3>Pace &amp; Projected Time to Clear</h3>
+            <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4, marginBottom: 10 }}>
+              Based on the last 7 days of applied changes across every tool.
+            </p>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr><th>Dimension</th><th>Remaining</th><th>Last 7 Days</th><th>Projected</th></tr>
+                </thead>
+                <tbody>
+                  {progressPace.length === 0 ? (
+                    <tr><td colSpan={4} className="empty-state">{loadingProgress ? "Loading…" : "No data yet."}</td></tr>
+                  ) : (
+                    progressPace.map((row) => (
+                      <tr key={row.key}>
+                        <td>{row.label}</td>
+                        <td>{row.gap.toLocaleString()}</td>
+                        <td>{row.weekCount.toLocaleString()}</td>
+                        <td>{row.projection}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <div className="card">
+            <h3>Recent Batch Runs</h3>
+            {progressBatchRuns.length === 0 ? (
+              <div className="empty-state">{loadingProgress ? "Loading…" : "No AI batch runs yet."}</div>
+            ) : (
+              <div className="table-wrap">
+                <table>
+                  <thead>
+                    <tr><th>Tool</th><th>Status</th><th>Size</th><th>Started</th></tr>
+                  </thead>
+                  <tbody>
+                    {progressBatchRuns.map((run) => (
+                      <tr key={`${run.kind}-${run.id}`}>
+                        <td>{run.kind}</td>
+                        <td>
+                          <span
+                            className="badge"
+                            style={
+                              run.status === "collected"
+                                ? { background: "#e6f0ea", color: "#1e7145" }
+                                : { background: "#fff2df", color: "#b8860b" }
+                            }
+                          >
+                            {run.status}
+                          </span>
+                        </td>
+                        <td>{run.fetched_count}/{run.requested_count}</td>
+                        <td>{fmtRelativeTime(new Date(run.created_at))}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {pageTab === "radar" && (
+      <>
       <div className="card" style={{ marginBottom: 14 }}>
         <h3 style={{ marginBottom: 4 }}>Today&apos;s List ({todaysListTotal})</h3>
         <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
@@ -3710,6 +4005,8 @@ export default function DataQualityPage() {
             )}
           </div>
         </>
+      )}
+      </>
       )}
     </div>
   );
