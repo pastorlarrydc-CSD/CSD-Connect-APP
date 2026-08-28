@@ -158,15 +158,25 @@ export default function BulkAthleticsPage() {
     setApplying(true);
     setApplyError("");
     setApplyResult(null);
+    // Each school's schools-row update and its school_change_log entry are
+    // written together, one school at a time, and the UI/counters update
+    // right after each one lands -- not batched until the whole loop
+    // finishes. That used to mean a lock-up or error partway through a
+    // large batch left whichever schools got updated before it happened
+    // with NO audit-log entry at all (the log insert only ran once, after
+    // every school succeeded) and no visible confirmation in the app
+    // either, since appliedIds/sessionApplied/missingCount only updated at
+    // the very end too. Now, however far the loop gets, everything up to
+    // that point is fully applied, logged, and reflected on screen.
+    let appliedCount = 0;
     try {
-      const changes = [];
       for (let i = 0; i < selectedToApply.length; i++) {
         const s = selectedToApply[i];
         setApplyStatus(`Applying ${i + 1} of ${selectedToApply.length}…`);
         const newVal = selections[s.id];
         const { error } = await supabase.from("schools").update({ athletics_url: newVal }).eq("id", s.id);
         if (error) throw error;
-        changes.push({
+        const { error: logError } = await supabase.from("school_change_log").insert({
           school_id: s.id,
           field_name: "athletics_url",
           old_value: s.athletics_url || null,
@@ -174,17 +184,22 @@ export default function BulkAthleticsPage() {
           source: "Athletics bulk discovery (reviewed)",
           changed_by: user.id,
         });
-      }
-      if (changes.length) {
-        const { error: logError } = await supabase.from("school_change_log").insert(changes);
         if (logError) throw logError;
+
+        appliedCount++;
+        setAppliedIds((prev) => new Set([...prev, s.id]));
+        setSessionApplied((n) => n + 1);
+        setMissingCount((prev) => (prev != null ? Math.max(0, prev - 1) : prev));
       }
-      setAppliedIds((prev) => new Set([...prev, ...selectedToApply.map((s) => s.id)]));
-      setApplyResult({ schools: selectedToApply.length });
-      setSessionApplied((n) => n + selectedToApply.length);
-      setMissingCount((prev) => (prev != null ? Math.max(0, prev - selectedToApply.length) : prev));
+      setApplyResult({ schools: appliedCount });
     } catch (err) {
-      setApplyError(err.message || "Could not apply these updates.");
+      const base = err.message || "Could not apply these updates.";
+      setApplyError(
+        appliedCount > 0
+          ? `Applied and logged ${appliedCount} of ${selectedToApply.length} before hitting an error -- those are saved, the rest were not attempted. ${base}`
+          : base
+      );
+      if (appliedCount > 0) setApplyResult({ schools: appliedCount });
     } finally {
       setApplying(false);
       setApplyStatus("");
