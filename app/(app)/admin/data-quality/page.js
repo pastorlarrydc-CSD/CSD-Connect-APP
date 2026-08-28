@@ -271,6 +271,11 @@ export default function DataQualityPage() {
   const [loadingProgress, setLoadingProgress] = useState(false);
   const [progressError, setProgressError] = useState("");
   const [progressLoadedAt, setProgressLoadedAt] = useState(null);
+  // On-demand Coach-Change News Check -- runs the same batch the nightly
+  // cron does, right now, instead of waiting for the fixed schedule.
+  const [runningNewsCheck, setRunningNewsCheck] = useState(false);
+  const [newsCheckResult, setNewsCheckResult] = useState(null);
+  const [newsCheckError, setNewsCheckError] = useState("");
 
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState("");
@@ -827,6 +832,35 @@ export default function DataQualityPage() {
   useEffect(() => {
     if (pageTab === "progress" && !progressStats) loadProgress();
   }, [pageTab, progressStats, loadProgress]);
+
+  // Fires the same batch the nightly coach-news-check cron runs (300
+  // schools, oldest-checked-first), on demand -- see
+  // app/api/admin/run-news-check. Safe to click repeatedly: each run only
+  // ever advances against school_news_check_priority's own staleness
+  // order, so back-to-back clicks pick up fresh schools each time, never
+  // the same slice twice in a row.
+  const runNewsCheckNow = useCallback(async () => {
+    setRunningNewsCheck(true);
+    setNewsCheckError("");
+    setNewsCheckResult(null);
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const res = await fetch("/api/admin/run-news-check", {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session?.access_token}` },
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok || json.error) throw new Error(json.error || "Could not run the news check.");
+      setNewsCheckResult(json);
+      loadProgress(); // today's activity / recent runs may have shifted
+    } catch (err) {
+      setNewsCheckError(err.message || "Could not run the news check.");
+    } finally {
+      setRunningNewsCheck(false);
+    }
+  }, [supabase, loadProgress]);
 
   const loadMaxprepsOpportunities = useCallback(async () => {
     if (!canReview) {
@@ -2251,6 +2285,28 @@ export default function DataQualityPage() {
                 </tbody>
               </table>
             </div>
+          </div>
+
+          <div className="card" style={{ marginBottom: 14 }}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10 }}>
+              <div>
+                <h3 style={{ marginBottom: 2 }}>Coach-Change News Check</h3>
+                <p style={{ fontSize: 12.5, color: "#697386", margin: 0 }}>
+                  Runs the same 300-school Google News scan the nightly sweep does, right now, instead of waiting for the 11:00 AM UTC schedule. Safe to click again right after — each run picks up the next-stalest schools, never the same ones twice in a row.
+                </p>
+              </div>
+              <button className="btn btn-gold btn-sm" onClick={runNewsCheckNow} disabled={runningNewsCheck}>
+                {runningNewsCheck ? "Running… (up to ~50 sec)" : "Run Now"}
+              </button>
+            </div>
+            {newsCheckError && <div className="notice danger" style={{ marginTop: 10 }}>{newsCheckError}</div>}
+            {newsCheckResult && !newsCheckError && (
+              <div className="notice info" style={{ marginTop: 10 }}>
+                {newsCheckResult.skipped
+                  ? newsCheckResult.reason
+                  : `Checked ${newsCheckResult.processed} schools — ${newsCheckResult.summary?.change_detected || 0} possible coaching change${(newsCheckResult.summary?.change_detected || 0) === 1 ? "" : "s"} found, ${newsCheckResult.flags_opened} flag${newsCheckResult.flags_opened === 1 ? "" : "s"} opened.`}
+              </div>
+            )}
           </div>
 
           <div className="card">
