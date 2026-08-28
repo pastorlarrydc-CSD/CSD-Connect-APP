@@ -4,7 +4,7 @@ import Link from "next/link";
 import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
-import { classifySchools, classifySchool } from "@/lib/dataQuality";
+import { classifySchools, classifySchool, isBlank, hasFullCoachRecord } from "@/lib/dataQuality";
 
 const PAGE_SIZE = 1000;
 const DISPLAY_CAP = 200;
@@ -107,6 +107,23 @@ const EDIT_FIELDS = [
 const AUTOMATED_FLAG_PREFIXES = ["Automated nightly recheck", "Automated weak-match recheck", "Automated email check", "Automated news check"];
 function isAutomatedFlag(reason) {
   return AUTOMATED_FLAG_PREFIXES.some((prefix) => (reason || "").startsWith(prefix));
+}
+
+// A Coach-Change Radar row counts as fully worked once its school passes
+// hasFullCoachRecord (see lib/dataQuality.js -- shared with the daily
+// digest email so the two can't drift apart on what "done" means).
+// Checked against the school's CURRENT field values (joined live on every
+// radar-page load), so it updates itself the moment those fields are
+// saved elsewhere in the app -- no separate click required.
+function isRadarRowAutoComplete(row) {
+  return hasFullCoachRecord(row.schools);
+}
+
+// "Done" for every purpose below (tab counts, dimming, Hide Reviewed) --
+// either an explicit Mark Reviewed click, or the auto-complete check above
+// catching up on its own. Either one is enough; a row never needs both.
+function isRadarRowDone(row) {
+  return !!row.reviewed_at || isRadarRowAutoComplete(row);
 }
 
 // Every result code checkSchoolCoach can return (see lib/schoolRecheck.js),
@@ -226,6 +243,19 @@ export default function DataQualityPage() {
   // coming back tomorrow -- not just local component state.
   const [radarHideReviewed, setRadarHideReviewed] = useState(false);
   const [radarReviewingId, setRadarReviewingId] = useState(null);
+  // Bulk "Mark all Confirmed handled" -- Confirmed rows mean the sweep
+  // found the right coach already on the site, nothing to fix, so
+  // clicking through them one at a time is pure busywork.
+  const [radarBulkMarking, setRadarBulkMarking] = useState(false);
+  // Inline "fix this URL" editor on Could Not Load rows -- keyed by
+  // recheck_log row id. radarUrlDrafts holds the in-progress text (only
+  // written to once the field's been touched; falls back to the row's
+  // last-checked URL otherwise), radarUrlSavingId is the one currently
+  // saving, radarUrlErrors/radarUrlSavedIds drive the per-row feedback.
+  const [radarUrlDrafts, setRadarUrlDrafts] = useState({});
+  const [radarUrlSavingId, setRadarUrlSavingId] = useState(null);
+  const [radarUrlErrors, setRadarUrlErrors] = useState({});
+  const [radarUrlSavedIds, setRadarUrlSavedIds] = useState(new Set());
 
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState("");
@@ -493,7 +523,9 @@ export default function DataQualityPage() {
     const since = new Date(Date.now() - 26 * 60 * 60 * 1000).toISOString();
     const { data } = await supabase
       .from("school_recheck_log")
-      .select("id, school_id, result, detail, website_checked, coach_name_checked, checked_at, reviewed_at, reviewed_by, schools(name,city,state)")
+      .select(
+        "id, school_id, result, detail, website_checked, coach_name_checked, checked_at, reviewed_at, reviewed_by, schools(name,city,state,website,hc_first_name,hc_last_name,hc_email,athletics_url,maxpreps_url,hc_twitter,hc_facebook)"
+      )
       .ilike("detail", "[Automated nightly sweep]%")
       .gte("checked_at", since)
       .order("checked_at", { ascending: false })
@@ -855,7 +887,18 @@ export default function DataQualityPage() {
     try {
       const rows = radarFilter === "all" ? radarRows : radarRows.filter((r) => r.result === radarFilter);
       const csv = Papa.unparse({
-        fields: ["school_name", "city", "state", "result", "website_checked", "coach_name_checked", "detail", "checked_at", "reviewed"],
+        fields: [
+          "school_name",
+          "city",
+          "state",
+          "result",
+          "website_checked",
+          "coach_name_checked",
+          "detail",
+          "checked_at",
+          "marked_reviewed",
+          "all_fields_updated",
+        ],
         data: rows.map((r) => [
           r.schools?.name || "",
           r.schools?.city || "",
@@ -866,6 +909,7 @@ export default function DataQualityPage() {
           (r.detail || "").replace("[Automated nightly sweep] ", ""),
           r.checked_at ? new Date(r.checked_at).toISOString() : "",
           r.reviewed_at ? "yes" : "no",
+          isRadarRowAutoComplete(r) ? "yes" : "no",
         ]),
       });
       const suffix = radarFilter === "all" ? "all" : radarFilter;
@@ -890,6 +934,60 @@ export default function DataQualityPage() {
       setRadarRows((prev) => prev.map((r) => (r.id === row.id ? { ...r, ...patch } : r)));
     }
     setRadarReviewingId(null);
+  }
+
+  // Marks every still-open "Confirmed" row as reviewed in one shot. Scoped
+  // deliberately to just result === "confirmed" (not the low-confidence or
+  // MaxPreps variants) -- those two are still worth a human glance since
+  // they're a weaker signal, but a plain Confirmed means the sweep found
+  // the exact coach name on the school's own site, which is as good as a
+  // manual check gets.
+  async function markAllConfirmedHandled() {
+    const ids = radarRows.filter((r) => r.result === "confirmed" && !isRadarRowDone(r)).map((r) => r.id);
+    if (!ids.length) return;
+    setRadarBulkMarking(true);
+    const now = new Date().toISOString();
+    const { error } = await supabase.from("school_recheck_log").update({ reviewed_at: now, reviewed_by: user.id }).in("id", ids);
+    if (!error) {
+      const idSet = new Set(ids);
+      setRadarRows((prev) => prev.map((r) => (idSet.has(r.id) ? { ...r, reviewed_at: now, reviewed_by: user.id } : r)));
+    }
+    setRadarBulkMarking(false);
+  }
+
+  // Saves a corrected website URL right from a "Could not load" row --
+  // same write school profile's Quick Fix would make (schools.website +
+  // a school_change_log entry), just without leaving this page. Doesn't
+  // touch reviewed_at on its own: a fixed URL alone doesn't make
+  // hasFullCoachRecord true (that also needs coach info/Athletics/MaxPreps/
+  // social), so the row clears itself only once the rest catches up, or
+  // stays available for an explicit Mark Reviewed if that's all this one
+  // needed. Tonight's sweep is what actually re-checks the new URL.
+  async function saveRadarUrlFix(row) {
+    const newUrl = (radarUrlDrafts[row.id] ?? row.website_checked ?? "").trim();
+    if (!newUrl) return;
+    setRadarUrlSavingId(row.id);
+    setRadarUrlErrors((prev) => ({ ...prev, [row.id]: "" }));
+    try {
+      const oldUrl = row.schools?.website || row.website_checked || null;
+      const { error: updateErr } = await supabase.from("schools").update({ website: newUrl }).eq("id", row.school_id);
+      if (updateErr) throw updateErr;
+      const { error: logErr } = await supabase.from("school_change_log").insert({
+        school_id: row.school_id,
+        field_name: "website",
+        old_value: oldUrl,
+        new_value: newUrl,
+        source: "Coach-Change Radar (inline fix)",
+        changed_by: user.id,
+      });
+      if (logErr) throw logErr;
+      setRadarRows((prev) => prev.map((r) => (r.id === row.id ? { ...r, schools: { ...r.schools, website: newUrl } } : r)));
+      setRadarUrlSavedIds((prev) => new Set([...prev, row.id]));
+    } catch (err) {
+      setRadarUrlErrors((prev) => ({ ...prev, [row.id]: err.message || "Could not save this URL." }));
+    } finally {
+      setRadarUrlSavingId(null);
+    }
   }
 
   // Exports every school currently in the review queue -- respecting the
@@ -1853,8 +1951,18 @@ export default function DataQualityPage() {
   const confirmedTotal =
     (radarStats?.counts.confirmed || 0) + (radarStats?.counts.confirmed_weak || 0) + (radarStats?.counts.confirmed_maxpreps || 0);
   const radarFilterBaseRows = radarFilter === "all" ? radarRows : radarRows.filter((r) => r.result === radarFilter);
-  const radarFilteredRows = radarHideReviewed ? radarFilterBaseRows.filter((r) => !r.reviewed_at) : radarFilterBaseRows;
-  const radarReviewedCount = radarRows.filter((r) => r.reviewed_at).length;
+  const radarFilteredRows = radarHideReviewed ? radarFilterBaseRows.filter((r) => !isRadarRowDone(r)) : radarFilterBaseRows;
+  const radarReviewedCount = radarRows.filter((r) => isRadarRowDone(r)).length;
+  // Remaining (not-yet-done) count per result bucket, recomputed live from
+  // radarRows on every render -- this is what each filter chip shows, so
+  // "Not found (173)" counts down toward zero as records get handled
+  // (either Mark Reviewed or the four-field auto-complete), instead of
+  // staying frozen at last night's raw total for the rest of the day.
+  const radarRemainingCounts = {};
+  radarRows.forEach((r) => {
+    if (!isRadarRowDone(r)) radarRemainingCounts[r.result] = (radarRemainingCounts[r.result] || 0) + 1;
+  });
+  const radarConfirmedPendingCount = radarRemainingCounts.confirmed || 0;
   const cycleDays = coverageStats?.eligible ? Math.ceil(coverageStats.eligible / RECHECK_BATCH_SIZE) : null;
 
   // Today's List -- a short, finishable daily task list instead of an
@@ -2215,7 +2323,7 @@ export default function DataQualityPage() {
                   onClick={() => setRadarFilter(f.key)}
                 >
                   {f.label}
-                  {f.key !== "all" && radarStats.counts[f.key] ? ` (${radarStats.counts[f.key]})` : ""}
+                  {f.key !== "all" && radarStats.counts[f.key] ? ` (${radarRemainingCounts[f.key] || 0} of ${radarStats.counts[f.key]})` : ""}
                 </button>
               ))}
               <button
@@ -2232,19 +2340,26 @@ export default function DataQualityPage() {
 
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
               <span style={{ fontSize: 12.5, color: "#697386" }}>
-                {radarReviewedCount} of {radarRows.length} reviewed
+                {radarReviewedCount} of {radarRows.length} handled ({radarRows.length - radarReviewedCount} left) — includes both Mark Reviewed and schools where every field is now filled in on its own
               </span>
-              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "#42506b", cursor: "pointer" }}>
-                <input type="checkbox" checked={radarHideReviewed} onChange={(e) => setRadarHideReviewed(e.target.checked)} />
-                Hide reviewed
-              </label>
+              <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                {radarConfirmedPendingCount > 0 && (
+                  <button type="button" className="btn btn-sm" disabled={radarBulkMarking} onClick={markAllConfirmedHandled}>
+                    {radarBulkMarking ? "Marking…" : `Mark all Confirmed handled (${radarConfirmedPendingCount})`}
+                  </button>
+                )}
+                <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "#42506b", cursor: "pointer" }}>
+                  <input type="checkbox" checked={radarHideReviewed} onChange={(e) => setRadarHideReviewed(e.target.checked)} />
+                  Hide handled
+                </label>
+              </div>
             </div>
 
             <div style={{ marginTop: 10 }}>
               {radarFilteredRows.length === 0 ? (
                 <div className="empty-state">
                   {radarHideReviewed && radarFilterBaseRows.length > 0
-                    ? "Everything in this filter is marked reviewed."
+                    ? "Everything in this filter has been handled."
                     : "Nothing matches this filter in last night's run."}
                 </div>
               ) : (
@@ -2252,8 +2367,10 @@ export default function DataQualityPage() {
                   {radarFilteredRows.slice(0, DISPLAY_CAP).map((row) => {
                     const meta = RADAR_RESULT_META[row.result] || { label: row.result, color: "#42506b", bg: "#e8ebf0" };
                     const isReviewed = !!row.reviewed_at;
+                    const isAutoComplete = !isReviewed && isRadarRowAutoComplete(row);
+                    const isDone = isReviewed || isAutoComplete;
                     return (
-                      <div className="log-item" key={row.id} style={{ paddingBottom: 10, opacity: isReviewed ? 0.6 : 1 }}>
+                      <div className="log-item" key={row.id} style={{ paddingBottom: 10, opacity: isDone ? 0.6 : 1 }}>
                         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
                           <div>
                             <strong>{row.schools?.name || `School #${row.school_id}`}</strong> — {row.schools?.city}, {row.schools?.state}
@@ -2280,9 +2397,39 @@ export default function DataQualityPage() {
                                 ✓ Reviewed {fmtRelativeTime(new Date(row.reviewed_at))}
                               </span>
                             )}
+                            {isAutoComplete && (
+                              <span style={{ marginLeft: 6, fontSize: 11, color: "#1a7f37" }} title="Coach name/email, Athletics URL, MaxPreps URL, and a social handle are all on file for this school now.">
+                                ✓ All fields updated
+                              </span>
+                            )}
                             <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
                               {(row.detail || "").replace("[Automated nightly sweep] ", "")}
                             </div>
+                            {row.result === "fetch_error" && (
+                              <div style={{ marginTop: 6, display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                                <input
+                                  type="text"
+                                  placeholder="Corrected website URL"
+                                  defaultValue={row.website_checked || row.schools?.website || ""}
+                                  onChange={(e) => setRadarUrlDrafts((prev) => ({ ...prev, [row.id]: e.target.value }))}
+                                  style={{ flex: "1 1 260px", minWidth: 200, padding: "6px 8px", fontSize: 12.5, border: "1px solid #d9dce3", borderRadius: 6 }}
+                                />
+                                <button
+                                  type="button"
+                                  className="btn btn-sm"
+                                  disabled={radarUrlSavingId === row.id}
+                                  onClick={() => saveRadarUrlFix(row)}
+                                >
+                                  {radarUrlSavingId === row.id ? "Saving…" : "Save URL"}
+                                </button>
+                                {radarUrlSavedIds.has(row.id) && (
+                                  <span style={{ fontSize: 11, color: "#1a7f37" }}>✓ Website updated — rechecked in tonight's sweep</span>
+                                )}
+                              </div>
+                            )}
+                            {radarUrlErrors[row.id] && (
+                              <div style={{ fontSize: 11.5, color: "#b3261e", marginTop: 4 }}>{radarUrlErrors[row.id]}</div>
+                            )}
                           </div>
                           <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
                             <div style={{ display: "flex", gap: 6 }}>
@@ -2294,7 +2441,7 @@ export default function DataQualityPage() {
                                 onClick={() => toggleRadarReviewed(row)}
                                 style={isReviewed ? { background: "#0b1f3a", color: "#fff", borderColor: "#0b1f3a" } : undefined}
                               >
-                                {radarReviewingId === row.id ? "…" : isReviewed ? "✓ Reviewed" : "Mark Reviewed"}
+                                {radarReviewingId === row.id ? "…" : isReviewed ? "✓ Reviewed" : isAutoComplete ? "Mark Reviewed too" : "Mark Reviewed"}
                               </button>
                             </div>
                             <span style={{ fontSize: 11, color: "#9aa2b1", whiteSpace: "nowrap" }}>
