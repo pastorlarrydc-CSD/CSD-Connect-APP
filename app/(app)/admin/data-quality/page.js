@@ -216,6 +216,16 @@ export default function DataQualityPage() {
   const [radarFilter, setRadarFilter] = useState("all");
   const [radarExporting, setRadarExporting] = useState(false);
   const [radarExportError, setRadarExportError] = useState("");
+  // "Mark Reviewed" -- an explicit, persisted way to know you've already
+  // dealt with a given radar row, separate from whether the underlying
+  // school record actually changed (fixing a dead website URL, or simply
+  // confirming the data on file is already right, leaves no trace in
+  // school_change_log at all, so that alone can't tell "handled" apart
+  // from "haven't looked at it yet"). Stored on school_recheck_log itself
+  // (reviewed_at/reviewed_by) so it survives a refresh, a new tab, or
+  // coming back tomorrow -- not just local component state.
+  const [radarHideReviewed, setRadarHideReviewed] = useState(false);
+  const [radarReviewingId, setRadarReviewingId] = useState(null);
 
   const [scanning, setScanning] = useState(false);
   const [scanError, setScanError] = useState("");
@@ -483,7 +493,7 @@ export default function DataQualityPage() {
     const since = new Date(Date.now() - 26 * 60 * 60 * 1000).toISOString();
     const { data } = await supabase
       .from("school_recheck_log")
-      .select("id, school_id, result, detail, website_checked, coach_name_checked, checked_at, schools(name,city,state)")
+      .select("id, school_id, result, detail, website_checked, coach_name_checked, checked_at, reviewed_at, reviewed_by, schools(name,city,state)")
       .ilike("detail", "[Automated nightly sweep]%")
       .gte("checked_at", since)
       .order("checked_at", { ascending: false })
@@ -845,7 +855,7 @@ export default function DataQualityPage() {
     try {
       const rows = radarFilter === "all" ? radarRows : radarRows.filter((r) => r.result === radarFilter);
       const csv = Papa.unparse({
-        fields: ["school_name", "city", "state", "result", "website_checked", "coach_name_checked", "detail", "checked_at"],
+        fields: ["school_name", "city", "state", "result", "website_checked", "coach_name_checked", "detail", "checked_at", "reviewed"],
         data: rows.map((r) => [
           r.schools?.name || "",
           r.schools?.city || "",
@@ -855,6 +865,7 @@ export default function DataQualityPage() {
           r.coach_name_checked || "",
           (r.detail || "").replace("[Automated nightly sweep] ", ""),
           r.checked_at ? new Date(r.checked_at).toISOString() : "",
+          r.reviewed_at ? "yes" : "no",
         ]),
       });
       const suffix = radarFilter === "all" ? "all" : radarFilter;
@@ -864,6 +875,21 @@ export default function DataQualityPage() {
     } finally {
       setRadarExporting(false);
     }
+  }
+
+  // Toggles the explicit "reviewed" mark on one Coach-Change Radar row.
+  // Persisted on school_recheck_log itself so it's there next time this
+  // page loads -- a refresh, a new tab, or coming back tomorrow -- not
+  // just local state that resets the moment you navigate away.
+  async function toggleRadarReviewed(row) {
+    setRadarReviewingId(row.id);
+    const nowReviewed = !row.reviewed_at;
+    const patch = nowReviewed ? { reviewed_at: new Date().toISOString(), reviewed_by: user.id } : { reviewed_at: null, reviewed_by: null };
+    const { error } = await supabase.from("school_recheck_log").update(patch).eq("id", row.id);
+    if (!error) {
+      setRadarRows((prev) => prev.map((r) => (r.id === row.id ? { ...r, ...patch } : r)));
+    }
+    setRadarReviewingId(null);
   }
 
   // Exports every school currently in the review queue -- respecting the
@@ -1826,7 +1852,9 @@ export default function DataQualityPage() {
   const automatedPendingCount = flaggedQueue.filter((f) => isAutomatedFlag(f.reason)).length;
   const confirmedTotal =
     (radarStats?.counts.confirmed || 0) + (radarStats?.counts.confirmed_weak || 0) + (radarStats?.counts.confirmed_maxpreps || 0);
-  const radarFilteredRows = radarFilter === "all" ? radarRows : radarRows.filter((r) => r.result === radarFilter);
+  const radarFilterBaseRows = radarFilter === "all" ? radarRows : radarRows.filter((r) => r.result === radarFilter);
+  const radarFilteredRows = radarHideReviewed ? radarFilterBaseRows.filter((r) => !r.reviewed_at) : radarFilterBaseRows;
+  const radarReviewedCount = radarRows.filter((r) => r.reviewed_at).length;
   const cycleDays = coverageStats?.eligible ? Math.ceil(coverageStats.eligible / RECHECK_BATCH_SIZE) : null;
 
   // Today's List -- a short, finishable daily task list instead of an
@@ -2202,15 +2230,30 @@ export default function DataQualityPage() {
             </div>
             {radarExportError && <div className="notice danger" style={{ marginTop: 8 }}>{radarExportError}</div>}
 
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginTop: 10 }}>
+              <span style={{ fontSize: 12.5, color: "#697386" }}>
+                {radarReviewedCount} of {radarRows.length} reviewed
+              </span>
+              <label style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12.5, color: "#42506b", cursor: "pointer" }}>
+                <input type="checkbox" checked={radarHideReviewed} onChange={(e) => setRadarHideReviewed(e.target.checked)} />
+                Hide reviewed
+              </label>
+            </div>
+
             <div style={{ marginTop: 10 }}>
               {radarFilteredRows.length === 0 ? (
-                <div className="empty-state">Nothing matches this filter in last night&apos;s run.</div>
+                <div className="empty-state">
+                  {radarHideReviewed && radarFilterBaseRows.length > 0
+                    ? "Everything in this filter is marked reviewed."
+                    : "Nothing matches this filter in last night's run."}
+                </div>
               ) : (
                 <>
                   {radarFilteredRows.slice(0, DISPLAY_CAP).map((row) => {
                     const meta = RADAR_RESULT_META[row.result] || { label: row.result, color: "#42506b", bg: "#e8ebf0" };
+                    const isReviewed = !!row.reviewed_at;
                     return (
-                      <div className="log-item" key={row.id} style={{ paddingBottom: 10 }}>
+                      <div className="log-item" key={row.id} style={{ paddingBottom: 10, opacity: isReviewed ? 0.6 : 1 }}>
                         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
                           <div>
                             <strong>{row.schools?.name || `School #${row.school_id}`}</strong> — {row.schools?.city}, {row.schools?.state}
@@ -2227,12 +2270,33 @@ export default function DataQualityPage() {
                             >
                               {meta.label}
                             </span>
+                            {recentCoachChangeBySchool.has(row.school_id) && (
+                              <span style={{ marginLeft: 6, fontSize: 11, color: "#1a7f37" }}>
+                                ✓ Coach changed {fmtRelativeTime(new Date(recentCoachChangeBySchool.get(row.school_id).changed_at))}
+                              </span>
+                            )}
+                            {isReviewed && (
+                              <span style={{ marginLeft: 6, fontSize: 11, color: "#42506b" }}>
+                                ✓ Reviewed {fmtRelativeTime(new Date(row.reviewed_at))}
+                              </span>
+                            )}
                             <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
                               {(row.detail || "").replace("[Automated nightly sweep] ", "")}
                             </div>
                           </div>
                           <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
-                            <Link href={`/schools/${row.school_id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
+                            <div style={{ display: "flex", gap: 6 }}>
+                              <Link href={`/schools/${row.school_id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
+                              <button
+                                type="button"
+                                className="btn btn-sm"
+                                disabled={radarReviewingId === row.id}
+                                onClick={() => toggleRadarReviewed(row)}
+                                style={isReviewed ? { background: "#0b1f3a", color: "#fff", borderColor: "#0b1f3a" } : undefined}
+                              >
+                                {radarReviewingId === row.id ? "…" : isReviewed ? "✓ Reviewed" : "Mark Reviewed"}
+                              </button>
+                            </div>
                             <span style={{ fontSize: 11, color: "#9aa2b1", whiteSpace: "nowrap" }}>
                               {row.checked_at ? new Date(row.checked_at).toLocaleString() : ""}
                             </span>
