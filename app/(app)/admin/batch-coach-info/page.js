@@ -84,6 +84,13 @@ export default function BatchCoachInfoPage() {
   const [scopeMode, setScopeMode] = useState("priority"); // "priority" | "all"
   const [customStates, setCustomStates] = useState(PRIORITY_STATES.join(", "));
   const [targetCount, setTargetCount] = useState(DEFAULT_TARGET_COUNT);
+  // Off by default so this tool keeps pulling from its full existing pool
+  // (athletics URL OR just a general website) unless asked not to. On, it
+  // narrows to schools that already have an Athletics URL specifically --
+  // an athletics/staff page tends to read cleaner for the model than a
+  // school's general homepage, so results skew more accurate at the cost
+  // of a smaller candidate pool per run.
+  const [requireAthletics, setRequireAthletics] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState("");
 
@@ -152,9 +159,12 @@ export default function BatchCoachInfoPage() {
         .select("id,name,city,state")
         .or("hc_first_name.is.null,hc_first_name.eq.")
         .or("hc_last_name.is.null,hc_last_name.eq.")
-        .or("athletics_url.not.is.null,website.not.is.null")
         .order("id", { ascending: true })
         .limit(targetCount);
+      // requireAthletics narrows the source pool to just Athletics URL;
+      // otherwise keep the looser "athletics OR general website" check
+      // this tool has always used.
+      query = requireAthletics ? query.not("athletics_url", "is", null).neq("athletics_url", "") : query.or("athletics_url.not.is.null,website.not.is.null");
       if (scopeMode !== "all" || states.length) {
         query = query.in("state", states);
       }
@@ -384,6 +394,10 @@ export default function BatchCoachInfoPage() {
               style={{ maxWidth: 360 }}
             />
           )}
+          <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
+            <input type="checkbox" checked={requireAthletics} onChange={(e) => setRequireAthletics(e.target.checked)} />
+            Require an Athletics URL on file (more accurate — skips schools with only a general website)
+          </label>
           <label style={{ fontSize: 13 }}>
             How many schools:{" "}
             <select value={targetCount} onChange={(e) => setTargetCount(Number(e.target.value))}>
