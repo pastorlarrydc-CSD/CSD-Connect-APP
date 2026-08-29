@@ -756,37 +756,56 @@ export default function DataQualityPage() {
       // no error, just a truncated result -- so all three read every page
       // via .range() instead of trusting a single request to return
       // everything. Ordering by id keeps each page stable across requests.
+      //
+      // Pages are fetched in parallel, not one at a time: the first page also
+      // asks Postgres for an exact total count (count: "exact"), which tells
+      // us how many more pages exist -- then all of those fire at once via
+      // Promise.all instead of waiting on each other in a loop. Fetching
+      // ~15 schools pages serially (the original version of this fix) took
+      // ~25 seconds end-to-end even though every individual request was fast
+      // and correct -- long enough that the Progress tab looked permanently
+      // stuck on "Refreshing...". Fetching the same pages in parallel
+      // finishes in roughly the time of the single slowest page instead of
+      // the sum of all of them.
       async function fetchAllRows(queryFactory, pageSize = 1000) {
-        let offset = 0;
-        let all = [];
-        while (true) {
-          const { data, error } = await queryFactory().range(offset, offset + pageSize - 1);
-          if (error) throw error;
-          all = all.concat(data || []);
-          if (!data || data.length < pageSize) break;
-          offset += pageSize;
+        const first = await queryFactory({ count: "exact" }).range(0, pageSize - 1);
+        if (first.error) throw first.error;
+        const rows = [...(first.data || [])];
+        const total = first.count ?? rows.length;
+        const remainingPages = Math.max(0, Math.ceil(total / pageSize) - 1);
+        if (remainingPages > 0) {
+          const pages = await Promise.all(
+            Array.from({ length: remainingPages }, (_, i) => {
+              const offset = (i + 1) * pageSize;
+              return queryFactory().range(offset, offset + pageSize - 1);
+            })
+          );
+          for (const p of pages) {
+            if (p.error) throw p.error;
+            rows.push(...(p.data || []));
+          }
         }
-        return all;
+        return rows;
       }
 
       const [rows, todayRows, weekRows, athleticsRunsRes, coachInfoRunsRes] = await Promise.all([
-        fetchAllRows(() =>
+        fetchAllRows((opts) =>
           supabase
             .from("schools")
-            .select("hc_first_name,hc_last_name,hc_email,athletics_url,maxpreps_url,hc_twitter,hc_facebook")
+            .select("hc_first_name,hc_last_name,hc_email,athletics_url,maxpreps_url,hc_twitter,hc_facebook", opts)
             .order("id", { ascending: true })
         ),
-        fetchAllRows(() =>
+        fetchAllRows((opts) =>
           supabase
             .from("school_change_log")
-            .select("field_name, source")
+            .select("field_name, source", opts)
             .gte("changed_at", startOfToday.toISOString())
             .order("id", { ascending: true })
         ),
-        fetchAllRows(() =>
+        fetchAllRows((opts) =>
           supabase
             .from("school_change_log")
-            .select("field_name, changed_at")
+            .select("field_name, changed_at", opts)
             .gte("changed_at", sevenDaysAgo.toISOString())
             .order("id", { ascending: true })
         ),
