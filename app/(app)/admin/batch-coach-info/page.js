@@ -81,6 +81,16 @@ export default function BatchCoachInfoPage() {
   const [items, setItems] = useState([]);
   const [loadingItems, setLoadingItems] = useState(false);
 
+  // "no_name" (default): the original targeting -- schools with no head
+  // coach name on file at all. "missing_email": a school already HAS a
+  // coach name but is missing just the email (and often phone/socials) --
+  // a much smaller, much closer-to-done pool that the original targeting
+  // never touched (it required BOTH name fields blank). Since the coach's
+  // name is already known here, fetch-item's search is name-targeted
+  // (buildSearchQuery in lib/coachInfoLookup.js) instead of the generic
+  // "who is the coach" search, so it's more likely to actually surface an
+  // email rather than just re-confirming a name already on file.
+  const [candidateMode, setCandidateMode] = useState("no_name"); // "no_name" | "missing_email"
   const [scopeMode, setScopeMode] = useState("priority"); // "priority" | "all"
   const [customStates, setCustomStates] = useState(PRIORITY_STATES.join(", "));
   const [targetCount, setTargetCount] = useState(DEFAULT_TARGET_COUNT);
@@ -89,7 +99,9 @@ export default function BatchCoachInfoPage() {
   // narrows to schools that already have an Athletics URL specifically --
   // an athletics/staff page tends to read cleaner for the model than a
   // school's general homepage, so results skew more accurate at the cost
-  // of a smaller candidate pool per run.
+  // of a smaller candidate pool per run. In "missing_email" mode a URL
+  // isn't required at all by default (the name-targeted search alone is
+  // often enough), so this only narrows the pool further if turned on.
   const [requireAthletics, setRequireAthletics] = useState(false);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState("");
@@ -157,14 +169,36 @@ export default function BatchCoachInfoPage() {
       let query = supabase
         .from("schools")
         .select("id,name,city,state")
-        .or("hc_first_name.is.null,hc_first_name.eq.")
-        .or("hc_last_name.is.null,hc_last_name.eq.")
         .order("id", { ascending: true })
         .limit(targetCount);
-      // requireAthletics narrows the source pool to just Athletics URL;
-      // otherwise keep the looser "athletics OR general website" check
-      // this tool has always used.
-      query = requireAthletics ? query.not("athletics_url", "is", null).neq("athletics_url", "") : query.or("athletics_url.not.is.null,website.not.is.null");
+
+      if (candidateMode === "missing_email") {
+        // Coach's name is already on file -- just the email is missing.
+        // The opposite condition from "no_name" below (De Morgan's on the
+        // same blank checks): both name fields present, email blank.
+        query = query
+          .not("hc_first_name", "is", null)
+          .neq("hc_first_name", "")
+          .not("hc_last_name", "is", null)
+          .neq("hc_last_name", "")
+          .or("hc_email.is.null,hc_email.eq.");
+      } else {
+        query = query.or("hc_first_name.is.null,hc_first_name.eq.").or("hc_last_name.is.null,hc_last_name.eq.");
+      }
+
+      // requireAthletics narrows the source pool to just Athletics URL.
+      // Outside that, "no_name" mode keeps the looser "athletics OR general
+      // website" check this tool has always used (a page to search from is
+      // essential when the coach isn't known yet); "missing_email" mode
+      // doesn't require a URL at all by default -- the name-targeted search
+      // alone is usually enough to find an email, and requiring a URL here
+      // would needlessly shrink an already-small candidate pool.
+      if (requireAthletics) {
+        query = query.not("athletics_url", "is", null).neq("athletics_url", "");
+      } else if (candidateMode !== "missing_email") {
+        query = query.or("athletics_url.not.is.null,website.not.is.null");
+      }
+
       if (scopeMode !== "all" || states.length) {
         query = query.in("state", states);
       }
@@ -172,13 +206,23 @@ export default function BatchCoachInfoPage() {
       const { data: schoolsData, error: schoolsErr } = await query;
       if (schoolsErr) throw schoolsErr;
       if (!schoolsData || schoolsData.length === 0) {
-        setCreateError("No schools matched -- everyone missing coach info in this scope already has a batch run, or has no website/athletics URL on file to search from.");
+        setCreateError(
+          candidateMode === "missing_email"
+            ? "No schools matched -- everyone with a coach name on file in this scope already has an email, or already has a batch run in progress."
+            : "No schools matched -- everyone missing coach info in this scope already has a batch run, or has no website/athletics URL on file to search from."
+        );
         return;
       }
 
       const { data: runRow, error: runErr } = await supabase
         .from("coach_info_batch_runs")
-        .insert({ status: "collecting", state_filter: scopeMode === "all" && states.length === 0 ? null : states, requested_count: schoolsData.length, created_by: user.id })
+        .insert({
+          status: "collecting",
+          state_filter: scopeMode === "all" && states.length === 0 ? null : states,
+          requested_count: schoolsData.length,
+          created_by: user.id,
+          candidate_mode: candidateMode,
+        })
         .select()
         .single();
       if (runErr) throw runErr;
@@ -375,9 +419,21 @@ export default function BatchCoachInfoPage() {
       <div className="card" style={{ marginBottom: 14 }}>
         <h3>Start a New Batch Run</h3>
         <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
-          Pulls schools missing a head coach name that have an athletics or general website on file to search from -- schools with neither can't be helped by this tool.
+          {candidateMode === "missing_email"
+            ? "Pulls schools that already have a head coach name on file but are missing an email -- searches for that specific coach by name instead of the generic \"who is the coach\" search."
+            : "Pulls schools missing a head coach name that have an athletics or general website on file to search from -- schools with neither can't be helped by this tool."}
         </p>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, paddingBottom: 4, borderBottom: "1px solid #e3e6ea", marginBottom: 2 }}>
+            <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
+              <input type="radio" checked={candidateMode === "no_name"} onChange={() => setCandidateMode("no_name")} />
+              No coach name on file (the original targeting)
+            </label>
+            <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
+              <input type="radio" checked={candidateMode === "missing_email"} onChange={() => setCandidateMode("missing_email")} />
+              Has a coach name, but missing an email
+            </label>
+          </div>
           <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
             <input type="radio" checked={scopeMode === "priority"} onChange={() => setScopeMode("priority")} />
             Priority recruiting states ({PRIORITY_STATES.join(", ")})
@@ -448,6 +504,7 @@ export default function BatchCoachInfoPage() {
                 <div style={{ fontSize: 12.5 }}>
                   <strong>Run #{r.id}</strong> — {new Date(r.created_at).toLocaleString()} — {r.state_filter ? r.state_filter.join(", ") : "all states"} — {r.requested_count} school
                   {r.requested_count === 1 ? "" : "s"}
+                  {r.candidate_mode === "missing_email" ? " — missing email" : ""}
                 </div>
                 <StatusBadge status={r.status} />
               </div>
