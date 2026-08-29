@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
 import { withProtocol } from "@/lib/schoolRecheck";
-import { fetchPageText, searchWeb, SYSTEM_PROMPT, parseModelJson, normalizeSuggestion, buildSourceBlocks, MODEL } from "@/lib/coachInfoLookup";
+import { fetchPageText, searchWeb, SYSTEM_PROMPT, parseModelJson, normalizeSuggestion, buildSourceBlocks, buildSearchQuery, MODEL } from "@/lib/coachInfoLookup";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
 
@@ -92,10 +92,13 @@ export async function POST(req, { params }) {
     const athleticsUrl = withProtocol(school.athletics_url);
     const websiteUrl = withProtocol(school.website);
 
-    // No exact-phrase quoting around school.name, same reasoning as the
-    // athletics/MaxPreps searches -- a school's public-facing name in
-    // search results sometimes differs slightly from the legal/CSD name.
-    const searchQuery = `${school.name} ${school.city || ""} ${school.state || ""} head football coach`;
+    // Name-targeted search when a coach is already on file -- e.g. a
+    // reviewer re-running this on a school that has a name but no email
+    // yet. See buildSearchQuery: falls back to the original school-only
+    // query (no exact-phrase quoting around school.name, since a school's
+    // public-facing name in search results sometimes differs slightly from
+    // the legal/CSD name) when no name is on file yet.
+    const searchQuery = buildSearchQuery(school);
 
     const [athleticsFetch, websiteFetch, searchResults] = await Promise.all([
       athleticsUrl ? fetchPageText(athleticsUrl) : Promise.resolve(null),
