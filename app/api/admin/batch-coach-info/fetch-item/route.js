@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
 import { withProtocol } from "@/lib/schoolRecheck";
-import { fetchPageText, searchWeb, buildSourceBlocks } from "@/lib/coachInfoLookup";
+import { fetchPageText, searchWeb, buildSourceBlocks, buildSearchQuery } from "@/lib/coachInfoLookup";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
 
@@ -69,7 +69,9 @@ export async function POST(req) {
 
     const athleticsUrl = withProtocol(school.athletics_url);
     const websiteUrl = withProtocol(school.website);
-    const searchQuery = `${school.name} ${school.city || ""} ${school.state || ""} head football coach`;
+    // Name-targeted search when a coach is already on file (e.g. this item
+    // came from the "missing email" targeting mode) -- see buildSearchQuery.
+    const searchQuery = buildSearchQuery(school);
 
     const [athleticsFetch, websiteFetch, searchResults] = await Promise.all([
       athleticsUrl ? fetchPageText(athleticsUrl) : Promise.resolve(null),
