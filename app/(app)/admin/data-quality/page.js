@@ -750,18 +750,50 @@ export default function DataQualityPage() {
       startOfToday.setHours(0, 0, 0, 0);
       const sevenDaysAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
 
-      const [coverageRes, todayRes, weekRes, athleticsRunsRes, coachInfoRunsRes] = await Promise.all([
-        supabase.from("schools").select("hc_first_name,hc_last_name,hc_email,athletics_url,maxpreps_url,hc_twitter,hc_facebook"),
-        supabase.from("school_change_log").select("field_name, source").gte("changed_at", startOfToday.toISOString()),
-        supabase.from("school_change_log").select("field_name, changed_at").gte("changed_at", sevenDaysAgo.toISOString()),
+      // Supabase/PostgREST caps a plain .select() at 1000 rows per request
+      // (db-max-rows). With ~14,600 schools and school_change_log growing
+      // by hundreds a day, every query below can blow past that silently --
+      // no error, just a truncated result -- so all three read every page
+      // via .range() instead of trusting a single request to return
+      // everything. Ordering by id keeps each page stable across requests.
+      async function fetchAllRows(queryFactory, pageSize = 1000) {
+        let offset = 0;
+        let all = [];
+        while (true) {
+          const { data, error } = await queryFactory().range(offset, offset + pageSize - 1);
+          if (error) throw error;
+          all = all.concat(data || []);
+          if (!data || data.length < pageSize) break;
+          offset += pageSize;
+        }
+        return all;
+      }
+
+      const [rows, todayRows, weekRows, athleticsRunsRes, coachInfoRunsRes] = await Promise.all([
+        fetchAllRows(() =>
+          supabase
+            .from("schools")
+            .select("hc_first_name,hc_last_name,hc_email,athletics_url,maxpreps_url,hc_twitter,hc_facebook")
+            .order("id", { ascending: true })
+        ),
+        fetchAllRows(() =>
+          supabase
+            .from("school_change_log")
+            .select("field_name, source")
+            .gte("changed_at", startOfToday.toISOString())
+            .order("id", { ascending: true })
+        ),
+        fetchAllRows(() =>
+          supabase
+            .from("school_change_log")
+            .select("field_name, changed_at")
+            .gte("changed_at", sevenDaysAgo.toISOString())
+            .order("id", { ascending: true })
+        ),
         supabase.from("athletics_batch_runs").select("id, status, requested_count, fetched_count, created_at").order("created_at", { ascending: false }).limit(5),
         supabase.from("coach_info_batch_runs").select("id, status, requested_count, fetched_count, created_at").order("created_at", { ascending: false }).limit(5),
       ]);
-      if (coverageRes.error) throw coverageRes.error;
-      if (todayRes.error) throw todayRes.error;
-      if (weekRes.error) throw weekRes.error;
 
-      const rows = coverageRes.data || [];
       const total = rows.length;
       let coachInfo = 0, athletics = 0, maxpreps = 0, social = 0, fullyComplete = 0;
       rows.forEach((s) => {
@@ -783,20 +815,20 @@ export default function DataQualityPage() {
 
       const byDim = {};
       const bySourceMap = new Map();
-      (todayRes.data || []).forEach((row) => {
+      todayRows.forEach((row) => {
         const dim = fieldToDimension(row.field_name);
         if (dim) byDim[dim] = (byDim[dim] || 0) + 1;
         const src = normalizeSource(row.source);
         bySourceMap.set(src, (bySourceMap.get(src) || 0) + 1);
       });
       setProgressToday({
-        total: (todayRes.data || []).length,
+        total: todayRows.length,
         byDim,
         bySource: Array.from(bySourceMap.entries()).sort((a, b) => b[1] - a[1]),
       });
 
       const weekByDim = {};
-      (weekRes.data || []).forEach((row) => {
+      weekRows.forEach((row) => {
         const dim = fieldToDimension(row.field_name);
         if (dim) weekByDim[dim] = (weekByDim[dim] || 0) + 1;
       });
