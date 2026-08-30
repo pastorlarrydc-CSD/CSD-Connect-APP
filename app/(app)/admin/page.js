@@ -274,8 +274,11 @@ export default function AdminPage() {
               <Link href="/admin/batch-athletics" className="btn btn-sm btn-primary" style={{ marginRight: 8 }}>
                 Batch Athletics-URL Discovery
               </Link>
-              <Link href="/admin/batch-social" className="btn btn-sm btn-primary">
+              <Link href="/admin/batch-social" className="btn btn-sm btn-primary" style={{ marginRight: 8 }}>
                 Batch Social Media Discovery
+              </Link>
+              <Link href="/admin/batch-maxpreps" className="btn btn-sm btn-primary">
+                Batch MaxPreps Discovery
               </Link>
             </div>
           </div>
