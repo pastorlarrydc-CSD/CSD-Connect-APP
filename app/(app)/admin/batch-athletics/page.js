@@ -1,4 +1,4 @@
-"use client";
+ "use client";
 import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
@@ -34,6 +34,7 @@ const PRIORITY_STATES = ["TX", "FL", "GA", "CA", "OH", "IN"];
 const TARGET_COUNTS = [100, 300, 500, 1000];
 const DEFAULT_TARGET_COUNT = 300;
 const FETCH_CONCURRENCY = 3;
+const APPLY_CONCURRENCY = 5; // applying is just a DB write, no web fetch/AI call, so higher concurrency than FETCH_CONCURRENCY is safe -- matches batch-coach-info
 
 const ITEM_SELECT =
   "id,batch_run_id,school_id,fetch_status,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,athletics_url)";
@@ -105,6 +106,8 @@ export default function BatchAthleticsPage() {
   const [applyingId, setApplyingId] = useState(null);
   const [reviewError, setReviewError] = useState("");
   const [showReviewed, setShowReviewed] = useState(false);
+  const [bulkApplying, setBulkApplying] = useState(false);
+  const [bulkProgress, setBulkProgress] = useState({ done: 0, total: 0 });
 
   const selectedRun = runs.find((r) => r.id === selectedRunId) || null;
 
@@ -282,12 +285,15 @@ export default function BatchAthleticsPage() {
     }
   }
 
-  async function applyItem(item) {
+  // Pulled out of applyItem so bulkApplyHighConfidence can reuse the exact
+  // same write path (schools update + school_change_log entry + item
+  // marked applied) for each item in a batch, without touching the
+  // single-item applyingId/reviewError state that only makes sense for one
+  // row at a time. Mirrors the same split on the Batch Coach-Info page.
+  async function applySuggestionCore(item) {
     const s = item.school;
     const sug = item.suggestion;
-    if (!s || !sug || !sug.best_url) return;
-    setApplyingId(item.id);
-    setReviewError("");
+    if (!s || !sug || !sug.best_url) return { ok: false, error: "Missing school or suggestion." };
     try {
       const newVal = sug.best_url;
       if (newVal !== (s.athletics_url || "")) {
@@ -308,11 +314,59 @@ export default function BatchAthleticsPage() {
         .update({ review_status: "applied", reviewed_at: new Date().toISOString(), reviewed_by: user.id })
         .eq("id", item.id);
       if (itemErr) throw itemErr;
-      setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: "applied" } : i)));
+      return { ok: true };
     } catch (err) {
-      setReviewError(err.message || "Could not apply this suggestion.");
-    } finally {
-      setApplyingId(null);
+      return { ok: false, error: err.message || "Could not apply this suggestion." };
+    }
+  }
+
+  async function applyItem(item) {
+    setApplyingId(item.id);
+    setReviewError("");
+    const result = await applySuggestionCore(item);
+    if (result.ok) {
+      setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: "applied" } : i)));
+    } else {
+      setReviewError(result.error);
+    }
+    setApplyingId(null);
+  }
+
+  // Applies every PENDING high-confidence suggestion in the current run in
+  // one click -- the AI only marks a suggestion "high confidence" when the
+  // search result was unambiguously this school's own athletics site, so
+  // these are the ones a reviewer would almost always click Apply on
+  // anyway. Same batching pattern as Batch Coach-Info's
+  // bulkApplyHighConfidence, since this page inherits the exact same
+  // one-card-at-a-time review bottleneck that upgrade was built to fix --
+  // and now that the weekly cron kicks off a ~300-school run every Monday
+  // on its own, this queue refills whether or not anyone remembers to run
+  // it by hand.
+  async function bulkApplyHighConfidence() {
+    const targets = pendingReview.filter((i) => i.suggestion?.confidence === "high");
+    if (!targets.length) return;
+    setBulkApplying(true);
+    setReviewError("");
+    setBulkProgress({ done: 0, total: targets.length });
+    let done = 0;
+    const failures = [];
+    await runWithConcurrency(targets, APPLY_CONCURRENCY, async (item) => {
+      const result = await applySuggestionCore(item);
+      if (result.ok) {
+        setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: "applied" } : i)));
+      } else {
+        failures.push(`${item.school?.name || `#${item.id}`}: ${result.error}`);
+      }
+      done++;
+      setBulkProgress({ done, total: targets.length });
+    });
+    setBulkApplying(false);
+    if (failures.length > 0) {
+      setReviewError(
+        `Applied ${targets.length - failures.length} of ${targets.length} high-confidence suggestions. ${failures.length} failed: ${failures.slice(0, 3).join("; ")}${
+          failures.length > 3 ? "…" : ""
+        }`
+      );
     }
   }
 
@@ -350,6 +404,7 @@ export default function BatchAthleticsPage() {
   const failedItems = suggestedItems.filter((i) => i.suggestion_error);
   const pendingReview = matchedItems.filter((i) => i.review_status === "pending");
   const reviewedItems = matchedItems.filter((i) => i.review_status !== "pending");
+  const highConfidencePendingCount = pendingReview.filter((i) => i.suggestion?.confidence === "high").length;
 
   return (
     <div className="view">
@@ -517,63 +572,96 @@ export default function BatchAthleticsPage() {
                 </label>
               </div>
 
+              {highConfidencePendingCount > 0 && (
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                    gap: 10,
+                    marginBottom: 10,
+                    padding: "10px 12px",
+                    background: "#eef4fb",
+                    border: "1px solid #cfe0f2",
+                    borderRadius: 8,
+                  }}
+                >
+                  <span style={{ fontSize: 12.5 }}>
+                    <strong>{highConfidencePendingCount}</strong> of those are <strong>high confidence</strong> -- the AI was confident the search result was unambiguously this school's own
+                    athletics site. These are safe to clear in one click instead of reviewing one at a time.
+                  </span>
+                  <button className="btn btn-gold btn-sm" onClick={bulkApplyHighConfidence} disabled={bulkApplying}>
+                    {bulkApplying ? `Applying ${bulkProgress.done} of ${bulkProgress.total}…` : `Apply All High-Confidence (${highConfidencePendingCount})`}
+                  </button>
+                </div>
+              )}
+
               {reviewError && (
                 <div className="notice danger" style={{ marginBottom: 10, fontSize: 12.5 }}>
                   {reviewError}
                 </div>
               )}
 
-              <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                {(showReviewed ? matchedItems : pendingReview).map((item) => {
-                  const s = item.school;
-                  const sug = item.suggestion;
-                  if (!s || !sug) return null;
-                  const applying = applyingId === item.id;
-                  const reviewed = item.review_status !== "pending";
-                  return (
-                    <div key={item.id} style={{ border: "1px solid #e3e6ea", borderRadius: 8, padding: 12, opacity: reviewed ? 0.6 : 1 }}>
-                      <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 6 }}>
-                        <div>
-                          <strong>{s.name}</strong>
-                          <div style={{ fontSize: 12, color: "#697386" }}>
-                            {s.city}, {s.state}
-                          </div>
-                        </div>
-                        <span className="badge" style={{ fontSize: 11, color: confidenceColor(sug.confidence) }}>
-                          {sug.confidence} confidence
-                        </span>
-                      </div>
-
-                      <div style={{ marginTop: 8, fontSize: 12.5 }}>
-                        <div style={{ color: "#9aa1ab" }}>Current: {s.athletics_url || "(blank)"}</div>
-                        <div style={{ color: "#1e7145", fontWeight: 600 }}>Suggested: {sug.best_url}</div>
-                      </div>
-                      {sug.reasoning && (
-                        <div style={{ marginTop: 8, fontSize: 12, fontStyle: "italic", color: "#697386" }}>"{sug.reasoning}"</div>
-                      )}
-
-                      <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
-                        {reviewed ? (
-                          <span style={{ fontSize: 12, fontWeight: 600, color: item.review_status === "applied" ? "#1e7145" : "#697386" }}>
-                            {item.review_status === "applied" ? "✓ Applied" : "Skipped"}
-                          </span>
-                        ) : (
-                          <>
-                            <button className="btn btn-gold btn-sm" disabled={applying} onClick={() => applyItem(item)}>
-                              {applying ? "Applying…" : "Apply"}
-                            </button>
-                            <button className="btn btn-sm" disabled={applying} onClick={() => skipItem(item)}>
-                              Skip
-                            </button>
-                            <Link href={`/schools/${s.id}`} className="btn btn-sm">
-                              Open Profile
-                            </Link>
-                          </>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
+              <div style={{ overflowX: "auto" }}>
+                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5 }}>
+                  <thead>
+                    <tr style={{ borderBottom: "2px solid #e3e6ea", textAlign: "left" }}>
+                      <th style={{ padding: "6px 8px", whiteSpace: "nowrap" }}>School</th>
+                      <th style={{ padding: "6px 8px" }}>Suggested athletics URL</th>
+                      <th style={{ padding: "6px 8px", whiteSpace: "nowrap" }}>Confidence</th>
+                      <th style={{ padding: "6px 8px", whiteSpace: "nowrap" }}>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(showReviewed ? matchedItems : pendingReview).map((item) => {
+                      const s = item.school;
+                      const sug = item.suggestion;
+                      if (!s || !sug) return null;
+                      const applying = applyingId === item.id;
+                      const reviewed = item.review_status !== "pending";
+                      return (
+                        <tr key={item.id} style={{ borderBottom: "1px solid #eef0f3", opacity: reviewed ? 0.55 : 1, verticalAlign: "top" }}>
+                          <td style={{ padding: "8px", whiteSpace: "nowrap" }}>
+                            <div style={{ fontWeight: 600 }}>{s.name}</div>
+                            <div style={{ color: "#9aa1ab" }}>
+                              {s.city}, {s.state}
+                            </div>
+                          </td>
+                          <td style={{ padding: "8px", minWidth: 260 }}>
+                            <div style={{ color: "#1e7145", fontWeight: 600 }}>{sug.best_url}</div>
+                            <div style={{ color: "#9aa1ab" }}>Current: {s.athletics_url || "(blank)"}</div>
+                            {sug.reasoning && <div style={{ marginTop: 4, fontStyle: "italic", color: "#9aa1ab" }}>"{sug.reasoning}"</div>}
+                          </td>
+                          <td style={{ padding: "8px", whiteSpace: "nowrap" }}>
+                            <span className="badge" style={{ fontSize: 11, color: confidenceColor(sug.confidence) }}>
+                              {sug.confidence}
+                            </span>
+                          </td>
+                          <td style={{ padding: "8px", whiteSpace: "nowrap" }}>
+                            {reviewed ? (
+                              <span style={{ fontWeight: 600, color: item.review_status === "applied" ? "#1e7145" : "#697386" }}>
+                                {item.review_status === "applied" ? "✓ Applied" : "Skipped"}
+                              </span>
+                            ) : (
+                              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                                <button className="btn btn-gold btn-sm" disabled={applying || bulkApplying} onClick={() => applyItem(item)}>
+                                  {applying ? "…" : "Apply"}
+                                </button>
+                                <button className="btn btn-sm" disabled={applying || bulkApplying} onClick={() => skipItem(item)}>
+                                  Skip
+                                </button>
+                                <Link href={`/schools/${s.id}`} className="btn btn-sm">
+                                  Open
+                                </Link>
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
                 {!showReviewed && pendingReview.length === 0 && <div className="empty-state">Nothing left to review.</div>}
               </div>
             </div>
