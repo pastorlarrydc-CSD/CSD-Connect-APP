@@ -21,7 +21,7 @@ const SUGGESTION_STATUS_LABEL = { pending: "Pending review", approved: "Approved
 const CLAIM_STATUS_LABEL = { pending: "Pending review", approved: "Approved", rejected: "Not approved" };
 const EMPTY_COACH_FORM = { hc_first_name: "", hc_last_name: "", hc_email: "", hc_cell: "", hc_office: "", note: "" };
 const EMPTY_OWNER_FORM = { hc_first_name: "", hc_last_name: "", hc_email: "", hc_cell: "", hc_office: "", website: "", note: "" };
-const EMPTY_STAFF_FORM = { hc_first_name: "", hc_last_name: "", hc_email: "", hc_cell: "", hc_office: "" };
+const EMPTY_STAFF_FORM = { hc_first_name: "", hc_last_name: "", hc_email: "", hc_cell: "", hc_office: "", hc_twitter: "", hc_facebook: "" };
 
 // Verification staff/sysadmin write directly to schools (schools_write RLS
 // policy), so unlike "Suggest a correction" below, this never goes through
@@ -32,6 +32,8 @@ const STAFF_EDIT_FIELDS = [
   ["hc_email", "Email"],
   ["hc_cell", "Cell"],
   ["hc_office", "Office"],
+  ["hc_twitter", "Twitter / X"],
+  ["hc_facebook", "Facebook"],
 ];
 
 function confidenceColor(score) {
@@ -188,6 +190,18 @@ export default function SchoolProfilePage() {
   const [staffEditValues, setStaffEditValues] = useState(EMPTY_STAFF_FORM);
   const [staffSaving, setStaffSaving] = useState(false);
   const [staffSaveError, setStaffSaveError] = useState("");
+  // "Suggest Coach Info (AI)" and "Find Social Media" -- same two
+  // AI/search-backed lookups the Data Quality Quick Fix panel offers (see
+  // app/api/schools/[id]/discover-coach-info and discover-social), reachable
+  // from the school's own profile so staff don't have to leave this page to
+  // go find them. Only ever fill the Quick Fix fields below for review --
+  // neither route writes to schools on its own.
+  const [aiSuggesting, setAiSuggesting] = useState(false);
+  const [aiSuggestError, setAiSuggestError] = useState("");
+  const [aiSuggestInfo, setAiSuggestInfo] = useState(null);
+  const [discoveringSocial, setDiscoveringSocial] = useState(false);
+  const [discoverSocialError, setDiscoverSocialError] = useState("");
+  const [socialSuggestions, setSocialSuggestions] = useState({ twitter: [], facebook: [] });
 
   // "Mark Verified" -- confirm-with-no-changes, same as its counterpart on
   // the Data Quality Review page. Doesn't touch confidence_score directly;
@@ -671,7 +685,13 @@ export default function SchoolProfilePage() {
       hc_email: school.hc_email || "",
       hc_cell: school.hc_cell || "",
       hc_office: school.hc_office || "",
+      hc_twitter: school.hc_twitter || "",
+      hc_facebook: school.hc_facebook || "",
     });
+    setAiSuggestError("");
+    setAiSuggestInfo(null);
+    setDiscoverSocialError("");
+    setSocialSuggestions({ twitter: [], facebook: [] });
     setStaffEditing(true);
   }
 
@@ -690,6 +710,77 @@ export default function SchoolProfilePage() {
     setStaffEditing(false);
     setStaffCoachChangeFrom(null);
     setStaffSaveError("");
+  }
+
+  // AI-assisted lookup of the head coach's name/email/cell/office from the
+  // school's website -- same route the Data Quality Quick Fix panel uses
+  // (see app/api/schools/[id]/discover-coach-info). Only ever fills the
+  // Quick Fix fields below for a human to review before Save; never writes
+  // to schools on its own.
+  async function suggestCoachInfo() {
+    setAiSuggesting(true);
+    setAiSuggestError("");
+    setAiSuggestInfo(null);
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const res = await fetch(`/api/schools/${id}/discover-coach-info`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session?.access_token}` },
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || "Could not look up coach info.");
+      setStaffEditValues((prev) => ({
+        ...prev,
+        hc_first_name: json.hc_first_name || prev.hc_first_name,
+        hc_last_name: json.hc_last_name || prev.hc_last_name,
+        hc_email: json.hc_email || prev.hc_email,
+        hc_office: json.hc_office || prev.hc_office,
+        hc_cell: json.hc_cell || prev.hc_cell,
+        hc_twitter: json.hc_twitter || prev.hc_twitter,
+        hc_facebook: json.hc_facebook || prev.hc_facebook,
+      }));
+      setAiSuggestInfo({ confidence: json.confidence, source: json.source, notes: json.notes });
+    } catch (err) {
+      setAiSuggestError(err.message || "Could not look up coach info.");
+    } finally {
+      setAiSuggesting(false);
+    }
+  }
+
+  // Searches Twitter/X and Facebook for the coach name currently sitting in
+  // the Quick Fix form (not necessarily saved yet) -- same route as the Data
+  // Quality Quick Fix panel (see app/api/schools/[id]/discover-social), so
+  // this can run right after Suggest Coach Info or Mark Coach Change fills
+  // in a new name, before that's been saved.
+  async function discoverSocial() {
+    setDiscoveringSocial(true);
+    setDiscoverSocialError("");
+    setSocialSuggestions({ twitter: [], facebook: [] });
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const res = await fetch(`/api/schools/${id}/discover-social`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session?.access_token}` },
+        body: JSON.stringify({ hc_first_name: staffEditValues.hc_first_name, hc_last_name: staffEditValues.hc_last_name }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || "Could not search for social media.");
+      setSocialSuggestions({ twitter: json.twitter || [], facebook: json.facebook || [] });
+      if (!json.twitter?.length && !json.facebook?.length) setDiscoverSocialError("Nothing turned up for either platform. Try searching directly and paste the link in.");
+    } catch (err) {
+      setDiscoverSocialError(err.message || "Could not search for social media.");
+    } finally {
+      setDiscoveringSocial(false);
+    }
+  }
+
+  function pickSocialSuggestion(field, link) {
+    setStaffEditValues((prev) => ({ ...prev, [field]: link }));
+    setSocialSuggestions((prev) => ({ ...prev, [field === "hc_twitter" ? "twitter" : "facebook"]: [] }));
   }
 
   async function saveStaffEdit(e) {
@@ -1191,6 +1282,10 @@ export default function SchoolProfilePage() {
               <div className="v">{fmtPhone(school.hc_cell) || <span className="empty-state">not on file</span>}</div>
               <div className="k">Office</div>
               <div className="v">{fmtPhone(school.hc_office) || <span className="empty-state">not on file</span>}</div>
+              <div className="k">Twitter / X</div>
+              <div className="v">{school.hc_twitter || <span className="empty-state">not on file</span>}</div>
+              <div className="k">Facebook</div>
+              <div className="v">{school.hc_facebook || <span className="empty-state">not on file</span>}</div>
             </div>
 
             {isStaff && staffEditing && staffCoachChangeFrom && (
@@ -1211,6 +1306,62 @@ export default function SchoolProfilePage() {
                       <input value={staffEditValues[field]} onChange={(e) => setStaffEditValues((v) => ({ ...v, [field]: e.target.value }))} />
                     </div>
                   ))}
+                </div>
+                <div style={{ marginBottom: 8 }}>
+                  <button type="button" className="btn btn-sm" disabled={aiSuggesting} onClick={suggestCoachInfo}>
+                    {aiSuggesting ? "Looking…" : "Suggest Coach Info (AI)"}
+                  </button>
+                  {aiSuggestError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{aiSuggestError}</div>}
+                  {aiSuggestInfo && (
+                    <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
+                      AI suggestion ({aiSuggestInfo.confidence} confidence, from the {aiSuggestInfo.source}) filled into the fields above — review before saving.
+                      {aiSuggestInfo.notes ? ` ${aiSuggestInfo.notes}` : ""}
+                    </div>
+                  )}
+                  <button type="button" className="btn btn-sm" disabled={discoveringSocial} onClick={discoverSocial} style={{ marginLeft: 6 }}>
+                    {discoveringSocial ? "Searching…" : "Find Social Media"}
+                  </button>
+                  {discoverSocialError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverSocialError}</div>}
+                  {(socialSuggestions.twitter.length > 0 || socialSuggestions.facebook.length > 0) && (
+                    <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 10 }}>
+                      {socialSuggestions.twitter.length > 0 && (
+                        <div>
+                          <div style={{ fontSize: 11, fontWeight: 600, color: "#697386", marginBottom: 4 }}>TWITTER / X RESULTS</div>
+                          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                            {socialSuggestions.twitter.map((sugg) => (
+                              <button
+                                type="button"
+                                key={sugg.link}
+                                className="btn btn-sm"
+                                style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
+                                onClick={() => pickSocialSuggestion("hc_twitter", sugg.link)}
+                              >
+                                {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                      {socialSuggestions.facebook.length > 0 && (
+                        <div>
+                          <div style={{ fontSize: 11, fontWeight: 600, color: "#697386", marginBottom: 4 }}>FACEBOOK RESULTS</div>
+                          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                            {socialSuggestions.facebook.map((sugg) => (
+                              <button
+                                type="button"
+                                key={sugg.link}
+                                className="btn btn-sm"
+                                style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
+                                onClick={() => pickSocialSuggestion("hc_facebook", sugg.link)}
+                              >
+                                {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
                 <div style={{ display: "flex", gap: 8 }}>
                   <button className="btn btn-sm btn-gold" disabled={staffSaving}>
