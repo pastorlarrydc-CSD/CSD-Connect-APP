@@ -1180,7 +1180,11 @@ export default function DataQualityPage() {
   // stays available for an explicit Mark Reviewed if that's all this one
   // needed. Tonight's sweep is what actually re-checks the new URL.
   async function saveRadarUrlFix(row) {
-    const newUrl = (radarUrlDrafts[row.id] ?? row.website_checked ?? "").trim();
+    // Falls back to whatever the input is actually showing (see the
+    // matching defaultValue below) if the reviewer clicks Save without
+    // typing anything -- keeps this in sync with what's on screen instead
+    // of silently re-saving the stale, already-failing website_checked URL.
+    const newUrl = (radarUrlDrafts[row.id] ?? row.schools?.website ?? row.website_checked ?? "").trim();
     if (!newUrl) return;
     setRadarUrlSavingId(row.id);
     setRadarUrlErrors((prev) => ({ ...prev, [row.id]: "" }));
@@ -2812,7 +2816,12 @@ export default function DataQualityPage() {
                                 <input
                                   type="text"
                                   placeholder="Corrected website URL"
-                                  defaultValue={row.website_checked || row.schools?.website || ""}
+                                  // schools.website is the live value -- once a fix has been saved
+                                  // here, that's what should show, not the stale URL from last
+                                  // night's failed check. Only fall back to website_checked (what
+                                  // the sweep actually tried) when nothing's been saved yet, so
+                                  // there's still something to edit from.
+                                  defaultValue={row.schools?.website || row.website_checked || ""}
                                   onChange={(e) => setRadarUrlDrafts((prev) => ({ ...prev, [row.id]: e.target.value }))}
                                   style={{ flex: "1 1 260px", minWidth: 200, padding: "6px 8px", fontSize: 12.5, border: "1px solid #d9dce3", borderRadius: 6 }}
                                 />
