@@ -1,4 +1,4 @@
- "use client";
+"use client";
 import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
@@ -108,8 +108,62 @@ export default function BatchAthleticsPage() {
   const [showReviewed, setShowReviewed] = useState(false);
   const [bulkApplying, setBulkApplying] = useState(false);
   const [bulkProgress, setBulkProgress] = useState({ done: 0, total: 0 });
+  // Lets a reviewer clear a run's queue with the keyboard alone -- Up/Down
+  // moves this between pending suggestions, A applies the focused one, S
+  // skips it, and since applying/skipping removes that item from
+  // pendingReview, the next item slides into the same index automatically
+  // (no explicit "advance" step needed). See the keydown effect below.
+  const [focusedIndex, setFocusedIndex] = useState(0);
 
   const selectedRun = runs.find((r) => r.id === selectedRunId) || null;
+
+  const readyCount = items.filter((i) => i.fetch_status === "ready").length;
+  const pendingFetchCount = items.filter((i) => i.fetch_status === "pending").length;
+  const noContentCount = items.filter((i) => i.fetch_status === "no_content").length;
+  const suggestedItems = items.filter((i) => i.suggestion);
+  const matchedItems = suggestedItems.filter((i) => i.suggestion.best_url);
+  const noMatchItems = suggestedItems.filter((i) => !i.suggestion.best_url && !i.suggestion_error);
+  const failedItems = suggestedItems.filter((i) => i.suggestion_error);
+  const pendingReview = matchedItems.filter((i) => i.review_status === "pending");
+  const reviewedItems = matchedItems.filter((i) => i.review_status !== "pending");
+  const highConfidencePendingCount = pendingReview.filter((i) => i.suggestion?.confidence === "high").length;
+  // Keeps the keyboard-focused row valid as pendingReview shrinks (applying
+  // or skipping removes items) or a different run is opened.
+  const clampedFocusedIndex = pendingReview.length ? Math.min(focusedIndex, pendingReview.length - 1) : 0;
+  const focusedItem = pendingReview[clampedFocusedIndex] || null;
+
+  // Keyboard shortcuts for the review table: Up/Down moves the focused row,
+  // A applies it, S skips it -- lets a reviewer clear a queue of
+  // medium/low-confidence suggestions without reaching for the mouse on
+  // every row. Ignored while typing in a text field, while a run isn't at
+  // the "collected" review stage, or while an apply/skip is already in
+  // flight (avoids double-firing on a held key).
+  useEffect(() => {
+    function onKeyDown(e) {
+      if (!selectedRun || selectedRun.status !== "collected") return;
+      if (bulkApplying || applyingId) return;
+      const tag = (document.activeElement?.tagName || "").toLowerCase();
+      if (tag === "input" || tag === "textarea" || tag === "select") return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      const key = e.key.toLowerCase();
+      if (key === "arrowdown") {
+        e.preventDefault();
+        setFocusedIndex((i) => Math.min(i + 1, Math.max(0, pendingReview.length - 1)));
+      } else if (key === "arrowup") {
+        e.preventDefault();
+        setFocusedIndex((i) => Math.max(i - 1, 0));
+      } else if (key === "a") {
+        e.preventDefault();
+        if (focusedItem) applyItem(focusedItem);
+      } else if (key === "s") {
+        e.preventDefault();
+        if (focusedItem) skipItem(focusedItem);
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selectedRun, pendingReview, focusedItem, bulkApplying, applyingId]);
 
   const loadRuns = useCallback(async () => {
     setLoadingRuns(true);
@@ -139,6 +193,7 @@ export default function BatchAthleticsPage() {
 
   function openRun(runId) {
     setSelectedRunId(runId);
+    setFocusedIndex(0);
     setCreateError("");
     setSubmitError("");
     setStatusError("");
@@ -361,6 +416,7 @@ export default function BatchAthleticsPage() {
       setBulkProgress({ done, total: targets.length });
     });
     setBulkApplying(false);
+    setFocusedIndex(0);
     if (failures.length > 0) {
       setReviewError(
         `Applied ${targets.length - failures.length} of ${targets.length} high-confidence suggestions. ${failures.length} failed: ${failures.slice(0, 3).join("; ")}${
@@ -394,17 +450,6 @@ export default function BatchAthleticsPage() {
       </div>
     );
   }
-
-  const readyCount = items.filter((i) => i.fetch_status === "ready").length;
-  const pendingFetchCount = items.filter((i) => i.fetch_status === "pending").length;
-  const noContentCount = items.filter((i) => i.fetch_status === "no_content").length;
-  const suggestedItems = items.filter((i) => i.suggestion);
-  const matchedItems = suggestedItems.filter((i) => i.suggestion.best_url);
-  const noMatchItems = suggestedItems.filter((i) => !i.suggestion.best_url && !i.suggestion_error);
-  const failedItems = suggestedItems.filter((i) => i.suggestion_error);
-  const pendingReview = matchedItems.filter((i) => i.review_status === "pending");
-  const reviewedItems = matchedItems.filter((i) => i.review_status !== "pending");
-  const highConfidencePendingCount = pendingReview.filter((i) => i.suggestion?.confidence === "high").length;
 
   return (
     <div className="view">
@@ -603,6 +648,10 @@ export default function BatchAthleticsPage() {
                 </div>
               )}
 
+              <div style={{ fontSize: 11.5, color: "#9aa1ab", marginBottom: 6 }}>
+                Keyboard shortcuts: <strong>↑</strong>/<strong>↓</strong> move focus · <strong>A</strong> apply · <strong>S</strong> skip
+              </div>
+
               <div style={{ overflowX: "auto" }}>
                 <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5 }}>
                   <thead>
@@ -620,8 +669,18 @@ export default function BatchAthleticsPage() {
                       if (!s || !sug) return null;
                       const applying = applyingId === item.id;
                       const reviewed = item.review_status !== "pending";
+                      const isFocused = !reviewed && focusedItem?.id === item.id;
                       return (
-                        <tr key={item.id} style={{ borderBottom: "1px solid #eef0f3", opacity: reviewed ? 0.55 : 1, verticalAlign: "top" }}>
+                        <tr
+                          key={item.id}
+                          style={{
+                            borderBottom: "1px solid #eef0f3",
+                            opacity: reviewed ? 0.55 : 1,
+                            verticalAlign: "top",
+                            background: isFocused ? "#eef4fb" : undefined,
+                            boxShadow: isFocused ? "inset 3px 0 0 #2f5fa8" : undefined,
+                          }}
+                        >
                           <td style={{ padding: "8px", whiteSpace: "nowrap" }}>
                             <div style={{ fontWeight: 600 }}>{s.name}</div>
                             <div style={{ color: "#9aa1ab" }}>
