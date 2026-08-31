@@ -197,6 +197,33 @@ function withProtocol(v) {
   return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
 }
 
+// Find MaxPreps page / Find Athletics page / Suggest Coach Info (AI) / Find
+// Social Media (in the Quick Fix editor below) all hit routes that make
+// their own live web search and/or AI call -- a plain fetch() here has no
+// timeout of its own, so if the backend ever stalls (a dropped connection,
+// an upstream API hanging) the button would sit on "Searching…"/"Looking…"
+// forever with no error, since nothing tells the browser to stop waiting.
+// This aborts and surfaces a normal, recoverable error instead, past a
+// generous ceiling well above how long any of these normally take. Set
+// higher than the matching server-side timeout (see discover-coach-info's
+// AI_TIMEOUT_MS) so the backend's own error message wins the race when
+// it's the one that timed out. Same helper as the school profile page.
+const DISCOVERY_FETCH_TIMEOUT_MS = 40000;
+async function fetchWithTimeout(url, options = {}, timeoutMs = DISCOVERY_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } catch (err) {
+    if (err.name === "AbortError") {
+      throw new Error("This is taking longer than expected. Please try again in a moment.");
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 // Same bands as the confidence-score readout on a school's profile page
 // (app/(app)/schools/[id]/page.js) -- kept visually consistent so the
 // color means the same thing everywhere it shows up.
@@ -1727,7 +1754,7 @@ export default function DataQualityPage() {
       const {
         data: { session },
       } = await supabase.auth.getSession();
-      const res = await fetch(`/api/schools/${school.id}/discover-maxpreps`, {
+      const res = await fetchWithTimeout(`/api/schools/${school.id}/discover-maxpreps`, {
         method: "POST",
         headers: { Authorization: `Bearer ${session?.access_token}` },
       });
@@ -1765,7 +1792,7 @@ export default function DataQualityPage() {
       const {
         data: { session },
       } = await supabase.auth.getSession();
-      const res = await fetch(`/api/schools/${school.id}/discover-athletics`, {
+      const res = await fetchWithTimeout(`/api/schools/${school.id}/discover-athletics`, {
         method: "POST",
         headers: { Authorization: `Bearer ${session?.access_token}` },
       });
@@ -1799,7 +1826,7 @@ export default function DataQualityPage() {
       const {
         data: { session },
       } = await supabase.auth.getSession();
-      const res = await fetch(`/api/schools/${school.id}/discover-coach-info`, {
+      const res = await fetchWithTimeout(`/api/schools/${school.id}/discover-coach-info`, {
         method: "POST",
         headers: { Authorization: `Bearer ${session?.access_token}` },
       });
@@ -1842,7 +1869,7 @@ export default function DataQualityPage() {
       const {
         data: { session },
       } = await supabase.auth.getSession();
-      const res = await fetch(`/api/schools/${school.id}/discover-social`, {
+      const res = await fetchWithTimeout(`/api/schools/${school.id}/discover-social`, {
         method: "POST",
         headers: { "Content-Type": "application/json", Authorization: `Bearer ${session?.access_token}` },
         body: JSON.stringify({ hc_first_name: editValues.hc_first_name, hc_last_name: editValues.hc_last_name }),
