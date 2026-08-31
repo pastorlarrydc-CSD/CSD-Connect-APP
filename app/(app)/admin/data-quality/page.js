@@ -56,6 +56,18 @@ const SCAN_CACHE_STALE_MS = 6 * 60 * 60 * 1000; // 6 hours
 // meant losing the search and landing back on an empty box.
 const FIND_SCHOOL_CACHE_KEY = "csd_dq_find_school_cache_v1";
 
+// Same idea again, but for scroll position instead of data -- this whole
+// page's window scroll, plus the Coach Change History list's own inner
+// scrollbar (it's capped to a small box, see its overflow:auto container
+// below). Every list on this page keeps reloading fine across a
+// navigation away and back (that's what the two caches above are for),
+// but the page itself always remounted at the very top -- so a specific
+// record found by scrolling down a long list was lost every time you left
+// for any reason (another item in the top nav, a back-button press) and
+// had to be scrolled back down to from scratch. Session-scoped like the
+// caches above: just "where was I," cleared when the tab closes.
+const SCROLL_CACHE_KEY = "csd_dq_scroll_cache_v1";
+
 function fmtRelativeTime(date) {
   if (!date) return "";
   const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
@@ -538,6 +550,73 @@ export default function DataQualityPage() {
   const [loadingMaxprepsOpp, setLoadingMaxprepsOpp] = useState(true);
   const [maxprepsOppExporting, setMaxprepsOppExporting] = useState(false);
   const [maxprepsOppExportError, setMaxprepsOppExportError] = useState("");
+
+  // Scroll-position memory -- see SCROLL_CACHE_KEY above. coachHistoryScrollRef
+  // is the Coach Change History list's own scrollable box; scrollRestoredRef
+  // just makes sure the restore below only ever fires once per visit to this
+  // page, not every time some later action (Quick Fix, Mark Verified, a
+  // re-check) happens to flip one of the loading flags back on.
+  const coachHistoryScrollRef = useRef(null);
+  const scrollRestoredRef = useRef(false);
+
+  // True only once every section on this page has finished its initial
+  // load. Restoring scroll any earlier -- while sections above Coach
+  // Change History are still showing "Loading…" placeholders -- would land
+  // short of the real target, since their content hasn't pushed everything
+  // below it down to its final position yet.
+  const allSectionsLoaded =
+    !loadingFlags &&
+    !loadingRadar &&
+    !loadingReviewMarked &&
+    !loadingCoachChanges &&
+    !loadingNeedsRecheck &&
+    !loadingUpcoming &&
+    !loadingCoverage &&
+    !loadingMaxprepsOpp;
+
+  useEffect(() => {
+    if (!allSectionsLoaded || scrollRestoredRef.current) return;
+    scrollRestoredRef.current = true;
+    try {
+      const raw = sessionStorage.getItem(SCROLL_CACHE_KEY);
+      if (!raw) return;
+      const cached = JSON.parse(raw);
+      // Two rAFs give the browser a frame to finish painting this
+      // now-fully-loaded page before we scroll it -- one isn't always
+      // enough for the layout to have settled.
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          if (typeof cached?.windowY === "number") window.scrollTo(0, cached.windowY);
+          if (typeof cached?.coachHistoryTop === "number" && coachHistoryScrollRef.current) {
+            coachHistoryScrollRef.current.scrollTop = cached.coachHistoryTop;
+          }
+        });
+      });
+    } catch {
+      // Corrupt or unavailable cache -- just leaves you at the top, same
+      // as if none existed.
+    }
+  }, [allSectionsLoaded]);
+
+  // Save on the way out -- runs as this effect's cleanup whenever the page
+  // unmounts, which covers a full navigation away (top nav, browser back)
+  // as well as just closing the tab.
+  useEffect(() => {
+    return () => {
+      try {
+        sessionStorage.setItem(
+          SCROLL_CACHE_KEY,
+          JSON.stringify({
+            windowY: window.scrollY || window.pageYOffset || 0,
+            coachHistoryTop: coachHistoryScrollRef.current ? coachHistoryScrollRef.current.scrollTop : 0,
+          })
+        );
+      } catch {
+        // Storage full/unavailable -- just means scroll position won't be
+        // restored next time, not worth surfacing an error for.
+      }
+    };
+  }, []);
 
   const loadFlags = useCallback(async () => {
     if (!canReview) {
@@ -3092,7 +3171,7 @@ export default function DataQualityPage() {
         ) : sortedCoachChanges.length === 0 ? (
           <div className="empty-state" style={{ marginTop: 10 }}>No coach changes recorded yet.</div>
         ) : (
-          <div style={{ maxHeight: 360, overflow: "auto", marginTop: 10 }}>
+          <div ref={coachHistoryScrollRef} style={{ maxHeight: 360, overflow: "auto", marginTop: 10 }}>
             {sortedCoachChanges.slice(0, 100).map((g) => {
               const meta = COACH_CHANGE_SOURCE_META[g.source] || { label: g.source || "Unknown source", color: "#697386", bg: "#f0f1f4" };
               return (
