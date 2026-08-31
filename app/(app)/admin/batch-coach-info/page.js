@@ -131,8 +131,61 @@ export default function BatchCoachInfoPage() {
   // see bulkApplyHighConfidence below.
   const [bulkApplying, setBulkApplying] = useState(false);
   const [bulkProgress, setBulkProgress] = useState({ done: 0, total: 0 });
+  const [focusedIndex, setFocusedIndex] = useState(0);
 
   const selectedRun = runs.find((r) => r.id === selectedRunId) || null;
+
+  const readyCount = items.filter((i) => i.fetch_status === "ready").length;
+  const pendingFetchCount = items.filter((i) => i.fetch_status === "pending").length;
+  const noContentCount = items.filter((i) => i.fetch_status === "no_content").length;
+  const suggestedItems = items.filter((i) => i.suggestion);
+  const pendingReview = suggestedItems.filter((i) => i.review_status === "pending");
+  const reviewedItems = suggestedItems.filter((i) => i.review_status !== "pending");
+  const failedItems = suggestedItems.filter((i) => i.suggestion_error);
+  const highConfidencePendingCount = pendingReview.filter((i) => i.suggestion?.confidence === "high").length;
+
+  // Keyboard-nav targets mirror the table's own row filter (pendingReview
+  // minus suggestion_error items) so the focused row always lines up with
+  // what's actually on screen.
+  const keyboardTargets = pendingReview.filter((i) => !i.suggestion_error);
+  const clampedFocusedIndex = keyboardTargets.length === 0 ? 0 : Math.min(focusedIndex, keyboardTargets.length - 1);
+  const focusedItem = keyboardTargets[clampedFocusedIndex] || null;
+
+  // Keyboard shortcuts for the review queue -- Up/Down move focus between
+  // pending rows, A applies the focused row, S skips it. Only active while
+  // this run is at the "collected" review stage, nothing's mid-flight, and
+  // the user isn't typing into a form field (e.g. the custom-states input
+  // above). Lets a reviewer clear a run without reaching for the mouse for
+  // every single Apply/Skip click.
+  useEffect(() => {
+    function onKeyDown(e) {
+      if (selectedRun?.status !== "collected") return;
+      if (bulkApplying || applyingId) return;
+      const tag = document.activeElement?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (e.metaKey || e.ctrlKey || e.altKey) return;
+
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setFocusedIndex((prev) => (keyboardTargets.length === 0 ? 0 : Math.min(prev + 1, keyboardTargets.length - 1)));
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setFocusedIndex((prev) => Math.max(prev - 1, 0));
+      } else if (e.key === "a" || e.key === "A") {
+        if (focusedItem) {
+          e.preventDefault();
+          applyItem(focusedItem);
+        }
+      } else if (e.key === "s" || e.key === "S") {
+        if (focusedItem) {
+          e.preventDefault();
+          skipItem(focusedItem);
+        }
+      }
+    }
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [selectedRun?.status, bulkApplying, applyingId, focusedItem, keyboardTargets.length]);
 
   const loadRuns = useCallback(async () => {
     setLoadingRuns(true);
@@ -167,6 +220,7 @@ export default function BatchCoachInfoPage() {
     setStatusError("");
     setCollectError("");
     setReviewError("");
+    setFocusedIndex(0);
   }
 
   async function startRun() {
@@ -420,6 +474,7 @@ export default function BatchCoachInfoPage() {
       setBulkProgress({ done, total: targets.length });
     });
     setBulkApplying(false);
+    setFocusedIndex(0);
     if (failures.length > 0) {
       setReviewError(
         `Applied ${targets.length - failures.length} of ${targets.length} high-confidence suggestions. ${failures.length} failed: ${failures.slice(0, 3).join("; ")}${
@@ -453,15 +508,6 @@ export default function BatchCoachInfoPage() {
       </div>
     );
   }
-
-  const readyCount = items.filter((i) => i.fetch_status === "ready").length;
-  const pendingFetchCount = items.filter((i) => i.fetch_status === "pending").length;
-  const noContentCount = items.filter((i) => i.fetch_status === "no_content").length;
-  const suggestedItems = items.filter((i) => i.suggestion);
-  const pendingReview = suggestedItems.filter((i) => i.review_status === "pending");
-  const reviewedItems = suggestedItems.filter((i) => i.review_status !== "pending");
-  const failedItems = suggestedItems.filter((i) => i.suggestion_error);
-  const highConfidencePendingCount = pendingReview.filter((i) => i.suggestion?.confidence === "high").length;
 
   return (
     <div className="view">
@@ -676,6 +722,10 @@ export default function BatchCoachInfoPage() {
                 </div>
               )}
 
+              <div style={{ fontSize: 11.5, color: "#9aa1ab", marginBottom: 6 }}>
+                Keyboard shortcuts: <strong>↑</strong>/<strong>↓</strong> move focus · <strong>A</strong> apply · <strong>S</strong> skip
+              </div>
+
               <div style={{ overflowX: "auto" }}>
                 <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12.5 }}>
                   <thead>
@@ -695,12 +745,22 @@ export default function BatchCoachInfoPage() {
                         if (!s || !sug) return null;
                         const applying = applyingId === item.id;
                         const reviewed = item.review_status !== "pending";
+                        const isFocused = !reviewed && focusedItem?.id === item.id;
                         const changedFields = SUGGESTION_FIELDS.filter((f) => {
                           const suggested = (sug[f] || "").trim();
                           return suggested && suggested !== (s[f] || "");
                         });
                         return (
-                          <tr key={item.id} style={{ borderBottom: "1px solid #eef0f3", opacity: reviewed ? 0.55 : 1, verticalAlign: "top" }}>
+                          <tr
+                            key={item.id}
+                            style={{
+                              borderBottom: "1px solid #eef0f3",
+                              opacity: reviewed ? 0.55 : 1,
+                              verticalAlign: "top",
+                              background: isFocused ? "#eef4fb" : undefined,
+                              boxShadow: isFocused ? "inset 3px 0 0 #2f5fa8" : undefined,
+                            }}
+                          >
                             <td style={{ padding: "8px", whiteSpace: "nowrap" }}>
                               <div style={{ fontWeight: 600 }}>{s.name}</div>
                               <div style={{ color: "#9aa1ab" }}>
