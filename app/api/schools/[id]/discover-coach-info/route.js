@@ -4,6 +4,17 @@ import { withProtocol } from "@/lib/schoolRecheck";
 import { fetchPageText, searchWeb, SYSTEM_PROMPT, parseModelJson, normalizeSuggestion, buildSourceBlocks, buildSearchQuery, MODEL } from "@/lib/coachInfoLookup";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
+// Every other network call in this route (fetchPageText, searchWeb) is
+// already bounded by lib/coachInfoLookup's own FETCH_TIMEOUT_MS -- this
+// route's own call to Anthropic wasn't. An unbounded fetch() meant that on
+// the rare occasion the AI call itself stalled (a dropped connection, a
+// slow upstream response), this route would hang until Vercel's own
+// platform-level function timeout killed it -- and the "Suggest Coach Info
+// (AI)" button's own fetch() had no timeout either, so it just sat on
+// "Looking…" forever with no error. See the matching client-side fix in
+// the Quick Fix / school profile pages for the other half of this.
+const AI_TIMEOUT_MS = 20000;
+export const maxDuration = 35; // fetch/search stage (up to ~8s) + AI_TIMEOUT_MS, plus headroom
 
 // AI auto-fill for the Quick Fix panel: instead of a human reading a
 // school's site by hand (or Googling it) to find and retype the head
@@ -115,20 +126,34 @@ export async function POST(req, { params }) {
       );
     }
 
-    const aiRes = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": apiKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: 400,
-        system: SYSTEM_PROMPT,
-        messages: [{ role: "user", content: userMessage }],
-      }),
-    });
+    const aiController = new AbortController();
+    const aiTimeout = setTimeout(() => aiController.abort(), AI_TIMEOUT_MS);
+    let aiRes;
+    try {
+      aiRes = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+        body: JSON.stringify({
+          model: MODEL,
+          max_tokens: 400,
+          system: SYSTEM_PROMPT,
+          messages: [{ role: "user", content: userMessage }],
+        }),
+        signal: aiController.signal,
+      });
+    } catch (aiFetchErr) {
+      console.error("Anthropic API fetch error (discover-coach-info)", aiFetchErr);
+      return NextResponse.json(
+        { error: aiFetchErr.name === "AbortError" ? "The AI lookup took too long to respond. Please try again." : "Could not reach the AI lookup service. Please try again." },
+        { status: 502 }
+      );
+    } finally {
+      clearTimeout(aiTimeout);
+    }
 
     if (!aiRes.ok) {
       const detail = await aiRes.text().catch(() => "");
