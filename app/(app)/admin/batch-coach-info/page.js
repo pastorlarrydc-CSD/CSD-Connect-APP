@@ -27,7 +27,7 @@ import { useAuth } from "@/lib/auth-context";
 const PRIORITY_STATES = ["TX", "FL", "GA", "CA", "OH", "IN"];
 const TARGET_COUNTS = [100, 300, 500, 1000];
 const DEFAULT_TARGET_COUNT = 300;
-const FETCH_CONCURRENCY = 3;
+const FETCH_CONCURRENCY = 8; // matches the weekly automated cron's own concurrency (app/api/cron/weekly-coach-info-batch) -- this manual page used to run at 3, well under what the same fetch/search calls handle fine unattended, which just meant a longer wait staring at this tab for a same-size run
 // Applying a suggestion is just two small DB writes (no web fetch, no AI
 // call) -- can safely run more of these in parallel than the page-fetching
 // step above, which is why bulk-apply uses its own higher concurrency.
