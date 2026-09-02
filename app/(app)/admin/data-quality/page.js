@@ -499,6 +499,22 @@ export default function DataQualityPage() {
   const [coachChangeExportError, setCoachChangeExportError] = useState("");
   const [coachChangeSort, setCoachChangeSort] = useState("newest");
 
+  // My Recent Updates -- every field I've personally changed on a school,
+  // from ANY source (Quick Fix, Mark Coach Change, a batch-review Apply
+  // click, a bulk upload, editing a school profile directly, etc.), not
+  // just the coach-contact fields Coach Change History narrows to. Grouped
+  // the same way as coachChanges, but scoped to just my own changed_by so
+  // this reads as a personal to-do list, and each entry can be individually
+  // cleared ("Mark done"). Dismissing writes to a small companion table
+  // (school_change_dismissals) and never touches school_change_log itself
+  // -- it's a per-viewer preference, not a change to the audit trail, so
+  // Coach Change History and this list can show the same underlying edit
+  // without one affecting the other.
+  const [myUpdates, setMyUpdates] = useState([]);
+  const [loadingMyUpdates, setLoadingMyUpdates] = useState(true);
+  const [dismissingUpdateKey, setDismissingUpdateKey] = useState(null);
+  const [dismissUpdateError, setDismissUpdateError] = useState("");
+
   // Needs Re-check -- verified schools whose last_verified_at has aged past
   // the recency bands the confidence-score trigger cares about (see
   // RECHECK_CUTOFF_DAYS/RECHECK_STALE_DAYS above), oldest first, so staff
@@ -726,6 +742,71 @@ export default function DataQualityPage() {
   coachChanges.forEach((g) => {
     if (!recentCoachChangeBySchool.has(g.school_id)) recentCoachChangeBySchool.set(g.school_id, g);
   });
+
+  const loadMyUpdates = useCallback(async () => {
+    if (!canReview || !user) {
+      setLoadingMyUpdates(false);
+      return;
+    }
+    setLoadingMyUpdates(true);
+    const [{ data: changeRows }, { data: dismissedRows }] = await Promise.all([
+      supabase
+        .from("school_change_log")
+        .select("id, school_id, field_name, old_value, new_value, source, changed_at, schools(name,city,state)")
+        .eq("changed_by", user.id)
+        .order("changed_at", { ascending: false })
+        .limit(2000),
+      supabase.from("school_change_dismissals").select("school_id, changed_at").eq("dismissed_by", user.id),
+    ]);
+
+    const dismissedKeys = new Set((dismissedRows || []).map((r) => `${r.school_id}|${r.changed_at}`));
+
+    // Same one-entry-per-save grouping as loadCoachChanges above, but over
+    // EVERY field school_change_log tracks (not narrowed to coach-contact
+    // fields), since the point of this list is "everything I've touched,"
+    // not just coach info. Anything already dismissed is dropped here so
+    // it never flashes into view before disappearing.
+    const groups = new Map();
+    (changeRows || []).forEach((row) => {
+      const key = `${row.school_id}|${row.changed_at}`;
+      if (dismissedKeys.has(key)) return;
+      if (!groups.has(key)) {
+        groups.set(key, { school_id: row.school_id, schools: row.schools, changed_at: row.changed_at, source: row.source, fields: [] });
+      }
+      groups.get(key).fields.push(row);
+    });
+    setMyUpdates(Array.from(groups.values()).sort((a, b) => new Date(b.changed_at) - new Date(a.changed_at)));
+    setLoadingMyUpdates(false);
+  }, [supabase, canReview, user]);
+
+  useEffect(() => {
+    loadMyUpdates();
+  }, [loadMyUpdates]);
+
+  // Clears one update event off "My Recent Updates" -- see
+  // school_change_dismissals above. Purely a personal checklist action:
+  // the school's record and its school_change_log rows are untouched, this
+  // just hides the entry from this list from now on.
+  async function dismissUpdate(group) {
+    if (!user) return;
+    const key = `${group.school_id}|${group.changed_at}`;
+    setDismissUpdateError("");
+    setDismissingUpdateKey(key);
+    try {
+      const { error } = await supabase
+        .from("school_change_dismissals")
+        .insert({ school_id: group.school_id, changed_at: group.changed_at, dismissed_by: user.id });
+      // A duplicate-key error (23505) just means this was already
+      // dismissed -- e.g. a second click landing before the list
+      // re-rendered -- either way it's safe to drop from view.
+      if (error && error.code !== "23505") throw error;
+      setMyUpdates((prev) => prev.filter((g) => `${g.school_id}|${g.changed_at}` !== key));
+    } catch (err) {
+      setDismissUpdateError(err.message || "Could not clear this update. Please try again.");
+    } finally {
+      setDismissingUpdateKey(null);
+    }
+  }
 
   const loadNeedsRecheck = useCallback(async () => {
     if (!canReview) {
@@ -3158,6 +3239,63 @@ export default function DataQualityPage() {
             {maxprepsOpportunities.length > DISPLAY_CAP && (
               <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
                 Showing the first {DISPLAY_CAP} of {maxprepsOpportunities.length.toLocaleString()} — download the CSV for the full list.
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="card" style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+          <div>
+            <h3 style={{ marginBottom: 4 }}>My Recent Updates ({myUpdates.length})</h3>
+            <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 0 }}>
+              Every field you&apos;ve personally changed on a school, dated, from anywhere in the app — Quick Fix, Mark Coach Change, a batch-review Apply, a bulk upload, or editing a profile directly. Click &quot;Mark done&quot; once you&apos;re satisfied with an update to clear it from this list — the record and its history stay exactly as they are.
+            </p>
+          </div>
+        </div>
+        {dismissUpdateError && <div className="notice danger" style={{ marginTop: 10 }}>{dismissUpdateError}</div>}
+        {loadingMyUpdates ? (
+          <div className="empty-state" style={{ marginTop: 10 }}>Loading…</div>
+        ) : myUpdates.length === 0 ? (
+          <div className="empty-state" style={{ marginTop: 10 }}>Nothing here — updates you make anywhere in the app will show up dated, so you can clear them once you&apos;re done with them.</div>
+        ) : (
+          <div style={{ maxHeight: 360, overflow: "auto", marginTop: 10 }}>
+            {myUpdates.slice(0, 100).map((g) => {
+              const meta = COACH_CHANGE_SOURCE_META[g.source] || { label: g.source || "Unknown source", color: "#697386", bg: "#f0f1f4" };
+              const key = `${g.school_id}|${g.changed_at}`;
+              return (
+                <div className="log-item" key={key} style={{ paddingBottom: 10 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+                    <div>
+                      <strong>{g.schools?.name}</strong> — {g.schools?.city}, {g.schools?.state}
+                      <span className="badge" style={{ marginLeft: 8, color: meta.color, background: meta.bg }}>{meta.label}</span>
+                      <div style={{ marginTop: 4, fontSize: 12.5 }}>
+                        {g.fields.map((f) => (
+                          <div key={f.id}>
+                            {COACH_CHANGE_FIELD_LABELS[f.field_name] || f.field_name}: <span style={{ color: "#697386" }}>{f.old_value || "—"}</span> → <strong>{f.new_value || "—"}</strong>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        <Link href={`/schools/${g.school_id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
+                        <button className="btn btn-sm btn-gold" disabled={dismissingUpdateKey === key} onClick={() => dismissUpdate(g)}>
+                          {dismissingUpdateKey === key ? "Clearing…" : "Mark done"}
+                        </button>
+                      </div>
+                      <span style={{ fontSize: 11, color: "#9aa2b1", whiteSpace: "nowrap" }}>
+                        {g.changed_at ? new Date(g.changed_at).toLocaleString() : ""}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+            {myUpdates.length > 100 && (
+              <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
+                Showing the first 100 of {myUpdates.length.toLocaleString()} — mark some done to see the rest.
               </div>
             )}
           </div>
