@@ -26,11 +26,18 @@ const MAX_TOKENS = 400; // matches app/api/admin/batch-coach-info/[runId]/submit
 // this one benefits the most from not needing a human to sit and watch
 // it happen.
 //
-// Defaults to "no_name" candidate mode (schools missing a coach name
-// entirely) rather than "missing_email" -- "no_name" is the tool's own
-// default in the manual UI and the larger of the two gaps
-// (full-sweep-roadmap.md: ~1,200 schools missing coach info entirely,
-// most of which are "no_name" cases). Same CRON_SECRET auth and
+// Targets "missing_email" candidates (a coach name already on file, no
+// email) rather than "no_name" -- checked against live data on
+// 2026-09-02: the "no coach name at all" gap this tool originally
+// targeted is essentially closed in every priority state (0-2 schools
+// each), while missing email is the real remaining gap (~121 schools
+// across TX/FL/GA/CA/OH/IN). Same query condition the manual tool's own
+// "missing_email" mode uses (app/(app)/admin/batch-coach-info/page.js) --
+// both name fields present, email blank -- and, matching that mode,
+// doesn't require an athletics/website URL: the name-targeted search
+// buildSearchQuery() builds once a coach name is already known is usually
+// enough on its own, and requiring a URL here would needlessly shrink an
+// already-small candidate pool. Same CRON_SECRET auth and
 // system_settings kill-switch pattern (key: weekly_coach_info_batch_enabled)
 // as every other cron route in this app.
 const PRIORITY_STATES = ["TX", "FL", "GA", "CA", "OH", "IN"];
@@ -78,9 +85,11 @@ export async function GET(req) {
     const { data: rawCandidates, error: candErr } = await supabase
       .from("schools")
       .select("id,name,city,state,athletics_url,website,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook")
-      .or("hc_first_name.is.null,hc_first_name.eq.")
-      .or("hc_last_name.is.null,hc_last_name.eq.")
-      .or("athletics_url.not.is.null,website.not.is.null")
+      .not("hc_first_name", "is", null)
+      .neq("hc_first_name", "")
+      .not("hc_last_name", "is", null)
+      .neq("hc_last_name", "")
+      .or("hc_email.is.null,hc_email.eq.")
       .in("state", PRIORITY_STATES)
       .order("id", { ascending: true })
       .limit(WEEKLY_TARGET_COUNT * 3);
@@ -88,13 +97,13 @@ export async function GET(req) {
 
     const candidates = (rawCandidates || []).filter((s) => !excludedIds.has(s.id)).slice(0, WEEKLY_TARGET_COUNT);
     if (candidates.length === 0) {
-      console.log("cron weekly-coach-info-batch: skipped -- no eligible schools (everyone missing a coach name in the priority states already has an unreviewed batch item, or has no website/athletics URL to search from)");
-      return NextResponse.json({ skipped: true, reason: "No eligible schools -- everyone missing coach info in the priority states either already has an unreviewed batch item pending, or has no website/athletics URL on file to search from." });
+      console.log("cron weekly-coach-info-batch: skipped -- no eligible schools (everyone with a coach name on file in the priority states already has an email, or already has an unreviewed batch item pending)");
+      return NextResponse.json({ skipped: true, reason: "No eligible schools -- everyone with a coach name on file in the priority states already has an email, or already has an unreviewed batch item pending." });
     }
 
     const { data: runRow, error: runErr } = await supabase
       .from("coach_info_batch_runs")
-      .insert({ status: "collecting", state_filter: PRIORITY_STATES, requested_count: candidates.length, created_by: SYSTEM_USER_ID, candidate_mode: "no_name" })
+      .insert({ status: "collecting", state_filter: PRIORITY_STATES, requested_count: candidates.length, created_by: SYSTEM_USER_ID, candidate_mode: "missing_email" })
       .select()
       .single();
     if (runErr) throw runErr;
