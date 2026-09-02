@@ -27,6 +27,14 @@
     {
       "path": "/api/cron/weekly-maxpreps-batch",
       "schedule": "0 14 * * 1"
+    },
+    {
+      "path": "/api/cron/weekly-coach-info-batch",
+      "schedule": "0 15 * * 1"
+    },
+    {
+      "path": "/api/cron/collect-batch-runs",
+      "schedule": "0 16 * * *"
     }
   ]
 }
