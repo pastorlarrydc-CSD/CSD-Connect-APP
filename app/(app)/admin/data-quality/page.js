@@ -749,6 +749,30 @@ export default function DataQualityPage() {
     loadNeedsRecheck();
   }, [loadNeedsRecheck]);
 
+  // Keep Today's List honest across tab switches -- flags and re-checks
+  // both load once on mount, so a school "handled" via Open Profile (it
+  // opens in a NEW tab -- Quick Fix, Mark Coach Change, and Mark Verified
+  // there all resolve the flag / refresh last_verified_at for real, see
+  // resolveAllPendingFlags on that page) never showed up as done back
+  // here: this tab's copy of flaggedQueue/needsRecheck had no way to know
+  // anything changed until a manual re-scan or a full reload. Re-pulling
+  // both queues whenever this tab becomes visible again -- switching back
+  // from that other tab counts, same as switching back from any other
+  // app -- means Today's List (and its count) reflects reality again
+  // without Larry having to do anything extra. Doesn't touch scanning/
+  // result (the Scan Results queue) or any other section; those aren't
+  // what backs Today's List.
+  useEffect(() => {
+    function onVisibilityChange() {
+      if (document.visibilityState === "visible") {
+        loadFlags();
+        loadNeedsRecheck();
+      }
+    }
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, [loadFlags, loadNeedsRecheck]);
+
   const loadReviewMarked = useCallback(async () => {
     if (!canReview) {
       setLoadingReviewMarked(false);
