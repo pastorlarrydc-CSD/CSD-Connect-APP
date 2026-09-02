@@ -34,7 +34,7 @@ import { useAuth } from "@/lib/auth-context";
 const PRIORITY_STATES = ["TX", "FL", "GA", "CA", "OH", "IN"];
 const TARGET_COUNTS = [100, 300, 500, 1000];
 const DEFAULT_TARGET_COUNT = 300;
-const FETCH_CONCURRENCY = 3;
+const FETCH_CONCURRENCY = 8; // matches the weekly automated cron's own concurrency (app/api/cron/weekly-maxpreps-batch) -- this manual page used to run at 3, well under what the same Serper calls handle fine unattended, which just meant a longer wait staring at this tab for a same-size run
 const APPLY_CONCURRENCY = 5; // applying is just a DB write, no web fetch/AI call, so higher concurrency than FETCH_CONCURRENCY is safe -- matches batch-athletics/batch-social
 
 const ITEM_SELECT =
