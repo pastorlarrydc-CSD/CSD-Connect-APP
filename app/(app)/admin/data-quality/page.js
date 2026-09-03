@@ -179,6 +179,7 @@ const COACH_CHANGE_SOURCE_META = {
   "Coach-submitted correction (approved, edited by verifier)": { label: "Coach-submitted, edited", color: "#1a7f37", bg: "#e6f4ea" },
   "Bulk correction upload (Data Quality)": { label: "Bulk upload", color: "#8a6100", bg: "#fff4dc" },
   "Bulk school update (CSV)": { label: "Bulk update tool", color: "#8a6100", bg: "#fff4dc" },
+  "Batch AI lookup (high confidence, auto-applied)": { label: "Auto-applied — needs a look", color: "#b3261e", bg: "#fdeceb" },
 };
 // Every field this card tracks -- originally just the coach's name, now
 // widened to cover email/cell/office too, since those are logged to
