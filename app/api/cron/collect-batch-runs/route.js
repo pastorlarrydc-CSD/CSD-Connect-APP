@@ -1,6 +1,6 @@
- import { NextResponse } from "next/server";
+import { NextResponse } from "next/server";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
-import { parseModelJson, normalizeSuggestion } from "@/lib/coachInfoLookup";
+import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion } from "@/lib/coachInfoLookup";
 import { normalizeAthleticsSuggestion } from "@/lib/athleticsLookup";
 import { normalizeMaxPrepsSuggestion } from "@/lib/maxPrepsLookup";
 import { normalizeSocialSuggestion } from "@/lib/socialLookup";
@@ -19,10 +19,19 @@ export const maxDuration = 60;
 // exact logic each tool's own [runId]/check-status and [runId]/collect
 // routes already use, just running unattended instead of on a click.
 //
-// Nothing here ever writes to the schools table -- same non-authoritative
-// contract as every discovery tool in this app. A human still reviews and
-// applies (or skips) each suggestion; this only closes the gap between
-// "Anthropic finished" and "someone happened to check."
+// Coach-Info is the one exception to "nothing here writes to the schools
+// table": once results come back, its high-confidence suggestions get
+// written straight into the school record right here (see
+// autoApplyHighConfidenceSuggestion in lib/coachInfoLookup.js) -- no click
+// needed, so a Monday-morning coach-info run can be fully done, applied,
+// and sitting in "My Recent Updates" on the Data Quality page for a spot
+// check before anyone opens the review page at all. Medium/low confidence
+// still waits for a human Apply click there, matching the existing
+// bulk-apply button's own bar. Athletics, MaxPreps, and Social still never
+// touch the schools table here -- their suggestions (URLs, handles) aren't
+// verified against a person's identity the way a name+email is, so this
+// keeps them exactly as reviewer-gated as before; a human still reviews and
+// applies (or skips) each of those.
 //
 // Anthropic's Batch API has no webhook/completion notification -- polling
 // is the only way to know a batch is done (confirmed against Anthropic's
@@ -68,6 +77,7 @@ const TOOLS = [
     runsTable: "coach_info_batch_runs",
     itemsTable: "coach_info_batch_items",
     buildSuggestion: (parsed) => normalizeSuggestion(parsed, "batch AI lookup"),
+    autoApplyHighConfidence: true,
   },
   {
     key: "maxpreps",
@@ -170,12 +180,24 @@ export async function GET(req) {
         }
         const resultsText = await resultsRes.text();
 
+        // Only coach_info auto-applies (see the tool config above) -- and
+        // only that lookup needs a school_id per item, since a result line
+        // itself only carries the item id. One query for the whole run
+        // instead of one per item.
+        let schoolIdByItemId = null;
+        if (tool.autoApplyHighConfidence) {
+          const { data: itemRows } = await supabase.from(tool.itemsTable).select("id,school_id").eq("batch_run_id", run.id);
+          schoolIdByItemId = new Map((itemRows || []).map((r) => [r.id, r.school_id]));
+        }
+
         // Same update-only approach (never upsert) as every manual collect
         // route -- each line updates an EXISTING item row created back at
         // Submit time, and upsert would trip NOT NULL constraints on
         // columns (batch_run_id, school_id) this loop never sees.
         let succeeded = 0;
         let failed = 0;
+        let autoApplied = 0;
+        let autoApplyErrors = 0;
         for (const line of resultsText.split("\n")) {
           const trimmed = line.trim();
           if (!trimmed) continue;
@@ -208,11 +230,33 @@ export async function GET(req) {
 
           const { error: itemErr } = await supabase.from(tool.itemsTable).update(patch).eq("id", itemId);
           if (itemErr) console.error(`cron collect-batch-runs: item update error for ${tool.key} run ${run.id} item ${itemId}`, itemErr);
+
+          if (!itemErr && tool.autoApplyHighConfidence && patch.suggestion?.confidence === "high") {
+            const schoolId = schoolIdByItemId?.get(itemId);
+            if (schoolId) {
+              const applyResult = await autoApplyHighConfidenceSuggestion({
+                supabase,
+                itemId,
+                itemsTable: tool.itemsTable,
+                schoolId,
+                suggestion: patch.suggestion,
+                actorUserId: SYSTEM_USER_ID,
+              });
+              if (applyResult.applied) autoApplied++;
+              else {
+                autoApplyErrors++;
+                console.error(`cron collect-batch-runs: auto-apply error for ${tool.key} run ${run.id} item ${itemId}`, applyResult.error);
+              }
+            }
+          }
         }
 
         await supabase.from(tool.runsTable).update({ status: "collected", collected_at: new Date().toISOString(), anthropic_batch_status: processingStatus }).eq("id", run.id);
-        summary.push({ tool: tool.key, run_id: run.id, collected: true, succeeded, failed });
-        console.log(`cron collect-batch-runs: collected ${tool.key} run ${run.id} -- ${succeeded} succeeded, ${failed} failed`);
+        summary.push({ tool: tool.key, run_id: run.id, collected: true, succeeded, failed, auto_applied: autoApplied, auto_apply_errors: autoApplyErrors });
+        console.log(
+          `cron collect-batch-runs: collected ${tool.key} run ${run.id} -- ${succeeded} succeeded, ${failed} failed` +
+            (tool.autoApplyHighConfidence ? `, ${autoApplied} auto-applied, ${autoApplyErrors} auto-apply errors` : "")
+        );
       }
     }
 
