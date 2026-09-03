@@ -126,6 +126,16 @@ export default function BatchCoachInfoPage() {
   const [applyingId, setApplyingId] = useState(null);
   const [reviewError, setReviewError] = useState("");
   const [showReviewed, setShowReviewed] = useState(false);
+  // Confidence filter -- lets a reviewer work through one tier at a time
+  // (e.g. clear every "medium" row after Apply All High-Confidence has
+  // taken care of the high ones) instead of scrolling a single mixed list.
+  // "all" shows everything, same as before this existed.
+  const [confidenceFilter, setConfidenceFilter] = useState("all"); // "all" | "high" | "medium" | "low"
+  // Free-text filter on school name/city -- useful once a run's list runs
+  // into the hundreds and a reviewer wants to jump straight to one school
+  // (e.g. checking whether a specific school they were just asked about
+  // already has a suggestion queued) instead of scanning the whole table.
+  const [searchQuery, setSearchQuery] = useState("");
   // Bulk-apply: lets a reviewer clear every high-confidence suggestion in a
   // run with one click instead of clicking Apply on each one individually --
   // see bulkApplyHighConfidence below.
@@ -144,10 +154,40 @@ export default function BatchCoachInfoPage() {
   const failedItems = suggestedItems.filter((i) => i.suggestion_error);
   const highConfidencePendingCount = pendingReview.filter((i) => i.suggestion?.confidence === "high").length;
 
-  // Keyboard-nav targets mirror the table's own row filter (pendingReview
-  // minus suggestion_error items) so the focused row always lines up with
-  // what's actually on screen.
-  const keyboardTargets = pendingReview.filter((i) => !i.suggestion_error);
+  // Matches a row against the current search box -- school name or city,
+  // case-insensitive, same loose substring match a reviewer would expect
+  // from a quick filter box.
+  function matchesSearch(item) {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return true;
+    const s = item.school;
+    return Boolean(s && (`${s.name || ""}`.toLowerCase().includes(q) || `${s.city || ""}`.toLowerCase().includes(q)));
+  }
+
+  // Base row set the table renders from -- everything still pending, or
+  // (with "Show already-reviewed" checked) every suggested item -- with
+  // the confidence tier and search box both applied on top. Computed once
+  // here rather than inline in the JSX so the on-screen counts next to
+  // each confidence button, the rendered rows, and the keyboard-nav
+  // targets below can never quietly disagree about what's actually
+  // visible.
+  const reviewBaseRows = (showReviewed ? suggestedItems : pendingReview).filter((i) => !i.suggestion_error);
+  const confidenceCounts = {
+    all: reviewBaseRows.length,
+    high: reviewBaseRows.filter((i) => i.suggestion?.confidence === "high").length,
+    medium: reviewBaseRows.filter((i) => i.suggestion?.confidence === "medium").length,
+    low: reviewBaseRows.filter((i) => i.suggestion?.confidence === "low").length,
+  };
+  const visibleRows = reviewBaseRows.filter((i) => (confidenceFilter === "all" || i.suggestion?.confidence === confidenceFilter) && matchesSearch(i));
+
+  // Keyboard-nav targets mirror the table's own row filter (pendingReview,
+  // minus suggestion_error items, with the same confidence/search filters
+  // the visible table uses) so the focused row always lines up with what's
+  // actually on screen -- reviewed rows are excluded here regardless of
+  // "Show already-reviewed" since there's nothing left to apply/skip on one.
+  const keyboardTargets = pendingReview.filter(
+    (i) => !i.suggestion_error && (confidenceFilter === "all" || i.suggestion?.confidence === confidenceFilter) && matchesSearch(i)
+  );
   const clampedFocusedIndex = keyboardTargets.length === 0 ? 0 : Math.min(focusedIndex, keyboardTargets.length - 1);
   const focusedItem = keyboardTargets[clampedFocusedIndex] || null;
 
@@ -186,6 +226,14 @@ export default function BatchCoachInfoPage() {
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [selectedRun?.status, bulkApplying, applyingId, focusedItem, keyboardTargets.length]);
+
+  // Narrowing the confidence filter or typing a search query changes which
+  // rows count as keyboard-nav targets -- reset focus to the top of the new
+  // list rather than leaving it pointed at an index that may now be a
+  // completely different (or nonexistent) row.
+  useEffect(() => {
+    setFocusedIndex(0);
+  }, [confidenceFilter, searchQuery]);
 
   const loadRuns = useCallback(async () => {
     setLoadingRuns(true);
@@ -691,6 +739,31 @@ export default function BatchCoachInfoPage() {
                 </label>
               </div>
 
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 10 }}>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {["all", "high", "medium", "low"].map((tier) => {
+                    const active = confidenceFilter === tier;
+                    const label = tier === "all" ? "All" : tier[0].toUpperCase() + tier.slice(1);
+                    return (
+                      <button
+                        key={tier}
+                        className="btn btn-sm"
+                        onClick={() => setConfidenceFilter(tier)}
+                        style={active ? { background: "#0b5fff", borderColor: "#0b5fff", color: "#fff" } : undefined}
+                      >
+                        {label} ({confidenceCounts[tier]})
+                      </button>
+                    );
+                  })}
+                </div>
+                <input
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search school or city…"
+                  style={{ maxWidth: 220, fontSize: 12.5 }}
+                />
+              </div>
+
               {highConfidencePendingCount > 0 && (
                 <div
                   style={{
@@ -737,9 +810,7 @@ export default function BatchCoachInfoPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {(showReviewed ? suggestedItems : pendingReview)
-                      .filter((i) => !i.suggestion_error)
-                      .map((item) => {
+                    {visibleRows.map((item) => {
                         const s = item.school;
                         const sug = item.suggestion;
                         if (!s || !sug) return null;
@@ -813,7 +884,13 @@ export default function BatchCoachInfoPage() {
                       })}
                   </tbody>
                 </table>
-                {!showReviewed && pendingReview.length === 0 && <div className="empty-state">Nothing left to review.</div>}
+                {visibleRows.length === 0 && (
+                  <div className="empty-state">
+                    {reviewBaseRows.length === 0
+                      ? "Nothing left to review."
+                      : "No suggestions match the current confidence filter and/or search -- try \"All\" or clearing the search box."}
+                  </div>
+                )}
               </div>
             </div>
           )}
