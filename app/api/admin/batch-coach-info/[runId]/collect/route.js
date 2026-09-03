@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
-import { parseModelJson, normalizeSuggestion } from "@/lib/coachInfoLookup";
+import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion } from "@/lib/coachInfoLookup";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
 
@@ -9,10 +9,19 @@ const REVIEWER_ROLES = ["verifier", "sysadmin"];
 // check-status), this route downloads the batch's results file -- a
 // newline-delimited JSON (JSONL) file Anthropic hosts at results_url, one
 // line per submitted request -- and drops each school's parsed suggestion
-// into coach_info_batch_items for the review page to show. Nothing here
-// touches the schools table itself: same non-authoritative contract as
-// every other discovery tool in this app, just at batch scale. A human
-// still has to Apply (or Skip) each suggestion on the review page.
+// into coach_info_batch_items for the review page to show.
+//
+// High-confidence suggestions get written straight into the schools table
+// right here, the moment they're collected -- no click required (see
+// autoApplyHighConfidenceSuggestion in lib/coachInfoLookup.js). Medium and
+// low confidence still just sit on the review page waiting for a human
+// Apply click, same as always: the AI itself flags those as less certain,
+// and an unattended write there risks landing bad data before anyone
+// catches it (the "Ajo High School -- coach could not be verified" case is
+// exactly the kind of low-confidence miss this bar exists to keep out of
+// the schools table without a human's own click). The reviewer who clicked
+// "Collect Results" is attributed as the actor on every auto-applied
+// change, same as if they'd clicked Apply themselves.
 export async function POST(req, { params }) {
   try {
     const runId = Number(params.runId);
@@ -69,6 +78,12 @@ export async function POST(req, { params }) {
     }
     const resultsText = await resultsRes.text();
 
+    // Needed to auto-apply below (a result line only carries an item id, not
+    // the school it belongs to) -- one query for the whole run instead of
+    // one per item.
+    const { data: itemRows } = await supabase.from("coach_info_batch_items").select("id,school_id").eq("batch_run_id", runId);
+    const schoolIdByItemId = new Map((itemRows || []).map((r) => [r.id, r.school_id]));
+
     // Each result line updates an EXISTING item row (created back in the
     // "start run" step, one per school) -- so this is always an update,
     // never an insert. Deliberately not using upsert(): coach_info_batch_items
@@ -79,6 +94,8 @@ export async function POST(req, { params }) {
     // columns listed below, so it can't trip that.
     let succeeded = 0;
     let failed = 0;
+    let autoApplied = 0;
+    let autoApplyErrors = 0;
     let saveErr = null;
     for (const line of resultsText.split("\n")) {
       const trimmed = line.trim();
@@ -112,6 +129,25 @@ export async function POST(req, { params }) {
 
       const { error: itemErr } = await supabase.from("coach_info_batch_items").update(patch).eq("id", itemId);
       if (itemErr && !saveErr) saveErr = itemErr;
+
+      if (!itemErr && patch.suggestion?.confidence === "high") {
+        const schoolId = schoolIdByItemId.get(itemId);
+        if (schoolId) {
+          const result = await autoApplyHighConfidenceSuggestion({
+            supabase,
+            itemId,
+            itemsTable: "coach_info_batch_items",
+            schoolId,
+            suggestion: patch.suggestion,
+            actorUserId: userData.user.id,
+          });
+          if (result.applied) autoApplied++;
+          else {
+            autoApplyErrors++;
+            console.error("batch-coach-info collect auto-apply error for item", itemId, result.error);
+          }
+        }
+      }
     }
 
     if (saveErr) {
@@ -126,7 +162,7 @@ export async function POST(req, { params }) {
       console.error("batch-coach-info collect run-update error", updateErr);
     }
 
-    return NextResponse.json({ status: "collected", succeeded, failed });
+    return NextResponse.json({ status: "collected", succeeded, failed, auto_applied: autoApplied, auto_apply_errors: autoApplyErrors });
   } catch (err) {
     console.error("batch-coach-info collect error", err);
     return NextResponse.json({ error: "Could not collect this run's results. Please try again." }, { status: 500 });
