@@ -266,6 +266,20 @@ export default function BatchCoachInfoPage() {
     loadRuns();
   }, [loadRuns]);
 
+  // Auto-selects a run the first time the page loads, instead of requiring
+  // a click into the run list every single visit -- picks the newest run
+  // that's actually ready to review (status "collected") since that's what
+  // a reviewer opens this page to do most of the time, falling back to the
+  // single newest run of any status (so a run still collecting/submitted is
+  // visible rather than an empty screen) if none are collected yet. Only
+  // fires while nothing is already selected -- never overrides a run the
+  // reviewer has deliberately opened.
+  useEffect(() => {
+    if (selectedRunId || runs.length === 0) return;
+    const newestCollected = runs.find((r) => r.status === "collected");
+    setSelectedRunId((newestCollected || runs[0]).id);
+  }, [runs, selectedRunId]);
+
   const loadItems = useCallback(
     async (runId) => {
       if (!runId) return;
