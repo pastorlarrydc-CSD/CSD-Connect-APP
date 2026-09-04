@@ -69,14 +69,17 @@ export async function GET(req) {
       return NextResponse.json({ skipped: true, reason: "Weekly Social Media batch is currently suspended (system_settings.weekly_social_batch_enabled = false)." });
     }
 
-    // Schools already sitting in an unresolved batch item (fetched or not,
-    // but not yet reviewed) from a previous run shouldn't be queued again --
-    // avoids paying for a second Serper/AI look at a school nobody's gotten
-    // to reviewing yet. Over-fetch the candidate pool since this filter
-    // happens client-side, then trim to the target count.
-    const { data: pendingItemRows, error: pendingErr } = await supabase.from("social_batch_items").select("school_id").eq("review_status", "pending");
-    if (pendingErr) throw pendingErr;
-    const excludedIds = new Set((pendingItemRows || []).map((r) => r.school_id));
+    // Excludes every school that's EVER gone through this tool -- applied,
+    // skipped, or a suggestion the AI found no match for -- not just the
+    // ones currently sitting in an unresolved run. Before this it was
+    // possible for a school you'd already worked to come right back in a
+    // later run with nothing new to say (matches the fix just made to
+    // Batch Coach-Info -- see that page's startRun for the reasoning).
+    // Over-fetch the candidate pool since this filter happens client-side,
+    // then trim to the target count.
+    const { data: touchedRows, error: touchedErr } = await supabase.from("social_batch_items").select("school_id");
+    if (touchedErr) throw touchedErr;
+    const excludedIds = new Set((touchedRows || []).map((r) => r.school_id));
 
     // Needs a coach name on file to search by -- same requirement as the
     // manual tool's own candidate query (see app/(app)/admin/batch-social).
@@ -95,8 +98,8 @@ export async function GET(req) {
 
     const candidates = (rawCandidates || []).filter((s) => !excludedIds.has(s.id)).slice(0, WEEKLY_TARGET_COUNT);
     if (candidates.length === 0) {
-      console.log("cron weekly-social-batch: skipped -- no eligible schools (everyone with a coach name already has both handles, an unreviewed batch item, or priority-state coverage is complete)");
-      return NextResponse.json({ skipped: true, reason: "No eligible schools -- everyone with a coach name on file in the priority states already has both handles or an unreviewed batch item pending." });
+      console.log("cron weekly-social-batch: skipped -- no eligible schools (everyone with a coach name already has both handles, has already been through this tool before, or priority-state coverage is complete)");
+      return NextResponse.json({ skipped: true, reason: "No eligible schools -- everyone with a coach name on file in the priority states already has both handles, or has already been through this tool before." });
     }
 
     const { data: runRow, error: runErr } = await supabase
