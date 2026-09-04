@@ -109,6 +109,13 @@ export default function BatchMaxPrepsPage() {
   const [showReviewed, setShowReviewed] = useState(false);
   const [bulkApplying, setBulkApplying] = useState(false);
   const [bulkProgress, setBulkProgress] = useState({ done: 0, total: 0 });
+  // Confidence filter + search box -- same pattern as Batch Coach-Info's
+  // own review queue (see that page's confidenceFilter/searchQuery for the
+  // full reasoning): lets a reviewer work through one tier at a time, or
+  // jump straight to a specific school, once a run's list runs into the
+  // hundreds instead of scrolling one long mixed table.
+  const [confidenceFilter, setConfidenceFilter] = useState("all"); // "all" | "high" | "medium" | "low"
+  const [searchQuery, setSearchQuery] = useState("");
   const [focusedIndex, setFocusedIndex] = useState(0);
 
   const selectedRun = runs.find((r) => r.id === selectedRunId) || null;
@@ -124,8 +131,49 @@ export default function BatchMaxPrepsPage() {
   const reviewedItems = matchedItems.filter((i) => i.review_status !== "pending");
   const highConfidencePendingCount = pendingReview.filter((i) => i.suggestion?.confidence === "high").length;
 
-  const clampedFocusedIndex = pendingReview.length === 0 ? 0 : Math.min(focusedIndex, pendingReview.length - 1);
-  const focusedItem = pendingReview[clampedFocusedIndex] || null;
+  // Matches a row against the current search box -- school name or city,
+  // case-insensitive. Same loose substring match as Batch Coach-Info's own
+  // matchesSearch.
+  function matchesSearch(item) {
+    const q = searchQuery.trim().toLowerCase();
+    if (!q) return true;
+    const s = item.school;
+    return Boolean(s && (`${s.name || ""}`.toLowerCase().includes(q) || `${s.city || ""}`.toLowerCase().includes(q)));
+  }
+
+  // Base row set the table renders from -- pendingReview, or (with "Show
+  // already-reviewed" checked) every matched item -- with the confidence
+  // tier and search box both applied on top. Computed once here so the
+  // on-screen counts next to each confidence button, the rendered rows, and
+  // the keyboard-nav targets below can never disagree about what's visible.
+  const reviewBaseRows = showReviewed ? matchedItems : pendingReview;
+  const confidenceCounts = {
+    all: reviewBaseRows.length,
+    high: reviewBaseRows.filter((i) => i.suggestion?.confidence === "high").length,
+    medium: reviewBaseRows.filter((i) => i.suggestion?.confidence === "medium").length,
+    low: reviewBaseRows.filter((i) => i.suggestion?.confidence === "low").length,
+  };
+  const visibleRows = reviewBaseRows.filter((i) => (confidenceFilter === "all" || i.suggestion?.confidence === confidenceFilter) && matchesSearch(i));
+
+  // Keyboard-nav targets mirror the table's own row filter (pendingReview
+  // with the same confidence/search filters the visible table uses) so the
+  // focused row always lines up with what's actually on screen -- reviewed
+  // rows stay excluded here regardless of "Show already-reviewed" since
+  // there's nothing left to apply/skip on one.
+  const keyboardTargets = pendingReview.filter((i) => (confidenceFilter === "all" || i.suggestion?.confidence === confidenceFilter) && matchesSearch(i));
+  // Keeps the keyboard-focused row valid as keyboardTargets shrinks (typing
+  // in the search box, narrowing the confidence filter, or applying/
+  // skipping removes items) or a different run is opened.
+  const clampedFocusedIndex = keyboardTargets.length === 0 ? 0 : Math.min(focusedIndex, keyboardTargets.length - 1);
+  const focusedItem = keyboardTargets[clampedFocusedIndex] || null;
+
+  // Narrowing the confidence filter or typing a search query changes which
+  // rows are keyboard-nav targets -- reset focus to the top of the new list
+  // rather than leaving it pointed at an index that now means something
+  // else (or nothing at all).
+  useEffect(() => {
+    setFocusedIndex(0);
+  }, [confidenceFilter, searchQuery]);
 
   // Keyboard shortcuts for the review queue -- Up/Down move focus between
   // pending rows, A applies the focused row, S skips it. Only active while
@@ -143,7 +191,7 @@ export default function BatchMaxPrepsPage() {
 
       if (e.key === "ArrowDown") {
         e.preventDefault();
-        setFocusedIndex((prev) => (pendingReview.length === 0 ? 0 : Math.min(prev + 1, pendingReview.length - 1)));
+        setFocusedIndex((prev) => (keyboardTargets.length === 0 ? 0 : Math.min(prev + 1, keyboardTargets.length - 1)));
       } else if (e.key === "ArrowUp") {
         e.preventDefault();
         setFocusedIndex((prev) => Math.max(prev - 1, 0));
@@ -161,7 +209,7 @@ export default function BatchMaxPrepsPage() {
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedRun?.status, bulkApplying, applyingId, focusedItem, pendingReview.length]);
+  }, [selectedRun?.status, bulkApplying, applyingId, focusedItem, keyboardTargets.length]);
 
   const loadRuns = useCallback(async () => {
     setLoadingRuns(true);
@@ -173,6 +221,20 @@ export default function BatchMaxPrepsPage() {
   useEffect(() => {
     loadRuns();
   }, [loadRuns]);
+
+  // Auto-selects a run the first time the page loads, instead of requiring
+  // a click into the run list every single visit -- picks the newest run
+  // that's actually ready to review (status "collected") since that's what
+  // a reviewer opens this page to do most of the time, falling back to the
+  // single newest run of any status (so a run still collecting/submitted is
+  // visible rather than an empty screen) if none are collected yet. Only
+  // fires while nothing is already selected -- never overrides a run the
+  // reviewer has deliberately opened.
+  useEffect(() => {
+    if (selectedRunId || runs.length === 0) return;
+    const newestCollected = runs.find((r) => r.status === "collected");
+    setSelectedRunId((newestCollected || runs[0]).id);
+  }, [runs, selectedRunId]);
 
   const loadItems = useCallback(
     async (runId) => {
@@ -624,6 +686,31 @@ export default function BatchMaxPrepsPage() {
                 </label>
               </div>
 
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 10 }}>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {["all", "high", "medium", "low"].map((tier) => {
+                    const active = confidenceFilter === tier;
+                    const label = tier === "all" ? "All" : tier[0].toUpperCase() + tier.slice(1);
+                    return (
+                      <button
+                        key={tier}
+                        className="btn btn-sm"
+                        onClick={() => setConfidenceFilter(tier)}
+                        style={active ? { background: "#0b5fff", borderColor: "#0b5fff", color: "#fff" } : undefined}
+                      >
+                        {label} ({confidenceCounts[tier]})
+                      </button>
+                    );
+                  })}
+                </div>
+                <input
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Search school or city…"
+                  style={{ maxWidth: 220, fontSize: 12.5 }}
+                />
+              </div>
+
               {highConfidencePendingCount > 0 && (
                 <div
                   style={{
@@ -670,7 +757,7 @@ export default function BatchMaxPrepsPage() {
                     </tr>
                   </thead>
                   <tbody>
-                    {(showReviewed ? matchedItems : pendingReview).map((item) => {
+                    {visibleRows.map((item) => {
                       const s = item.school;
                       const sug = item.suggestion;
                       if (!s || !sug) return null;
@@ -728,7 +815,13 @@ export default function BatchMaxPrepsPage() {
                     })}
                   </tbody>
                 </table>
-                {!showReviewed && pendingReview.length === 0 && <div className="empty-state">Nothing left to review.</div>}
+                {visibleRows.length === 0 && (
+                  <div className="empty-state">
+                    {reviewBaseRows.length === 0
+                      ? "Nothing left to review."
+                      : "No suggestions match the current confidence filter and/or search -- try \"All\" or clearing the search box."}
+                  </div>
+                )}
               </div>
             </div>
           )}
