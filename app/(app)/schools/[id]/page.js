@@ -49,6 +49,31 @@ const EMPTY_COACH_FORM = { hc_first_name: "", hc_last_name: "", hc_email: "", hc
 const EMPTY_OWNER_FORM = { hc_first_name: "", hc_last_name: "", hc_email: "", hc_cell: "", hc_office: "", website: "", note: "" };
 const EMPTY_STAFF_FORM = { hc_first_name: "", hc_last_name: "", hc_email: "", hc_cell: "", hc_office: "", hc_twitter: "", hc_facebook: "" };
 
+// Same 50-state list app/(app)/schools/new/page.js uses for its own State
+// dropdown -- duplicated here rather than imported since it's plain inline
+// data, not shared-lib code anywhere yet.
+const STATES = ["AL","AK","AS","AZ","AR","CA","CO","CT","DE","DC","FL","GA","HI","ID","IL","IN","IA","KS","KY","LA","ME","MD","MA","MI","MN","MS","MO","MT","NE","NV","NH","NJ","NM","NY","NC","ND","OH","OK","OR","PA","RI","SC","SD","TN","TX","UT","VT","VA","WA","WV","WI","WY"];
+
+// The "School Info" card's core fields -- name, type, address, county,
+// state, zip, classification, main phone -- were display-only until now.
+// Website/MaxPreps URL/Athletics URL already had their own inline-edit
+// forms right below this same card; these are the fields that were
+// missing one, which is what Larry asked for when he said he wants to
+// "update high school information that already exists."
+const SCHOOL_INFO_FIELDS = ["name", "school_type", "addr1", "addr2", "city", "county", "state", "zip", "classification", "phone"];
+const SCHOOL_INFO_FIELD_LABELS = {
+  name: "School name",
+  school_type: "Type",
+  addr1: "Address line 1",
+  addr2: "Address line 2",
+  city: "City",
+  county: "County",
+  state: "State",
+  zip: "Zip",
+  classification: "Classification",
+  phone: "Main phone",
+};
+
 // Verification staff/sysadmin write directly to schools (schools_write RLS
 // policy), so unlike "Suggest a correction" below, this never goes through
 // a review queue -- the person editing here IS the reviewer.
@@ -163,6 +188,10 @@ export default function SchoolProfilePage() {
   // since a stale/broken URL here is exactly what breaks the automated
   // coach-change recheck.
   const isStaff = profile?.role === "verifier" || profile?.role === "sysadmin";
+  const [editingSchoolInfo, setEditingSchoolInfo] = useState(false);
+  const [schoolInfoDraft, setSchoolInfoDraft] = useState({});
+  const [schoolInfoSaving, setSchoolInfoSaving] = useState(false);
+  const [schoolInfoError, setSchoolInfoError] = useState("");
   const [editingWebsite, setEditingWebsite] = useState(false);
   const [websiteDraft, setWebsiteDraft] = useState("");
   const [websiteSaving, setWebsiteSaving] = useState(false);
@@ -482,6 +511,69 @@ export default function SchoolProfilePage() {
       setRecheckError(err.message || "Could not run this check.");
     } finally {
       setCheckingUpdate(false);
+    }
+  }
+
+  function startEditSchoolInfo() {
+    const draft = {};
+    SCHOOL_INFO_FIELDS.forEach((f) => {
+      draft[f] = school[f] || "";
+    });
+    setSchoolInfoDraft(draft);
+    setSchoolInfoError("");
+    setEditingSchoolInfo(true);
+  }
+
+  // Same write shape as saveWebsiteDirect right below -- schools update +
+  // one school_change_log row per field that actually changed -- just
+  // looping SCHOOL_INFO_FIELDS instead of a single column, and validating
+  // name/state stay non-blank the same way the Add-a-School form does
+  // (both are NOT NULL-equivalent in practice: a school with no name or no
+  // state breaks search, exports, and every state-scoped batch tool).
+  async function saveSchoolInfoDirect(e) {
+    e.preventDefault();
+    setSchoolInfoError("");
+
+    const name = (schoolInfoDraft.name || "").trim();
+    const state = (schoolInfoDraft.state || "").trim().toUpperCase();
+    if (!name) {
+      setSchoolInfoError("School name is required.");
+      return;
+    }
+    if (!state) {
+      setSchoolInfoError("State is required.");
+      return;
+    }
+
+    setSchoolInfoSaving(true);
+    try {
+      const update = {};
+      const changes = [];
+      SCHOOL_INFO_FIELDS.forEach((f) => {
+        const newVal = f === "name" ? name : f === "state" ? state : (schoolInfoDraft[f] || "").trim() || null;
+        const oldVal = school[f] || null;
+        if (newVal !== oldVal) {
+          update[f] = newVal;
+          changes.push({ school_id: id, field_name: f, old_value: oldVal, new_value: newVal, source: "Edited directly by verification staff", changed_by: user.id });
+        }
+      });
+
+      if (Object.keys(update).length > 0) {
+        update.updated_at = new Date().toISOString();
+        const { error } = await supabase.from("schools").update(update).eq("id", id);
+        if (error) throw error;
+        if (changes.length > 0 && user?.id) {
+          const { error: logErr } = await supabase.from("school_change_log").insert(changes);
+          if (logErr) throw logErr;
+        }
+      }
+
+      setEditingSchoolInfo(false);
+      load();
+    } catch (err) {
+      setSchoolInfoError(err.message || "Could not save these changes.");
+    } finally {
+      setSchoolInfoSaving(false);
     }
   }
 
@@ -1114,6 +1206,11 @@ export default function SchoolProfilePage() {
               <h3 style={{ margin: 0 }}>School Info</h3>
               {isStaff && (
                 <div style={{ display: "flex", gap: 6 }}>
+                  {!editingSchoolInfo && (
+                    <button className="btn btn-sm btn-primary" onClick={startEditSchoolInfo}>
+                      Edit School Info
+                    </button>
+                  )}
                   {!editingWebsite && (
                     <button className="btn btn-sm" onClick={startEditWebsite}>
                       Edit website
@@ -1178,6 +1275,85 @@ export default function SchoolProfilePage() {
                   ))}
               </div>
             </div>
+
+            {editingSchoolInfo && (
+              <form onSubmit={saveSchoolInfoDirect} style={{ marginTop: 10, borderTop: "1px solid #eef0f3", paddingTop: 10 }}>
+                {schoolInfoError && <div className="notice danger" style={{ marginBottom: 10 }}>{schoolInfoError}</div>}
+                <div className="grid grid-2" style={{ gap: 10, marginBottom: 4 }}>
+                  <div className="form-field">
+                    <label>{SCHOOL_INFO_FIELD_LABELS.name} *</label>
+                    <input value={schoolInfoDraft.name || ""} onChange={(e) => setSchoolInfoDraft((v) => ({ ...v, name: e.target.value }))} required />
+                  </div>
+                  <div className="form-field">
+                    <label>{SCHOOL_INFO_FIELD_LABELS.school_type}</label>
+                    <select value={schoolInfoDraft.school_type || ""} onChange={(e) => setSchoolInfoDraft((v) => ({ ...v, school_type: e.target.value }))}>
+                      <option value="">—</option>
+                      <option value="Public">Public</option>
+                      <option value="Private">Private</option>
+                    </select>
+                  </div>
+                </div>
+                <div className="grid grid-2" style={{ gap: 10, marginBottom: 4 }}>
+                  <div className="form-field">
+                    <label>{SCHOOL_INFO_FIELD_LABELS.addr1}</label>
+                    <input value={schoolInfoDraft.addr1 || ""} onChange={(e) => setSchoolInfoDraft((v) => ({ ...v, addr1: e.target.value }))} />
+                  </div>
+                  <div className="form-field">
+                    <label>{SCHOOL_INFO_FIELD_LABELS.addr2}</label>
+                    <input value={schoolInfoDraft.addr2 || ""} onChange={(e) => setSchoolInfoDraft((v) => ({ ...v, addr2: e.target.value }))} />
+                  </div>
+                </div>
+                <div className="grid grid-2" style={{ gap: 10, marginBottom: 4 }}>
+                  <div className="form-field">
+                    <label>{SCHOOL_INFO_FIELD_LABELS.city}</label>
+                    <input value={schoolInfoDraft.city || ""} onChange={(e) => setSchoolInfoDraft((v) => ({ ...v, city: e.target.value }))} />
+                  </div>
+                  <div className="form-field">
+                    <label>{SCHOOL_INFO_FIELD_LABELS.county}</label>
+                    <input value={schoolInfoDraft.county || ""} onChange={(e) => setSchoolInfoDraft((v) => ({ ...v, county: e.target.value }))} />
+                  </div>
+                </div>
+                <div className="grid grid-2" style={{ gap: 10, marginBottom: 4 }}>
+                  <div className="form-field">
+                    <label>{SCHOOL_INFO_FIELD_LABELS.state} *</label>
+                    <select value={schoolInfoDraft.state || ""} onChange={(e) => setSchoolInfoDraft((v) => ({ ...v, state: e.target.value }))} required>
+                      <option value="">—</option>
+                      {STATES.map((s) => (
+                        <option key={s} value={s}>
+                          {s}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="form-field">
+                    <label>{SCHOOL_INFO_FIELD_LABELS.zip}</label>
+                    <input value={schoolInfoDraft.zip || ""} onChange={(e) => setSchoolInfoDraft((v) => ({ ...v, zip: e.target.value }))} />
+                  </div>
+                </div>
+                <div className="grid grid-2" style={{ gap: 10, marginBottom: 8 }}>
+                  <div className="form-field">
+                    <label>{SCHOOL_INFO_FIELD_LABELS.classification}</label>
+                    <input
+                      placeholder="e.g. 4A, D2, GRP 1"
+                      value={schoolInfoDraft.classification || ""}
+                      onChange={(e) => setSchoolInfoDraft((v) => ({ ...v, classification: e.target.value }))}
+                    />
+                  </div>
+                  <div className="form-field">
+                    <label>{SCHOOL_INFO_FIELD_LABELS.phone}</label>
+                    <input value={schoolInfoDraft.phone || ""} onChange={(e) => setSchoolInfoDraft((v) => ({ ...v, phone: e.target.value }))} />
+                  </div>
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button className="btn btn-sm btn-primary" disabled={schoolInfoSaving}>
+                    {schoolInfoSaving ? "Saving…" : "Save"}
+                  </button>
+                  <button type="button" className="btn btn-sm" onClick={() => setEditingSchoolInfo(false)} disabled={schoolInfoSaving}>
+                    Cancel
+                  </button>
+                </div>
+              </form>
+            )}
 
             {editingWebsite && (
               <form onSubmit={saveWebsiteDirect} style={{ marginTop: 10, borderTop: "1px solid #eef0f3", paddingTop: 10 }}>
