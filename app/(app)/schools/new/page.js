@@ -1,7 +1,6 @@
 "use client";
 import { useState } from "react";
 import Link from "next/link";
-import { useRouter } from "next/navigation";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 
@@ -28,13 +27,23 @@ const EMPTY_FORM = {
 };
 
 export default function AddSchoolPage() {
-  const router = useRouter();
   const supabase = getSupabaseBrowserClient();
   const { user, profile } = useAuth();
 
   const [form, setForm] = useState(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
+  // The most recently added school on THIS page visit -- shown as a
+  // dismissable confirmation banner instead of navigating away to that
+  // school's own profile page. Larry's own words: he wants to add a run of
+  // high schools back-to-back without "the screen refreshing itself"
+  // between each one, which is exactly what router.push(`/schools/${id}`)
+  // used to do here -- it worked, but it meant leaving this form (and
+  // losing the muscle-memory flow of tab, tab, tab, Add School) every
+  // single time. Staying put and clearing the form for the next entry
+  // keeps the add-many-in-a-row workflow on one screen; the banner still
+  // links to the new record for whoever wants to open it right away.
+  const [addedSchool, setAddedSchool] = useState(null); // { id, name } | null
 
   const canAdd = profile?.role === "verifier" || profile?.role === "sysadmin";
 
@@ -45,6 +54,7 @@ export default function AddSchoolPage() {
   async function handleSubmit(e) {
     e.preventDefault();
     setError("");
+    setAddedSchool(null);
 
     const name = form.name.trim();
     const state = form.state.trim().toUpperCase();
@@ -112,7 +122,11 @@ export default function AddSchoolPage() {
         changed_by: user.id,
       });
 
-      router.push(`/schools/${created.id}`);
+      // Stay on this page -- see addedSchool's own comment above for why --
+      // and hand back a blank form ready for the next school.
+      setAddedSchool({ id: created.id, name });
+      setForm(EMPTY_FORM);
+      setSaving(false);
     } catch (err) {
       setError(err.message || "Could not save this school.");
       setSaving(false);
@@ -138,6 +152,25 @@ export default function AddSchoolPage() {
           <p>Adds a single school directly to the national database. To add many schools at once, use Bulk Add Schools (CSV) from the Admin page instead.</p>
         </div>
       </div>
+
+      {addedSchool && (
+        <div
+          className="notice"
+          style={{ marginBottom: 12, maxWidth: 720, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, flexWrap: "wrap" }}
+        >
+          <span>
+            ✓ Added <strong>{addedSchool.name}</strong> to the database. Keep going below, or:
+          </span>
+          <div style={{ display: "flex", gap: 8 }}>
+            <Link href={`/schools/${addedSchool.id}`} className="btn btn-sm">
+              View this school
+            </Link>
+            <button type="button" className="btn btn-sm" onClick={() => setAddedSchool(null)}>
+              Dismiss
+            </button>
+          </div>
+        </div>
+      )}
 
       <form className="card" onSubmit={handleSubmit} style={{ maxWidth: 720 }}>
         {error && <div className="notice danger" style={{ marginBottom: 12 }}>{error}</div>}
