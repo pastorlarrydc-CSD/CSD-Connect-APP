@@ -141,6 +141,9 @@ export default function BatchCoachInfoPage() {
   // see bulkApplyHighConfidence below.
   const [bulkApplying, setBulkApplying] = useState(false);
   const [bulkProgress, setBulkProgress] = useState({ done: 0, total: 0 });
+  // Bulk-skip: same idea for suggestions with nothing to apply at all --
+  // see bulkSkipNoChanges below.
+  const [bulkSkipping, setBulkSkipping] = useState(false);
   const [focusedIndex, setFocusedIndex] = useState(0);
 
   const selectedRun = runs.find((r) => r.id === selectedRunId) || null;
@@ -153,6 +156,23 @@ export default function BatchCoachInfoPage() {
   const reviewedItems = suggestedItems.filter((i) => i.review_status !== "pending");
   const failedItems = suggestedItems.filter((i) => i.suggestion_error);
   const highConfidencePendingCount = pendingReview.filter((i) => i.suggestion?.confidence === "high").length;
+  // Suggestions where every field already matches what's on file -- the
+  // coach was confirmed but nothing new turned up (no email, phone, or
+  // social found anywhere), regardless of confidence tier. Skip never
+  // writes to the schools table or school_change_log the way Apply does,
+  // so clearing all of these in one click carries none of the risk Apply
+  // All High-Confidence has to guard against -- there's nothing here TO
+  // get wrong. Same field-by-field diff the table below uses per row.
+  const noChangesPendingItems = pendingReview.filter((i) => {
+    const s = i.school;
+    const sug = i.suggestion;
+    if (!s || !sug) return false;
+    return !SUGGESTION_FIELDS.some((f) => {
+      const suggested = (sug[f] || "").trim();
+      return suggested && suggested !== (s[f] || "");
+    });
+  });
+  const noChangesPendingCount = noChangesPendingItems.length;
 
   // Matches a row against the current search box -- school name or city,
   // case-insensitive, same loose substring match a reviewer would expect
@@ -200,7 +220,7 @@ export default function BatchCoachInfoPage() {
   useEffect(() => {
     function onKeyDown(e) {
       if (selectedRun?.status !== "collected") return;
-      if (bulkApplying || applyingId) return;
+      if (bulkApplying || bulkSkipping || applyingId) return;
       const tag = document.activeElement?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
@@ -225,7 +245,7 @@ export default function BatchCoachInfoPage() {
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedRun?.status, bulkApplying, applyingId, focusedItem, keyboardTargets.length]);
+  }, [selectedRun?.status, bulkApplying, bulkSkipping, applyingId, focusedItem, keyboardTargets.length]);
 
   // Narrowing the confidence filter or typing a search query changes which
   // rows count as keyboard-nav targets -- reset focus to the top of the new
@@ -549,6 +569,36 @@ export default function BatchCoachInfoPage() {
     }
   }
 
+  // Clears every pending suggestion with nothing to apply -- the coach was
+  // confirmed but no new email/phone/social turned up. Skip only ever
+  // touches coach_info_batch_items itself (never the schools table or
+  // school_change_log), so unlike bulkApplyHighConfidence this is a single
+  // batched update instead of one write per item with its own concurrency
+  // limit -- there's no per-school side effect that could fail on its own.
+  async function bulkSkipNoChanges() {
+    const targets = noChangesPendingItems;
+    if (!targets.length) return;
+    setBulkSkipping(true);
+    setReviewError("");
+    try {
+      const { error } = await supabase
+        .from("coach_info_batch_items")
+        .update({ review_status: "skipped", reviewed_at: new Date().toISOString(), reviewed_by: user.id })
+        .in(
+          "id",
+          targets.map((i) => i.id)
+        );
+      if (error) throw error;
+      const skippedIds = new Set(targets.map((i) => i.id));
+      setItems((prev) => prev.map((i) => (skippedIds.has(i.id) ? { ...i, review_status: "skipped" } : i)));
+      setFocusedIndex(0);
+    } catch (err) {
+      setReviewError(err.message || "Could not skip these suggestions.");
+    } finally {
+      setBulkSkipping(false);
+    }
+  }
+
   async function skipItem(item) {
     setApplyingId(item.id);
     setReviewError("");
@@ -801,8 +851,33 @@ export default function BatchCoachInfoPage() {
                     <strong>{highConfidencePendingCount}</strong> of those are <strong>high confidence</strong> -- the AI found the name/email directly in full page text on the school's own
                     site, not just a search snippet. These are safe to clear in one click instead of reviewing one at a time.
                   </span>
-                  <button className="btn btn-gold btn-sm" onClick={bulkApplyHighConfidence} disabled={bulkApplying}>
+                  <button className="btn btn-gold btn-sm" onClick={bulkApplyHighConfidence} disabled={bulkApplying || bulkSkipping}>
                     {bulkApplying ? `Applying ${bulkProgress.done} of ${bulkProgress.total}…` : `Apply All High-Confidence (${highConfidencePendingCount})`}
+                  </button>
+                </div>
+              )}
+
+              {noChangesPendingCount > 0 && (
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                    gap: 10,
+                    marginBottom: 10,
+                    padding: "10px 12px",
+                    background: "#f5f6f8",
+                    border: "1px solid #e3e6ea",
+                    borderRadius: 8,
+                  }}
+                >
+                  <span style={{ fontSize: 12.5 }}>
+                    <strong>{noChangesPendingCount}</strong> have <strong>nothing to apply</strong> -- the coach was confirmed but no new email, phone, or social turned up anywhere.
+                    Skipping never writes to a school's record, so these are safe to clear in one click too.
+                  </span>
+                  <button className="btn btn-sm" onClick={bulkSkipNoChanges} disabled={bulkApplying || bulkSkipping}>
+                    {bulkSkipping ? "Skipping…" : `Skip All — No Changes Suggested (${noChangesPendingCount})`}
                   </button>
                 </div>
               )}
@@ -885,10 +960,10 @@ export default function BatchCoachInfoPage() {
                                 </span>
                               ) : (
                                 <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                                  <button className="btn btn-gold btn-sm" disabled={applying || bulkApplying} onClick={() => applyItem(item)}>
+                                  <button className="btn btn-gold btn-sm" disabled={applying || bulkApplying || bulkSkipping} onClick={() => applyItem(item)}>
                                     {applying ? "…" : "Apply"}
                                   </button>
-                                  <button className="btn btn-sm" disabled={applying || bulkApplying} onClick={() => skipItem(item)}>
+                                  <button className="btn btn-sm" disabled={applying || bulkApplying || bulkSkipping} onClick={() => skipItem(item)}>
                                     Skip
                                   </button>
                                   <Link href={`/schools/${s.id}`} className="btn btn-sm">
