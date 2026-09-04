@@ -207,6 +207,16 @@ export default function BatchSocialPage() {
     try {
       const states = scopeMode === "priority" ? PRIORITY_STATES : customStates.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
 
+      // Excludes every school that's EVER gone through this tool before --
+      // applied, skipped, or a suggestion the AI found no match for -- not
+      // just ones sitting in a still-open run (same fix just made to Batch
+      // Coach-Info's startRun; see that page for the full reasoning). Over-
+      // fetches 3x and filters client-side rather than a giant SQL "not in"
+      // list.
+      const { data: touchedRows, error: touchedErr } = await supabase.from("social_batch_items").select("school_id");
+      if (touchedErr) throw touchedErr;
+      const excludedIds = new Set((touchedRows || []).map((r) => r.school_id));
+
       // Needs a coach name on file to search by -- see the file header.
       // Missing either handle (not necessarily both) is enough to qualify,
       // since a school might already have a Twitter but not a Facebook, or
@@ -220,15 +230,16 @@ export default function BatchSocialPage() {
         .neq("hc_last_name", "")
         .or("hc_twitter.is.null,hc_twitter.eq.,hc_facebook.is.null,hc_facebook.eq.")
         .order("id", { ascending: true })
-        .limit(targetCount);
+        .limit(targetCount * 3);
       if (scopeMode !== "all" || states.length) {
         query = query.in("state", states);
       }
 
-      const { data: schoolsData, error: schoolsErr } = await query;
+      const { data: rawSchoolsData, error: schoolsErr } = await query;
       if (schoolsErr) throw schoolsErr;
+      const schoolsData = (rawSchoolsData || []).filter((s) => !excludedIds.has(s.id)).slice(0, targetCount);
       if (!schoolsData || schoolsData.length === 0) {
-        setCreateError("No schools matched -- everyone with a coach name on file in this scope already has both a Twitter/X and Facebook handle, or already has a batch run.");
+        setCreateError("No schools matched -- everyone with a coach name on file in this scope already has both a Twitter/X and Facebook handle, or has already been through this tool before.");
         return;
       }
 
@@ -476,6 +487,7 @@ export default function BatchSocialPage() {
         <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
           Pulls schools that already have a head coach name on file but are missing a Twitter/X and/or Facebook handle -- a useful search needs a name, so schools with no coach name yet
           can't be helped by this tool (run Batch Coach-Info Discovery first for those).
+          {" "}Any school already applied, skipped, or attempted here before is automatically left out of every future run.
         </p>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
