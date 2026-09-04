@@ -205,20 +205,31 @@ export default function BatchMaxPrepsPage() {
     try {
       const states = scopeMode === "priority" ? PRIORITY_STATES : customStates.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
 
+      // Excludes every school that's EVER gone through this tool before --
+      // applied, skipped, or a suggestion the AI found no match for -- not
+      // just ones sitting in a still-open run (same fix just made to Batch
+      // Coach-Info's startRun; see that page for the full reasoning). Over-
+      // fetches 3x and filters client-side rather than a giant SQL "not in"
+      // list.
+      const { data: touchedRows, error: touchedErr } = await supabase.from("maxpreps_batch_items").select("school_id");
+      if (touchedErr) throw touchedErr;
+      const excludedIds = new Set((touchedRows || []).map((r) => r.school_id));
+
       let query = supabase
         .from("schools")
         .select("id,name,city,state")
         .or("maxpreps_url.is.null,maxpreps_url.eq.")
         .order("id", { ascending: true })
-        .limit(targetCount);
+        .limit(targetCount * 3);
       if (scopeMode !== "all" || states.length) {
         query = query.in("state", states);
       }
 
-      const { data: schoolsData, error: schoolsErr } = await query;
+      const { data: rawSchoolsData, error: schoolsErr } = await query;
       if (schoolsErr) throw schoolsErr;
+      const schoolsData = (rawSchoolsData || []).filter((s) => !excludedIds.has(s.id)).slice(0, targetCount);
       if (!schoolsData || schoolsData.length === 0) {
-        setCreateError("No schools matched -- everyone missing a MaxPreps URL in this scope already has a batch run.");
+        setCreateError("No schools matched -- everyone missing a MaxPreps URL in this scope has already been through this tool before.");
         return;
       }
 
@@ -463,6 +474,7 @@ export default function BatchMaxPrepsPage() {
         <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
           Pulls schools with no MaxPreps URL on file yet. A school's MaxPreps team page is the fallback source the nightly Coach-Change Radar checks when there's no athletics URL on file,
           and it's often the fastest way for recruiting staff to confirm a roster is current -- closing this gap raises the accuracy ceiling here too.
+          {" "}Any school already applied, skipped, or attempted here before is automatically left out of every future run.
         </p>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
