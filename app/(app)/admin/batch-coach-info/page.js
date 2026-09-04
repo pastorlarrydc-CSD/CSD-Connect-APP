@@ -277,11 +277,27 @@ export default function BatchCoachInfoPage() {
     try {
       const states = scopeMode === "priority" ? PRIORITY_STATES : customStates.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
 
+      // Excludes every school that's EVER gone through this tool before --
+      // applied, skipped, or a suggestion that errored out -- not just ones
+      // sitting in a still-open run. Without this, clicking Apply or Skip
+      // didn't stop a school from coming right back the next time someone
+      // clicked "Start Run": nothing marked it as already looked at, so the
+      // same "no email/social found anywhere" schools kept resurfacing.
+      // Over-fetches 3x and filters client-side (same approach the weekly
+      // cron uses) rather than a giant SQL "not in" list, which Supabase
+      // struggles with once this table has thousands of rows across many
+      // runs. The single-school "Suggest Coach Info (AI)" button on a
+      // school's own profile page is unaffected -- that's still there any
+      // time someone wants to force a fresh look at one specific school.
+      const { data: touchedRows, error: touchedErr } = await supabase.from("coach_info_batch_items").select("school_id");
+      if (touchedErr) throw touchedErr;
+      const excludedIds = new Set((touchedRows || []).map((r) => r.school_id));
+
       let query = supabase
         .from("schools")
         .select("id,name,city,state")
         .order("id", { ascending: true })
-        .limit(targetCount);
+        .limit(targetCount * 3);
 
       if (candidateMode === "missing_email") {
         // Coach's name is already on file -- just the email is missing.
@@ -314,13 +330,14 @@ export default function BatchCoachInfoPage() {
         query = query.in("state", states);
       }
 
-      const { data: schoolsData, error: schoolsErr } = await query;
+      const { data: rawSchoolsData, error: schoolsErr } = await query;
       if (schoolsErr) throw schoolsErr;
+      const schoolsData = (rawSchoolsData || []).filter((s) => !excludedIds.has(s.id)).slice(0, targetCount);
       if (!schoolsData || schoolsData.length === 0) {
         setCreateError(
           candidateMode === "missing_email"
-            ? "No schools matched -- everyone with a coach name on file in this scope already has an email, or already has a batch run in progress."
-            : "No schools matched -- everyone missing coach info in this scope already has a batch run, or has no website/athletics URL on file to search from."
+            ? "No schools matched -- everyone with a coach name on file in this scope already has an email, or has already been through this tool before."
+            : "No schools matched -- everyone missing coach info in this scope has already been through this tool before, or has no website/athletics URL on file to search from."
         );
         return;
       }
@@ -575,6 +592,7 @@ export default function BatchCoachInfoPage() {
           {candidateMode === "missing_email"
             ? "Pulls schools that already have a head coach name on file but are missing an email -- searches for that specific coach by name instead of the generic \"who is the coach\" search."
             : "Pulls schools missing a head coach name that have an athletics or general website on file to search from -- schools with neither can't be helped by this tool."}
+          {" "}Any school already applied, skipped, or attempted here before is automatically left out of every future run.
         </p>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           <div style={{ display: "flex", flexDirection: "column", gap: 6, paddingBottom: 4, borderBottom: "1px solid #e3e6ea", marginBottom: 2 }}>
