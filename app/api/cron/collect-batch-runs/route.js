@@ -57,20 +57,50 @@ export const maxDuration = 60;
 // the slow part (one DB update per school), so the time budget mostly
 // protects against a run finishing that happens to have a lot of items
 // in one invocation.
+//
+// Also runs a pool-depletion check every time this cron fires (see the
+// end of the GET handler below) -- separate from the collect loop above,
+// it looks at how many eligible, never-touched schools are left for each
+// tool in the priority states and emails Larry once a tool's pool first
+// drops below one more week's worth. Built alongside the new
+// /admin/batch-status dashboard (same underlying batch_tool_pool_status()
+// Postgres function powers both) in response to Larry asking for a
+// pool-depletion alert so a tool running dry doesn't go unnoticed.
 const TIME_BUDGET_MS = 50_000;
 
 const SYSTEM_USER_ID = "d24ad753-f759-479d-8958-fae8f995faa1"; // CSD sysadmin account (Larry) -- same attribution every other cron uses for automated writes
+
+// Matches WEEKLY_TARGET_COUNT on every weekly-*-batch cron -- "fewer than
+// one more week's worth of eligible schools left" is the bar for the
+// pool-depletion alert below.
+const POOL_ALERT_THRESHOLD = 300;
+// Same FROM_EMAIL/SITE_URL fallback pattern as coach-alert-digest and
+// verifier-digest -- see the comment on FROM_EMAIL in
+// app/api/cron/coach-alert-digest/route.js for the Resend sandbox note.
+const ALERT_FROM_EMAIL = process.env.ALERT_FROM_EMAIL || "CSD CoachConnect Alerts <onboarding@resend.dev>";
+const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "https://coachconnect.vercel.app";
+// One system_settings row per tool records whether that tool's alert has
+// already fired for its CURRENT low spell -- stops the same alert from
+// re-sending every single day while a pool stays low. Cleared back to
+// false once the pool recovers above POOL_ALERT_THRESHOLD, so a later
+// dip alerts again.
+const poolAlertSettingKey = (toolKey) => `batch_pool_alert_sent__${toolKey}`;
 
 // One entry per batch discovery tool -- everything that differs between
 // them (table names, how a parsed suggestion gets normalized) lives here;
 // the loop below is otherwise identical for all four, mirroring each
 // tool's own [runId]/check-status + [runId]/collect routes exactly.
+// label/criteria/href are only used by the pool-depletion alert email
+// below (the collect loop above never touches them).
 const TOOLS = [
   {
     key: "athletics",
     runsTable: "athletics_batch_runs",
     itemsTable: "athletics_batch_items",
     buildSuggestion: (parsed) => normalizeAthleticsSuggestion(parsed),
+    label: "Athletics-URL",
+    criteria: "Missing an athletics-site URL",
+    href: "/admin/batch-athletics",
   },
   {
     key: "coach_info",
@@ -78,18 +108,27 @@ const TOOLS = [
     itemsTable: "coach_info_batch_items",
     buildSuggestion: (parsed) => normalizeSuggestion(parsed, "batch AI lookup"),
     autoApplyHighConfidence: true,
+    label: "Coach-Info",
+    criteria: "Coach name on file, missing email",
+    href: "/admin/batch-coach-info",
   },
   {
     key: "maxpreps",
     runsTable: "maxpreps_batch_runs",
     itemsTable: "maxpreps_batch_items",
     buildSuggestion: (parsed) => normalizeMaxPrepsSuggestion(parsed),
+    label: "MaxPreps",
+    criteria: "Missing a MaxPreps page URL",
+    href: "/admin/batch-maxpreps",
   },
   {
     key: "social",
     runsTable: "social_batch_runs",
     itemsTable: "social_batch_items",
     buildSuggestion: (parsed) => normalizeSocialSuggestion(parsed),
+    label: "Social Media",
+    criteria: "Coach name on file, missing Twitter/X or Facebook",
+    href: "/admin/batch-social",
   },
 ];
 
@@ -260,7 +299,132 @@ export async function GET(req) {
       }
     }
 
-    return NextResponse.json({ summary, duration_ms: Date.now() - startedAt });
+    // --- Pool-depletion check ---------------------------------------
+    // Runs every time this cron fires, independent of whatever the collect
+    // loop above did (or didn't) find -- checks batch_tool_pool_status()
+    // (a Postgres function; same one the /admin/batch-status dashboard
+    // reads) for how many never-touched, criteria-matching schools are
+    // left for each tool in the priority states, and emails Larry the
+    // first time a tool drops below POOL_ALERT_THRESHOLD. Wrapped in its
+    // own try/catch so a problem here (bad RPC, Resend hiccup, etc.) never
+    // costs the collect-loop summary above -- worst case this section
+    // fails silently into the logs and next run tries again.
+    let poolAlert = null;
+    try {
+      const { data: poolRows, error: poolErr } = await supabase.rpc("batch_tool_pool_status");
+      if (poolErr) throw poolErr;
+      const poolByKey = new Map((poolRows || []).map((r) => [r.tool_key, r]));
+
+      const { data: flagRows, error: flagErr } = await supabase
+        .from("system_settings")
+        .select("key,value")
+        .in("key", TOOLS.map((t) => poolAlertSettingKey(t.key)));
+      if (flagErr) throw flagErr;
+      const flagByKey = new Map((flagRows || []).map((r) => [r.key, r.value === true]));
+
+      const newlyLow = [];
+      const recovered = [];
+      for (const tool of TOOLS) {
+        const pool = poolByKey.get(tool.key);
+        if (!pool) continue;
+        const remaining = Number(pool.remaining_pool);
+        const settingKey = poolAlertSettingKey(tool.key);
+        const alreadyFlagged = flagByKey.get(settingKey) || false;
+        if (remaining < POOL_ALERT_THRESHOLD && !alreadyFlagged) {
+          newlyLow.push({ ...tool, remaining });
+        } else if (remaining >= POOL_ALERT_THRESHOLD && alreadyFlagged) {
+          recovered.push(settingKey);
+        }
+      }
+
+      for (const settingKey of recovered) {
+        await supabase.from("system_settings").upsert({ key: settingKey, value: false, updated_at: new Date().toISOString() }, { onConflict: "key" });
+      }
+
+      if (newlyLow.length > 0) {
+        const resendKey = process.env.RESEND_API_KEY;
+        if (!resendKey) {
+          console.warn(
+            "cron collect-batch-runs: pool-depletion alert triggered but RESEND_API_KEY is not set -- skipping email:",
+            newlyLow.map((t) => t.key).join(", ")
+          );
+          poolAlert = { triggered: newlyLow.map((t) => t.key), emailed: false, reason: "RESEND_API_KEY not set" };
+        } else {
+          const { data: recipientProfiles } = await supabase.from("profiles").select("id").in("role", ["sysadmin", "verifier"]);
+          const emails = [];
+          for (const p of recipientProfiles || []) {
+            const { data: userRes } = await supabase.auth.admin.getUserById(p.id);
+            if (userRes?.user?.email) emails.push(userRes.user.email);
+          }
+
+          if (emails.length === 0) {
+            poolAlert = { triggered: newlyLow.map((t) => t.key), emailed: false, reason: "No sysadmin/verifier email addresses found" };
+          } else {
+            const rowsHtml = newlyLow
+              .map(
+                (t) => `<tr>
+                <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;">${t.label}</td>
+                <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;text-align:right;font-weight:700;color:${
+                  t.remaining === 0 ? "#b3261e" : "#8a6100"
+                };">${t.remaining}</td>
+                <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;color:#697386;">${t.criteria}</td>
+              </tr>`
+              )
+              .join("");
+            const subject = `Batch Discovery: ${newlyLow.length} tool${newlyLow.length === 1 ? "" : "s"} running low on eligible schools`;
+            const html = `<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;max-width:640px;margin:0 auto;color:#1a1a1a;">
+              <h2 style="margin-bottom:4px;">Batch discovery pool running low</h2>
+              <p style="color:#697386;margin-top:0;">
+                ${newlyLow.length} of the four AI discovery tools ${newlyLow.length === 1 ? "has" : "have"} fewer than ${POOL_ALERT_THRESHOLD} eligible
+                schools left to work with in the priority states (TX, FL, GA, CA, OH, IN). Their weekly automated runs will keep coming back with
+                nothing new until this is addressed -- typically by adding more states or widening the search criteria.
+              </p>
+              <table style="width:100%;border-collapse:collapse;font-size:14px;">
+                <thead>
+                  <tr style="text-align:left;color:#697386;font-size:12px;text-transform:uppercase;">
+                    <th style="padding:8px 12px;border-bottom:2px solid #e5e7eb;">Tool</th>
+                    <th style="padding:8px 12px;border-bottom:2px solid #e5e7eb;text-align:right;">Remaining</th>
+                    <th style="padding:8px 12px;border-bottom:2px solid #e5e7eb;">Criteria</th>
+                  </tr>
+                </thead>
+                <tbody>${rowsHtml}</tbody>
+              </table>
+              <p style="margin-top:24px;">
+                <a href="${SITE_URL}/admin/batch-status" style="background:#1a1a2e;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;display:inline-block;">
+                  Open Batch Discovery Status
+                </a>
+              </p>
+              <p style="color:#9ca3af;font-size:12px;margin-top:32px;">CSD CoachConnect — Collegiate Sports Data. You'll only get this once per tool until its pool recovers and drops low again.</p>
+            </div>`;
+
+            const sendRes = await fetch("https://api.resend.com/emails", {
+              method: "POST",
+              headers: { "content-type": "application/json", authorization: `Bearer ${resendKey}` },
+              body: JSON.stringify({ from: ALERT_FROM_EMAIL, to: emails, subject, html }),
+            });
+
+            if (sendRes.ok) {
+              for (const t of newlyLow) {
+                await supabase
+                  .from("system_settings")
+                  .upsert({ key: poolAlertSettingKey(t.key), value: true, updated_at: new Date().toISOString() }, { onConflict: "key" });
+              }
+              poolAlert = { triggered: newlyLow.map((t) => t.key), emailed: true, to: emails };
+              console.log("cron collect-batch-runs: pool-depletion alert sent for", newlyLow.map((t) => t.key).join(", "));
+            } else {
+              const detail = await sendRes.text().catch(() => "");
+              console.error("cron collect-batch-runs: pool-depletion alert Resend error", sendRes.status, detail);
+              poolAlert = { triggered: newlyLow.map((t) => t.key), emailed: false, reason: `Resend error ${sendRes.status}` };
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.error("cron collect-batch-runs: pool-depletion check failed (non-fatal -- the collection summary above still completed)", err);
+      poolAlert = { error: err.message || String(err) };
+    }
+
+    return NextResponse.json({ summary, duration_ms: Date.now() - startedAt, pool_alert: poolAlert });
   } catch (err) {
     console.error("cron collect-batch-runs error", err);
     return NextResponse.json({ error: err.message || "Automated batch collection failed.", summary }, { status: 500 });
