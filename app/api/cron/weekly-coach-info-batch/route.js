@@ -76,11 +76,18 @@ export async function GET(req) {
       return NextResponse.json({ skipped: true, reason: "Weekly Coach-Info batch is currently suspended (system_settings.weekly_coach_info_batch_enabled = false)." });
     }
 
-    // Same "don't re-queue a school already sitting in an unresolved batch
-    // item" guard the other three weekly crons use.
-    const { data: pendingItemRows, error: pendingErr } = await supabase.from("coach_info_batch_items").select("school_id").eq("review_status", "pending");
-    if (pendingErr) throw pendingErr;
-    const excludedIds = new Set((pendingItemRows || []).map((r) => r.school_id));
+    // Excludes every school that's EVER gone through this tool -- applied,
+    // skipped, or a suggestion that errored out -- not just the ones
+    // currently sitting in an unresolved run. Before this it was possible
+    // for a school you'd already applied or skipped last week to come right
+    // back in this week's run with nothing new to say, since only "pending"
+    // items were held back. Once a school shows up here at all, it's done
+    // with this tool going forward; the single-school "Suggest Coach Info
+    // (AI)" button on that school's own profile page still works any time
+    // someone wants to force a fresh look at one.
+    const { data: touchedRows, error: touchedErr } = await supabase.from("coach_info_batch_items").select("school_id");
+    if (touchedErr) throw touchedErr;
+    const excludedIds = new Set((touchedRows || []).map((r) => r.school_id));
 
     const { data: rawCandidates, error: candErr } = await supabase
       .from("schools")
@@ -97,8 +104,8 @@ export async function GET(req) {
 
     const candidates = (rawCandidates || []).filter((s) => !excludedIds.has(s.id)).slice(0, WEEKLY_TARGET_COUNT);
     if (candidates.length === 0) {
-      console.log("cron weekly-coach-info-batch: skipped -- no eligible schools (everyone with a coach name on file in the priority states already has an email, or already has an unreviewed batch item pending)");
-      return NextResponse.json({ skipped: true, reason: "No eligible schools -- everyone with a coach name on file in the priority states already has an email, or already has an unreviewed batch item pending." });
+      console.log("cron weekly-coach-info-batch: skipped -- no eligible schools (everyone with a coach name on file in the priority states already has an email, or has already been through this tool before)");
+      return NextResponse.json({ skipped: true, reason: "No eligible schools -- everyone with a coach name on file in the priority states already has an email, or has already been through this tool before." });
     }
 
     const { data: runRow, error: runErr } = await supabase
