@@ -145,6 +145,23 @@ export default function BatchCoachInfoPage() {
   // see bulkSkipNoChanges below.
   const [bulkSkipping, setBulkSkipping] = useState(false);
   const [focusedIndex, setFocusedIndex] = useState(0);
+  // The AI's one-paragraph reasoning/notes for each suggestion is collapsed
+  // by default (Larry's own words: reading a full paragraph per row on a
+  // 100+-item run is "extremely time consuming") -- a row shows just the
+  // field-by-field old-value -> new-value summary (or "No changes
+  // suggested") plus a "Why?" toggle; clicking it reveals the AI's notes
+  // for that one row without reloading anything. Tracked as a Set of item
+  // ids rather than a boolean per item so this stays a single small piece
+  // of state instead of touching the items array itself.
+  const [expandedNotes, setExpandedNotes] = useState(() => new Set());
+  function toggleNotes(itemId) {
+    setExpandedNotes((prev) => {
+      const next = new Set(prev);
+      if (next.has(itemId)) next.delete(itemId);
+      else next.add(itemId);
+      return next;
+    });
+  }
 
   const selectedRun = runs.find((r) => r.id === selectedRunId) || null;
 
@@ -957,8 +974,19 @@ export default function BatchCoachInfoPage() {
                                 ))
                               )}
                               {sug.notes && (
-                                <div style={{ marginTop: 4, fontStyle: "italic", color: "#9aa1ab" }}>
-                                  "{sug.notes}" — {sug.source}
+                                <div style={{ marginTop: 4 }}>
+                                  <button
+                                    type="button"
+                                    onClick={() => toggleNotes(item.id)}
+                                    style={{ background: "none", border: "none", padding: 0, color: "#5b7fb5", fontSize: 11.5, cursor: "pointer", textDecoration: "underline" }}
+                                  >
+                                    {expandedNotes.has(item.id) ? "Hide reasoning" : "Why?"}
+                                  </button>
+                                  {expandedNotes.has(item.id) && (
+                                    <div style={{ marginTop: 2, fontStyle: "italic", color: "#9aa1ab" }}>
+                                      "{sug.notes}" — {sug.source}
+                                    </div>
+                                  )}
                                 </div>
                               )}
                             </td>
