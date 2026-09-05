@@ -59,7 +59,7 @@ export async function POST(req) {
 
     const { data: school, error: schoolErr } = await supabase
       .from("schools")
-      .select("id,name,city,state,athletics_url,website,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook")
+      .select("id,name,city,state,athletics_url,website,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,ad_name,ad_email")
       .eq("id", item.school_id)
       .maybeSingle();
     if (schoolErr || !school) {
