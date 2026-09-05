@@ -31,7 +31,12 @@ import { useAuth } from "@/lib/auth-context";
 // rather than staying dimmed in place.
 const ROWS_PER_TOOL_CAP = 500; // keeps the initial load fast even if a tool's pending pile is huge; a banner says so if any tool hits this cap
 
-const COACH_INFO_FIELDS = ["hc_first_name", "hc_last_name", "hc_email", "hc_office", "hc_cell", "hc_twitter", "hc_facebook"];
+// ad_name/ad_email are the Athletic Director fallback contact, captured by
+// the same AI lookup alongside the hc_* head-coach fields (see
+// lib/coachInfoLookup.js's SYSTEM_PROMPT) -- included here so they show up
+// in the changed-fields diff and get written on Apply exactly like every
+// other suggested coach-info field.
+const COACH_INFO_FIELDS = ["hc_first_name", "hc_last_name", "hc_email", "hc_office", "hc_cell", "hc_twitter", "hc_facebook", "ad_name", "ad_email"];
 const COACH_INFO_FIELD_LABELS = {
   hc_first_name: "First name",
   hc_last_name: "Last name",
@@ -40,6 +45,8 @@ const COACH_INFO_FIELD_LABELS = {
   hc_cell: "Cell",
   hc_twitter: "Twitter / X",
   hc_facebook: "Facebook",
+  ad_name: "Athletic Director",
+  ad_email: "AD email",
 };
 
 const TOOLS = [
@@ -49,7 +56,7 @@ const TOOLS = [
     itemsTable: "coach_info_batch_items",
     href: "/admin/batch-coach-info",
     select:
-      "id,school_id,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_office,hc_cell,hc_twitter,hc_facebook)",
+      "id,school_id,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_office,hc_cell,hc_twitter,hc_facebook,ad_name,ad_email)",
   },
   {
     key: "athletics",
@@ -220,7 +227,16 @@ export default function ReviewQueuePage() {
           const newVal = (sug[f] || "").trim();
           if (newVal && newVal !== (s[f] || "")) {
             update[f] = newVal;
-            changes.push({ school_id: s.id, field_name: f, old_value: s[f] || null, new_value: newVal, source: `Batch AI lookup (${sug.confidence} confidence, reviewed)`, changed_by: user.id });
+            // hc_email gets its own distinct source label when it's a
+            // pattern-derived estimate rather than an address actually
+            // found on file somewhere -- so school_change_log always shows
+            // this email was never directly confirmed, same as the
+            // individual Batch Coach-Info page's own apply logic.
+            const source =
+              f === "hc_email" && sug.hc_email_estimated
+                ? "Batch AI lookup (pattern-estimated email, reviewed)"
+                : `Batch AI lookup (${sug.confidence} confidence, reviewed)`;
+            changes.push({ school_id: s.id, field_name: f, old_value: s[f] || null, new_value: newVal, source, changed_by: user.id });
           }
         });
       } else if (row.tool === "athletics" || row.tool === "maxpreps") {
@@ -503,6 +519,9 @@ export default function ReviewQueuePage() {
                                 <div key={f}>
                                   <strong>{COACH_INFO_FIELD_LABELS[f]}:</strong> {sug[f]}
                                   {s[f] ? <span style={{ color: "#9aa1ab" }}> (was: {s[f]})</span> : null}
+                                  {f === "hc_email" && sug.hc_email_estimated ? (
+                                    <span style={{ color: "#8a6100", fontWeight: 600 }}> (pattern-estimated, not confirmed)</span>
+                                  ) : null}
                                 </div>
                               ))
                             );
