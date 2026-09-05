@@ -1,11 +1,22 @@
 import { NextResponse } from "next/server";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
-import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion } from "@/lib/coachInfoLookup";
+import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion, runWithConcurrency } from "@/lib/coachInfoLookup";
 import { normalizeAthleticsSuggestion } from "@/lib/athleticsLookup";
 import { normalizeMaxPrepsSuggestion } from "@/lib/maxPrepsLookup";
 import { normalizeSocialSuggestion } from "@/lib/socialLookup";
 
 export const maxDuration = 60;
+
+// How many result lines a single run's collect step processes at once
+// instead of one at a time -- see runWithConcurrency's own comment in
+// lib/coachInfoLookup.js. This cron only has a 60-second budget total
+// (TIME_BUDGET_MS below stops it from STARTING a new run once that's spent,
+// but a run already in progress here still has to finish item-by-item) --
+// on a run with a lot of items, the old sequential loop could all by itself
+// run past the 60s ceiling and get killed mid-run, same failure mode as the
+// manual "Collect Results" click on an oversized Athletics/MaxPreps/
+// Coach-Info run.
+const COLLECT_CONCURRENCY = 8;
 
 // Wait + Collect stages of all four overnight Batch API jobs (Athletics,
 // Coach-Info, MaxPreps, Social Media), automated. The four weekly-*-batch
@@ -233,21 +244,26 @@ export async function GET(req) {
         // route -- each line updates an EXISTING item row created back at
         // Submit time, and upsert would trip NOT NULL constraints on
         // columns (batch_run_id, school_id) this loop never sees.
+        const resultLines = resultsText.split("\n").map((l) => l.trim()).filter(Boolean);
         let succeeded = 0;
         let failed = 0;
         let autoApplied = 0;
         let autoApplyErrors = 0;
-        for (const line of resultsText.split("\n")) {
-          const trimmed = line.trim();
-          if (!trimmed) continue;
+
+        // Processed COLLECT_CONCURRENCY-at-a-time rather than one line at a
+        // time -- see COLLECT_CONCURRENCY's comment above. The counters
+        // below are plain-number increments, safe to share across
+        // concurrent workers here since JavaScript never runs two of these
+        // callbacks' synchronous stretches at the same instant.
+        await runWithConcurrency(resultLines, COLLECT_CONCURRENCY, async (trimmed) => {
           let entry;
           try {
             entry = JSON.parse(trimmed);
           } catch (_) {
-            continue;
+            return;
           }
           const match = /^item-(\d+)$/.exec(entry.custom_id || "");
-          if (!match) continue;
+          if (!match) return;
           const itemId = Number(match[1]);
 
           let patch;
@@ -288,7 +304,7 @@ export async function GET(req) {
               }
             }
           }
-        }
+        });
 
         await supabase.from(tool.runsTable).update({ status: "collected", collected_at: new Date().toISOString(), anthropic_batch_status: processingStatus }).eq("id", run.id);
         summary.push({ tool: tool.key, run_id: run.id, collected: true, succeeded, failed, auto_applied: autoApplied, auto_apply_errors: autoApplyErrors });
