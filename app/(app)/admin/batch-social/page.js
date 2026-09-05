@@ -119,6 +119,22 @@ export default function BatchSocialPage() {
   const [confidenceFilter, setConfidenceFilter] = useState("all"); // "all" | "high" | "medium" | "low"
   const [searchQuery, setSearchQuery] = useState("");
   const [focusedIndex, setFocusedIndex] = useState(0);
+  // The AI's one-paragraph reasoning for each suggestion is collapsed by
+  // default (Larry's own words: reading a full paragraph per row on a
+  // 100+-item run is "extremely time consuming") -- a row shows just the
+  // suggested handle(s) and a "Why?" toggle; clicking it reveals the
+  // reasoning for that one row without reloading anything. Tracked as a
+  // Set of item ids rather than a boolean per item so this stays a single
+  // small piece of state instead of touching the items array itself.
+  const [expandedReasoning, setExpandedReasoning] = useState(() => new Set());
+  function toggleReasoning(itemId) {
+    setExpandedReasoning((prev) => {
+      const next = new Set(prev);
+      if (next.has(itemId)) next.delete(itemId);
+      else next.add(itemId);
+      return next;
+    });
+  }
 
   const selectedRun = runs.find((r) => r.id === selectedRunId) || null;
 
@@ -810,7 +826,20 @@ export default function BatchSocialPage() {
                                 {s.hc_facebook ? <span style={{ color: "#9aa1ab" }}> (was: {s.hc_facebook})</span> : null}
                               </div>
                             )}
-                            {sug.reasoning && <div style={{ marginTop: 4, fontStyle: "italic", color: "#9aa1ab" }}>"{sug.reasoning}"</div>}
+                            {sug.reasoning && (
+                              <div style={{ marginTop: 4 }}>
+                                <button
+                                  type="button"
+                                  onClick={() => toggleReasoning(item.id)}
+                                  style={{ background: "none", border: "none", padding: 0, color: "#5b7fb5", fontSize: 11.5, cursor: "pointer", textDecoration: "underline" }}
+                                >
+                                  {expandedReasoning.has(item.id) ? "Hide reasoning" : "Why?"}
+                                </button>
+                                {expandedReasoning.has(item.id) && (
+                                  <div style={{ marginTop: 2, fontStyle: "italic", color: "#9aa1ab" }}>"{sug.reasoning}"</div>
+                                )}
+                              </div>
+                            )}
                           </td>
                           <td style={{ padding: "8px", whiteSpace: "nowrap" }}>
                             <span className="badge" style={{ fontSize: 11, color: confidenceColor(sug.confidence) }}>
