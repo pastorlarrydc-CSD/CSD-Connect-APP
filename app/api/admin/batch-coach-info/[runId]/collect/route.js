@@ -1,8 +1,14 @@
 import { NextResponse } from "next/server";
 import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
-import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion } from "@/lib/coachInfoLookup";
+import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion, runWithConcurrency } from "@/lib/coachInfoLookup";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
+
+// How many result lines this route processes at once instead of one at a
+// time -- see runWithConcurrency's own comment in lib/coachInfoLookup.js for
+// why (the same sequential design timed out Batch Athletics' Run #20 on an
+// oversized run; this route shares that exact structure).
+const COLLECT_CONCURRENCY = 8;
 
 // Collect stage of the overnight Coach-Info Batch API job. Once Anthropic
 // reports a batch's processing_status as "ended" (checked via
@@ -92,22 +98,29 @@ export async function POST(req, { params }) {
     // candidate row on the insert path of an upsert even when the row will
     // end up just being updated. A plain update() only ever touches the
     // columns listed below, so it can't trip that.
+    const resultLines = resultsText.split("\n").map((l) => l.trim()).filter(Boolean);
     let succeeded = 0;
     let failed = 0;
     let autoApplied = 0;
     let autoApplyErrors = 0;
     let saveErr = null;
-    for (const line of resultsText.split("\n")) {
-      const trimmed = line.trim();
-      if (!trimmed) continue;
+
+    // Processed COLLECT_CONCURRENCY-at-a-time rather than one line at a
+    // time -- see COLLECT_CONCURRENCY's comment above. The counters below
+    // are all simple increments on plain numbers, which is safe to share
+    // across concurrent workers here: JavaScript never runs two of these
+    // callbacks' synchronous stretches at the same instant, only their
+    // `await`s overlap, so no two increments can ever land on top of each
+    // other.
+    await runWithConcurrency(resultLines, COLLECT_CONCURRENCY, async (trimmed) => {
       let entry;
       try {
         entry = JSON.parse(trimmed);
       } catch (_) {
-        continue;
+        return;
       }
       const match = /^item-(\d+)$/.exec(entry.custom_id || "");
-      if (!match) continue;
+      if (!match) return;
       const itemId = Number(match[1]);
 
       let patch;
@@ -148,7 +161,7 @@ export async function POST(req, { params }) {
           }
         }
       }
-    }
+    });
 
     if (saveErr) {
       return NextResponse.json({ error: saveErr.message || "Downloaded results but could not save all of them." }, { status: 500 });
