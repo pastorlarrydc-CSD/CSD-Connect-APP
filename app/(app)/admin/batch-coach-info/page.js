@@ -32,7 +32,12 @@ const FETCH_CONCURRENCY = 8; // matches the weekly automated cron's own concurre
 // call) -- can safely run more of these in parallel than the page-fetching
 // step above, which is why bulk-apply uses its own higher concurrency.
 const APPLY_CONCURRENCY = 5;
-const SUGGESTION_FIELDS = ["hc_first_name", "hc_last_name", "hc_email", "hc_office", "hc_cell", "hc_twitter", "hc_facebook"];
+// ad_name/ad_email are the Athletic Director fallback contact -- a separate
+// pair of fields from the hc_* head-coach ones, captured by the same AI
+// lookup alongside them (see lib/coachInfoLookup.js's SYSTEM_PROMPT).
+// Included here so they show up in the changed-fields diff below and get
+// written on Apply exactly like every other suggested field.
+const SUGGESTION_FIELDS = ["hc_first_name", "hc_last_name", "hc_email", "hc_office", "hc_cell", "hc_twitter", "hc_facebook", "ad_name", "ad_email"];
 const FIELD_LABELS = {
   hc_first_name: "First name",
   hc_last_name: "Last name",
@@ -41,10 +46,12 @@ const FIELD_LABELS = {
   hc_cell: "Cell",
   hc_twitter: "Twitter / X",
   hc_facebook: "Facebook",
+  ad_name: "Athletic Director",
+  ad_email: "AD email",
 };
 
 const ITEM_SELECT =
-  "id,batch_run_id,school_id,fetch_status,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,athletics_url,website)";
+  "id,batch_run_id,school_id,fetch_status,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,ad_name,ad_email,athletics_url,website)";
 
 async function runWithConcurrency(items, limit, worker) {
   let next = 0;
@@ -531,7 +538,17 @@ export default function BatchCoachInfoPage() {
         const newVal = (sug[f] || "").trim();
         if (newVal && newVal !== (s[f] || "")) {
           update[f] = newVal;
-          changes.push({ school_id: s.id, field_name: f, old_value: s[f] || null, new_value: newVal, source: `Batch AI lookup (${sug.confidence} confidence, reviewed)`, changed_by: user.id });
+          // hc_email gets its own distinct source label when it's a
+          // pattern-derived estimate rather than an address actually found
+          // on file somewhere -- so school_change_log (and Data Quality's
+          // "My Recent Updates") always shows, permanently, that this
+          // particular email was never directly confirmed, even after
+          // it's long since been applied and looks like any other field.
+          const source =
+            f === "hc_email" && sug.hc_email_estimated
+              ? "Batch AI lookup (pattern-estimated email, reviewed)"
+              : `Batch AI lookup (${sug.confidence} confidence, reviewed)`;
+          changes.push({ school_id: s.id, field_name: f, old_value: s[f] || null, new_value: newVal, source, changed_by: user.id });
         }
       });
       if (Object.keys(update).length > 0) {
@@ -970,6 +987,9 @@ export default function BatchCoachInfoPage() {
                                   <div key={f}>
                                     <strong>{FIELD_LABELS[f]}:</strong> {sug[f]}
                                     {s[f] ? <span style={{ color: "#9aa1ab" }}> (was: {s[f]})</span> : null}
+                                    {f === "hc_email" && sug.hc_email_estimated ? (
+                                      <span style={{ color: "#8a6100", fontWeight: 600 }}> (pattern-estimated, not confirmed)</span>
+                                    ) : null}
                                   </div>
                                 ))
                               )}
