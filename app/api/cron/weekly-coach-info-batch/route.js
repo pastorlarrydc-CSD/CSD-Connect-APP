@@ -91,7 +91,7 @@ export async function GET(req) {
 
     const { data: rawCandidates, error: candErr } = await supabase
       .from("schools")
-      .select("id,name,city,state,athletics_url,website,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook")
+      .select("id,name,city,state,athletics_url,website,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,ad_name,ad_email")
       .not("hc_first_name", "is", null)
       .neq("hc_first_name", "")
       .not("hc_last_name", "is", null)
