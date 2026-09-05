@@ -47,7 +47,7 @@ const SUGGESTION_STATUS_LABEL = { pending: "Pending review", approved: "Approved
 const CLAIM_STATUS_LABEL = { pending: "Pending review", approved: "Approved", rejected: "Not approved" };
 const EMPTY_COACH_FORM = { hc_first_name: "", hc_last_name: "", hc_email: "", hc_cell: "", hc_office: "", note: "" };
 const EMPTY_OWNER_FORM = { hc_first_name: "", hc_last_name: "", hc_email: "", hc_cell: "", hc_office: "", website: "", note: "" };
-const EMPTY_STAFF_FORM = { hc_first_name: "", hc_last_name: "", hc_email: "", hc_cell: "", hc_office: "", hc_twitter: "", hc_facebook: "" };
+const EMPTY_STAFF_FORM = { hc_first_name: "", hc_last_name: "", hc_email: "", hc_cell: "", hc_office: "", hc_twitter: "", hc_facebook: "", ad_name: "", ad_email: "" };
 
 // Same 50-state list app/(app)/schools/new/page.js uses for its own State
 // dropdown -- duplicated here rather than imported since it's plain inline
@@ -85,6 +85,14 @@ const STAFF_EDIT_FIELDS = [
   ["hc_office", "Office"],
   ["hc_twitter", "Twitter / X"],
   ["hc_facebook", "Facebook"],
+  // Athletic Director -- a separate fallback contact from the head coach
+  // above, captured by the same "Suggest Coach Info (AI)" lookup (see
+  // lib/coachInfoLookup.js's SYSTEM_PROMPT) whenever an AD is identified,
+  // whether or not a football head coach was also found. Kept in this same
+  // Quick Fix form rather than a separate one so it saves/logs through the
+  // exact same reviewed-by-a-human path as every other field here.
+  ["ad_name", "Athletic Director"],
+  ["ad_email", "AD email"],
 ];
 
 function confidenceColor(score) {
@@ -805,6 +813,8 @@ export default function SchoolProfilePage() {
       hc_office: school.hc_office || "",
       hc_twitter: school.hc_twitter || "",
       hc_facebook: school.hc_facebook || "",
+      ad_name: school.ad_name || "",
+      ad_email: school.ad_email || "",
     });
     setAiSuggestError("");
     setAiSuggestInfo(null);
@@ -858,8 +868,10 @@ export default function SchoolProfilePage() {
         hc_cell: json.hc_cell || prev.hc_cell,
         hc_twitter: json.hc_twitter || prev.hc_twitter,
         hc_facebook: json.hc_facebook || prev.hc_facebook,
+        ad_name: json.ad_name || prev.ad_name,
+        ad_email: json.ad_email || prev.ad_email,
       }));
-      setAiSuggestInfo({ confidence: json.confidence, source: json.source, notes: json.notes });
+      setAiSuggestInfo({ confidence: json.confidence, source: json.source, notes: json.notes, hc_email_estimated: json.hc_email_estimated });
     } catch (err) {
       setAiSuggestError(err.message || "Could not look up coach info.");
     } finally {
@@ -1488,6 +1500,10 @@ export default function SchoolProfilePage() {
               <div className="v">{school.hc_twitter || <span className="empty-state">not on file</span>}</div>
               <div className="k">Facebook</div>
               <div className="v">{school.hc_facebook || <span className="empty-state">not on file</span>}</div>
+              <div className="k">Athletic Director</div>
+              <div className="v">{school.ad_name || <span className="empty-state">not on file</span>}</div>
+              <div className="k">AD email</div>
+              <div className="v">{school.ad_email || <span className="empty-state">not on file</span>}</div>
             </div>
 
             {isStaff && staffEditing && staffCoachChangeFrom && (
@@ -1518,6 +1534,11 @@ export default function SchoolProfilePage() {
                     <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
                       AI suggestion ({aiSuggestInfo.confidence} confidence, from the {aiSuggestInfo.source}) filled into the fields above — review before saving.
                       {aiSuggestInfo.notes ? ` ${aiSuggestInfo.notes}` : ""}
+                      {aiSuggestInfo.hc_email_estimated && (
+                        <div style={{ color: "#8a6100", fontWeight: 600, marginTop: 4 }}>
+                          The email above was estimated from the district's email naming pattern, not confirmed directly — double-check before saving.
+                        </div>
+                      )}
                     </div>
                   )}
                   <button type="button" className="btn btn-sm" disabled={discoveringSocial} onClick={discoverSocial} style={{ marginLeft: 6 }}>
