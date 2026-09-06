@@ -307,6 +307,10 @@ export default function BatchSocialPage() {
         .not("hc_last_name", "is", null)
         .neq("hc_last_name", "")
         .or("hc_twitter.is.null,hc_twitter.eq.,hc_facebook.is.null,hc_facebook.eq.")
+        // Skip schools a human has already confirmed have no social media --
+        // otherwise they'd resurface here forever (blank fields look the
+        // same as "not yet checked"). See lib/dataQuality.js.
+        .eq("social_not_available", false)
         .order("id", { ascending: true })
         .limit(targetCount * 3);
       if (scopeMode !== "all" || states.length) {
