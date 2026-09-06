@@ -82,6 +82,10 @@ export async function GET(req) {
       .from("schools")
       .select("id,name,city,state")
       .or("maxpreps_url.is.null,maxpreps_url.eq.")
+      // Skip schools a human has already confirmed have no MaxPreps page,
+      // and closed/discontinued schools -- see lib/dataQuality.js.
+      .eq("maxpreps_not_available", false)
+      .eq("is_closed", false)
       .in("state", PRIORITY_STATES)
       .order("id", { ascending: true })
       .limit(WEEKLY_TARGET_COUNT * 3);
