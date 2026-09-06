@@ -311,6 +311,9 @@ export default function BatchSocialPage() {
         // otherwise they'd resurface here forever (blank fields look the
         // same as "not yet checked"). See lib/dataQuality.js.
         .eq("social_not_available", false)
+        // Closed/discontinued schools will never have real social media to
+        // find -- see lib/dataQuality.js.
+        .eq("is_closed", false)
         .order("id", { ascending: true })
         .limit(targetCount * 3);
       if (scopeMode !== "all" || states.length) {
