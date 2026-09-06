@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useCallback, useRef } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import Link from "next/link";
 import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
@@ -309,6 +309,21 @@ export default function DataQualityPage() {
   const [progressPace, setProgressPace] = useState([]);
   const [progressBatchRuns, setProgressBatchRuns] = useState([]);
   const [loadingProgress, setLoadingProgress] = useState(false);
+  // Browse-by-coverage -- Larry asked for a way to actually SEE which
+  // schools are fully complete (or still missing something) rather than
+  // just the aggregate percentages above; this reuses the exact same
+  // per-school rows loadProgress() already pulls for the stat cards; no
+  // extra query. "complete" here means hasFullCoachRecord() -- the same
+  // all-4-dimensions definition Coach-Change Radar and the verifier
+  // digest use, so this view can never quietly disagree with those about
+  // what "done" means.
+  const [progressSchools, setProgressSchools] = useState([]);
+  const [coverageFilter, setCoverageFilter] = useState("all");
+  const [coverageStateFilter, setCoverageStateFilter] = useState("");
+  const [coverageSearch, setCoverageSearch] = useState("");
+  const [coverageExporting, setCoverageExporting] = useState(false);
+  const [coverageExportError, setCoverageExportError] = useState("");
+  const coverageBrowseRef = useRef(null);
   const [progressError, setProgressError] = useState("");
   const [progressLoadedAt, setProgressLoadedAt] = useState(null);
   // On-demand Coach-Change News Check -- runs the same batch the nightly
@@ -1004,7 +1019,7 @@ export default function DataQualityPage() {
         fetchAllRows((opts) =>
           supabase
             .from("schools")
-            .select("hc_first_name,hc_last_name,hc_email,athletics_url,maxpreps_url,hc_twitter,hc_facebook", opts)
+            .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,athletics_url,maxpreps_url,hc_twitter,hc_facebook", opts)
             .order("id", { ascending: true })
         ),
         fetchAllRows((opts) =>
@@ -1027,13 +1042,21 @@ export default function DataQualityPage() {
 
       const total = rows.length;
       let coachInfo = 0, athletics = 0, maxpreps = 0, social = 0, fullyComplete = 0;
+      const schoolsCoverage = [];
       rows.forEach((s) => {
-        if (!isBlank(s.hc_first_name) && !isBlank(s.hc_last_name) && !isBlank(s.hc_email)) coachInfo++;
-        if (!isBlank(s.athletics_url)) athletics++;
-        if (!isBlank(s.maxpreps_url)) maxpreps++;
-        if (!isBlank(s.hc_twitter) || !isBlank(s.hc_facebook)) social++;
-        if (hasFullCoachRecord(s)) fullyComplete++;
+        const hasCoachInfo = !isBlank(s.hc_first_name) && !isBlank(s.hc_last_name) && !isBlank(s.hc_email);
+        const hasAthletics = !isBlank(s.athletics_url);
+        const hasMaxpreps = !isBlank(s.maxpreps_url);
+        const hasSocial = !isBlank(s.hc_twitter) || !isBlank(s.hc_facebook);
+        const complete = hasFullCoachRecord(s);
+        if (hasCoachInfo) coachInfo++;
+        if (hasAthletics) athletics++;
+        if (hasMaxpreps) maxpreps++;
+        if (hasSocial) social++;
+        if (complete) fullyComplete++;
+        schoolsCoverage.push({ id: s.id, name: s.name, city: s.city, state: s.state, hasCoachInfo, hasAthletics, hasMaxpreps, hasSocial, complete });
       });
+      setProgressSchools(schoolsCoverage);
       const pct = (n) => (total ? Math.round((n / total) * 1000) / 10 : 0);
       setProgressStats({
         total,
@@ -1095,6 +1118,65 @@ export default function DataQualityPage() {
   useEffect(() => {
     if (pageTab === "progress" && !progressStats) loadProgress();
   }, [pageTab, progressStats, loadProgress]);
+
+  const coverageStates = useMemo(() => {
+    const set = new Set();
+    progressSchools.forEach((s) => {
+      if (s.state) set.add(s.state);
+    });
+    return Array.from(set).sort();
+  }, [progressSchools]);
+
+  const filteredCoverageSchools = useMemo(() => {
+    const q = coverageSearch.trim().toLowerCase();
+    return progressSchools.filter((s) => {
+      if (coverageFilter === "complete" && !s.complete) return false;
+      if (coverageFilter === "missing_coach_info" && s.hasCoachInfo) return false;
+      if (coverageFilter === "missing_athletics" && s.hasAthletics) return false;
+      if (coverageFilter === "missing_maxpreps" && s.hasMaxpreps) return false;
+      if (coverageFilter === "missing_social" && s.hasSocial) return false;
+      if (coverageStateFilter && s.state !== coverageStateFilter) return false;
+      if (q && !`${s.name || ""} ${s.city || ""}`.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }, [progressSchools, coverageFilter, coverageStateFilter, coverageSearch]);
+
+  // Sets the filter and jumps down to the browse table -- what a click on
+  // any of the coverage stat cards above does, so "58% have an athletics
+  // URL" is one click away from the actual list of who's still missing it.
+  function viewCoverage(filter) {
+    setCoverageFilter(filter);
+    requestAnimationFrame(() => coverageBrowseRef.current?.scrollIntoView({ behavior: "smooth", block: "start" }));
+  }
+
+  // Exports whatever the browse table below is currently filtered to
+  // (all rows that match, not just the DISPLAY_CAP-limited ones on
+  // screen) -- so "missing MaxPreps URL in TX" can go straight to a
+  // spreadsheet without anyone re-running a database query by hand.
+  function exportCoverageList() {
+    setCoverageExportError("");
+    setCoverageExporting(true);
+    try {
+      const csv = Papa.unparse({
+        fields: ["Name", "City", "State", "Coach Info", "Athletics URL", "MaxPreps URL", "Social Handle", "Fully Complete"],
+        data: filteredCoverageSchools.map((s) => [
+          s.name || "",
+          s.city || "",
+          s.state || "",
+          s.hasCoachInfo ? "Yes" : "No",
+          s.hasAthletics ? "Yes" : "No",
+          s.hasMaxpreps ? "Yes" : "No",
+          s.hasSocial ? "Yes" : "No",
+          s.complete ? "Yes" : "No",
+        ]),
+      });
+      downloadBlob(csv, `school_coverage_${coverageFilter}_${new Date().toISOString().slice(0, 10)}.csv`);
+    } catch (err) {
+      setCoverageExportError(err.message || "Could not export this list.");
+    } finally {
+      setCoverageExporting(false);
+    }
+  }
 
   // Fires the same batch the nightly coach-news-check cron runs (300
   // schools, oldest-checked-first), on demand -- see
@@ -2456,38 +2538,131 @@ export default function DataQualityPage() {
           {progressError && <div className="notice danger" style={{ marginBottom: 14 }}>{progressError}</div>}
 
           <div className="grid grid-4" style={{ marginBottom: 14 }}>
-            <div className="card stat-card">
+            <div className="card stat-card" style={{ cursor: "pointer" }} onClick={() => viewCoverage("all")}>
               <div className="num">{progressStats ? progressStats.total.toLocaleString() : "—"}</div>
               <div className="label">Total Schools</div>
+              {progressStats && <div className="sub">View all →</div>}
             </div>
-            <div className="card stat-card">
+            <div className="card stat-card" style={{ cursor: "pointer" }} onClick={() => viewCoverage("missing_coach_info")}>
               <div className="num">{progressStats ? `${progressStats.coachInfoPct}%` : "—"}</div>
               <div className="label">Coach Info</div>
-              {progressStats && <div className="sub">{progressStats.coachInfoGap.toLocaleString()} remaining</div>}
+              {progressStats && <div className="sub">{progressStats.coachInfoGap.toLocaleString()} remaining →</div>}
             </div>
-            <div className="card stat-card">
+            <div className="card stat-card" style={{ cursor: "pointer" }} onClick={() => viewCoverage("missing_athletics")}>
               <div className="num">{progressStats ? `${progressStats.athleticsPct}%` : "—"}</div>
               <div className="label">Athletics URL</div>
-              {progressStats && <div className="sub">{progressStats.athleticsGap.toLocaleString()} remaining</div>}
+              {progressStats && <div className="sub">{progressStats.athleticsGap.toLocaleString()} remaining →</div>}
             </div>
-            <div className="card stat-card">
+            <div className="card stat-card" style={{ cursor: "pointer" }} onClick={() => viewCoverage("missing_maxpreps")}>
               <div className="num">{progressStats ? `${progressStats.maxprepsPct}%` : "—"}</div>
               <div className="label">MaxPreps URL</div>
-              {progressStats && <div className="sub">{progressStats.maxprepsGap.toLocaleString()} remaining</div>}
+              {progressStats && <div className="sub">{progressStats.maxprepsGap.toLocaleString()} remaining →</div>}
             </div>
           </div>
 
           <div className="grid grid-2" style={{ marginBottom: 14 }}>
-            <div className="card stat-card">
+            <div className="card stat-card" style={{ cursor: "pointer" }} onClick={() => viewCoverage("missing_social")}>
               <div className="num">{progressStats ? `${progressStats.socialPct}%` : "—"}</div>
               <div className="label">Social Handle</div>
-              {progressStats && <div className="sub">{progressStats.socialGap.toLocaleString()} remaining</div>}
+              {progressStats && <div className="sub">{progressStats.socialGap.toLocaleString()} remaining →</div>}
             </div>
-            <div className="card stat-card">
+            <div className="card stat-card" style={{ cursor: "pointer" }} onClick={() => viewCoverage("complete")}>
               <div className="num">{progressStats ? `${progressStats.fullyCompletePct}%` : "—"}</div>
               <div className="label">Fully Complete</div>
-              {progressStats && <div className="sub">{progressStats.fullyComplete.toLocaleString()} schools</div>}
+              {progressStats && <div className="sub">{progressStats.fullyComplete.toLocaleString()} schools →</div>}
             </div>
+          </div>
+
+          <div className="card" style={{ marginBottom: 14 }} ref={coverageBrowseRef}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 10 }}>
+              <div>
+                <h3 style={{ marginBottom: 2 }}>Browse Schools by Coverage</h3>
+                <p style={{ fontSize: 12.5, color: "#697386", margin: 0 }}>
+                  Click a stat above, or pick a filter here, to see exactly which schools are fully complete or still missing something — and export the list.
+                </p>
+              </div>
+              <button className="btn btn-sm" onClick={exportCoverageList} disabled={coverageExporting || filteredCoverageSchools.length === 0}>
+                {coverageExporting ? "Exporting…" : `Export CSV (${filteredCoverageSchools.length.toLocaleString()})`}
+              </button>
+            </div>
+            {coverageExportError && <div className="notice danger" style={{ marginBottom: 10 }}>{coverageExportError}</div>}
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10 }}>
+              <select value={coverageFilter} onChange={(e) => setCoverageFilter(e.target.value)}>
+                <option value="all">All schools</option>
+                <option value="complete">Fully complete (all 4)</option>
+                <option value="missing_coach_info">Missing coach info</option>
+                <option value="missing_athletics">Missing athletics URL</option>
+                <option value="missing_maxpreps">Missing MaxPreps URL</option>
+                <option value="missing_social">Missing social handle</option>
+              </select>
+              <select value={coverageStateFilter} onChange={(e) => setCoverageStateFilter(e.target.value)}>
+                <option value="">All states</option>
+                {coverageStates.map((st) => (
+                  <option key={st} value={st}>
+                    {st}
+                  </option>
+                ))}
+              </select>
+              <input
+                placeholder="Search by school or city…"
+                value={coverageSearch}
+                onChange={(e) => setCoverageSearch(e.target.value)}
+                style={{ flex: 1, minWidth: 180 }}
+              />
+            </div>
+            <div className="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>School</th>
+                    <th>City</th>
+                    <th>State</th>
+                    <th>Coach Info</th>
+                    <th>Athletics</th>
+                    <th>MaxPreps</th>
+                    <th>Social</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {loadingProgress && progressSchools.length === 0 ? (
+                    <tr>
+                      <td colSpan={8} className="empty-state">
+                        Loading…
+                      </td>
+                    </tr>
+                  ) : filteredCoverageSchools.length === 0 ? (
+                    <tr>
+                      <td colSpan={8} className="empty-state">
+                        No schools match this filter.
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredCoverageSchools.slice(0, DISPLAY_CAP).map((s) => (
+                      <tr key={s.id}>
+                        <td>{s.name}</td>
+                        <td>{s.city}</td>
+                        <td>{s.state}</td>
+                        <td>{s.hasCoachInfo ? "✓" : "—"}</td>
+                        <td>{s.hasAthletics ? "✓" : "—"}</td>
+                        <td>{s.hasMaxpreps ? "✓" : "—"}</td>
+                        <td>{s.hasSocial ? "✓" : "—"}</td>
+                        <td>
+                          <Link href={`/schools/${s.id}`} className="btn btn-sm">
+                            Open
+                          </Link>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+            {filteredCoverageSchools.length > DISPLAY_CAP && (
+              <p style={{ fontSize: 12, color: "#697386", marginTop: 8 }}>
+                Showing the first {DISPLAY_CAP} of {filteredCoverageSchools.length.toLocaleString()} matching schools — narrow with search/state, or use Export CSV to get the full list.
+              </p>
+            )}
           </div>
 
           <div className="card" style={{ marginBottom: 14 }}>
