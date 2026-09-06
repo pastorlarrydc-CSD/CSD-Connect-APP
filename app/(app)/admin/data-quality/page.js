@@ -1019,7 +1019,16 @@ export default function DataQualityPage() {
         fetchAllRows((opts) =>
           supabase
             .from("schools")
-            .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,athletics_url,maxpreps_url,hc_twitter,hc_facebook,social_not_available", opts)
+            .select(
+              "id,name,city,state,hc_first_name,hc_last_name,hc_email,athletics_url,maxpreps_url,hc_twitter,hc_facebook,social_not_available,athletics_not_available,maxpreps_not_available",
+              opts
+            )
+            // Closed schools (program discontinued or school shut down) can
+            // never become "complete" -- nobody's finding a coach or social
+            // media for a program that no longer exists -- so they shouldn't
+            // drag down these stats or clutter the browse table below. Same
+            // exclusion Search already applies.
+            .eq("is_closed", false)
             .order("id", { ascending: true })
         ),
         fetchAllRows((opts) =>
@@ -1045,12 +1054,14 @@ export default function DataQualityPage() {
       const schoolsCoverage = [];
       rows.forEach((s) => {
         const hasCoachInfo = !isBlank(s.hc_first_name) && !isBlank(s.hc_last_name) && !isBlank(s.hc_email);
-        const hasAthletics = !isBlank(s.athletics_url);
-        const hasMaxpreps = !isBlank(s.maxpreps_url);
-        // hasSocial also counts a confirmed "no social media exists" flag
-        // (social_not_available, set from the school profile) -- see
-        // hasFullCoachRecord in lib/dataQuality.js for why.
+        // hasAthletics, hasMaxpreps, and hasSocial each also count a
+        // confirmed "doesn't exist" flag (set from the school profile) --
+        // see hasFullCoachRecord in lib/dataQuality.js for why.
+        const hasAthletics = !isBlank(s.athletics_url) || s.athletics_not_available === true;
+        const hasMaxpreps = !isBlank(s.maxpreps_url) || s.maxpreps_not_available === true;
         const hasSocial = !isBlank(s.hc_twitter) || !isBlank(s.hc_facebook) || s.social_not_available === true;
+        const athleticsNotAvailable = s.athletics_not_available === true;
+        const maxprepsNotAvailable = s.maxpreps_not_available === true;
         const socialNotAvailable = s.social_not_available === true;
         const complete = hasFullCoachRecord(s);
         if (hasCoachInfo) coachInfo++;
@@ -1058,7 +1069,20 @@ export default function DataQualityPage() {
         if (hasMaxpreps) maxpreps++;
         if (hasSocial) social++;
         if (complete) fullyComplete++;
-        schoolsCoverage.push({ id: s.id, name: s.name, city: s.city, state: s.state, hasCoachInfo, hasAthletics, hasMaxpreps, hasSocial, socialNotAvailable, complete });
+        schoolsCoverage.push({
+          id: s.id,
+          name: s.name,
+          city: s.city,
+          state: s.state,
+          hasCoachInfo,
+          hasAthletics,
+          hasMaxpreps,
+          hasSocial,
+          athleticsNotAvailable,
+          maxprepsNotAvailable,
+          socialNotAvailable,
+          complete,
+        });
       });
       setProgressSchools(schoolsCoverage);
       const pct = (n) => (total ? Math.round((n / total) * 1000) / 10 : 0);
@@ -1168,8 +1192,8 @@ export default function DataQualityPage() {
           s.city || "",
           s.state || "",
           s.hasCoachInfo ? "Yes" : "No",
-          s.hasAthletics ? "Yes" : "No",
-          s.hasMaxpreps ? "Yes" : "No",
+          s.hasAthletics ? (s.athleticsNotAvailable ? "N/A (confirmed none)" : "Yes") : "No",
+          s.hasMaxpreps ? (s.maxprepsNotAvailable ? "N/A (confirmed none)" : "Yes") : "No",
           s.hasSocial ? (s.socialNotAvailable ? "N/A (confirmed none)" : "Yes") : "No",
           s.complete ? "Yes" : "No",
         ]),
@@ -2648,8 +2672,8 @@ export default function DataQualityPage() {
                         <td>{s.city}</td>
                         <td>{s.state}</td>
                         <td>{s.hasCoachInfo ? "✓" : "—"}</td>
-                        <td>{s.hasAthletics ? "✓" : "—"}</td>
-                        <td>{s.hasMaxpreps ? "✓" : "—"}</td>
+                        <td>{s.hasAthletics ? (s.athleticsNotAvailable ? "N/A" : "✓") : "—"}</td>
+                        <td>{s.hasMaxpreps ? (s.maxprepsNotAvailable ? "N/A" : "✓") : "—"}</td>
                         <td>{s.hasSocial ? (s.socialNotAvailable ? "N/A" : "✓") : "—"}</td>
                         <td>
                           <Link href={`/schools/${s.id}`} className="btn btn-sm">
