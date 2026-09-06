@@ -1019,7 +1019,7 @@ export default function DataQualityPage() {
         fetchAllRows((opts) =>
           supabase
             .from("schools")
-            .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,athletics_url,maxpreps_url,hc_twitter,hc_facebook", opts)
+            .select("id,name,city,state,hc_first_name,hc_last_name,hc_email,athletics_url,maxpreps_url,hc_twitter,hc_facebook,social_not_available", opts)
             .order("id", { ascending: true })
         ),
         fetchAllRows((opts) =>
@@ -1047,14 +1047,18 @@ export default function DataQualityPage() {
         const hasCoachInfo = !isBlank(s.hc_first_name) && !isBlank(s.hc_last_name) && !isBlank(s.hc_email);
         const hasAthletics = !isBlank(s.athletics_url);
         const hasMaxpreps = !isBlank(s.maxpreps_url);
-        const hasSocial = !isBlank(s.hc_twitter) || !isBlank(s.hc_facebook);
+        // hasSocial also counts a confirmed "no social media exists" flag
+        // (social_not_available, set from the school profile) -- see
+        // hasFullCoachRecord in lib/dataQuality.js for why.
+        const hasSocial = !isBlank(s.hc_twitter) || !isBlank(s.hc_facebook) || s.social_not_available === true;
+        const socialNotAvailable = s.social_not_available === true;
         const complete = hasFullCoachRecord(s);
         if (hasCoachInfo) coachInfo++;
         if (hasAthletics) athletics++;
         if (hasMaxpreps) maxpreps++;
         if (hasSocial) social++;
         if (complete) fullyComplete++;
-        schoolsCoverage.push({ id: s.id, name: s.name, city: s.city, state: s.state, hasCoachInfo, hasAthletics, hasMaxpreps, hasSocial, complete });
+        schoolsCoverage.push({ id: s.id, name: s.name, city: s.city, state: s.state, hasCoachInfo, hasAthletics, hasMaxpreps, hasSocial, socialNotAvailable, complete });
       });
       setProgressSchools(schoolsCoverage);
       const pct = (n) => (total ? Math.round((n / total) * 1000) / 10 : 0);
@@ -1166,7 +1170,7 @@ export default function DataQualityPage() {
           s.hasCoachInfo ? "Yes" : "No",
           s.hasAthletics ? "Yes" : "No",
           s.hasMaxpreps ? "Yes" : "No",
-          s.hasSocial ? "Yes" : "No",
+          s.hasSocial ? (s.socialNotAvailable ? "N/A (confirmed none)" : "Yes") : "No",
           s.complete ? "Yes" : "No",
         ]),
       });
@@ -2646,7 +2650,7 @@ export default function DataQualityPage() {
                         <td>{s.hasCoachInfo ? "✓" : "—"}</td>
                         <td>{s.hasAthletics ? "✓" : "—"}</td>
                         <td>{s.hasMaxpreps ? "✓" : "—"}</td>
-                        <td>{s.hasSocial ? "✓" : "—"}</td>
+                        <td>{s.hasSocial ? (s.socialNotAvailable ? "N/A" : "✓") : "—"}</td>
                         <td>
                           <Link href={`/schools/${s.id}`} className="btn btn-sm">
                             Open
