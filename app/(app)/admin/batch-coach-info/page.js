@@ -354,6 +354,9 @@ export default function BatchCoachInfoPage() {
       let query = supabase
         .from("schools")
         .select("id,name,city,state")
+        // Closed/discontinued schools will never have a real coach to
+        // find -- see lib/dataQuality.js.
+        .eq("is_closed", false)
         .order("id", { ascending: true })
         .limit(targetCount * 3);
 
