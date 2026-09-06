@@ -97,6 +97,9 @@ export async function GET(req) {
       .not("hc_last_name", "is", null)
       .neq("hc_last_name", "")
       .or("hc_email.is.null,hc_email.eq.")
+      // Closed/discontinued schools will never have a real coach to find
+      // -- see lib/dataQuality.js.
+      .eq("is_closed", false)
       .in("state", PRIORITY_STATES)
       .order("id", { ascending: true })
       .limit(WEEKLY_TARGET_COUNT * 3);
