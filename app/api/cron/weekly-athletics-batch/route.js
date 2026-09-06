@@ -82,6 +82,11 @@ export async function GET(req) {
       .from("schools")
       .select("id,name,city,state")
       .or("athletics_url.is.null,athletics_url.eq.")
+      // Skip schools a human has already confirmed have no separate
+      // athletics website, and closed/discontinued schools -- see
+      // lib/dataQuality.js.
+      .eq("athletics_not_available", false)
+      .eq("is_closed", false)
       .in("state", PRIORITY_STATES)
       .order("id", { ascending: true })
       .limit(WEEKLY_TARGET_COUNT * 3);
