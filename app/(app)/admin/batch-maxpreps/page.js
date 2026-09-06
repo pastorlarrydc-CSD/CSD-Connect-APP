@@ -297,6 +297,11 @@ export default function BatchMaxPrepsPage() {
         .from("schools")
         .select("id,name,city,state")
         .or("maxpreps_url.is.null,maxpreps_url.eq.")
+        // Skip schools a human has already confirmed have no MaxPreps page,
+        // and closed/discontinued schools -- neither will ever have a real
+        // MaxPreps page to find. See lib/dataQuality.js.
+        .eq("maxpreps_not_available", false)
+        .eq("is_closed", false)
         .order("id", { ascending: true })
         .limit(targetCount * 3);
       if (scopeMode !== "all" || states.length) {
