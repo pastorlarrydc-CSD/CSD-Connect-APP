@@ -68,7 +68,11 @@ export default function BulkMaxPrepsPage() {
       const { count, error } = await supabase
         .from("schools")
         .select("id", { count: "exact", head: true })
-        .or("maxpreps_url.is.null,maxpreps_url.eq.");
+        .or("maxpreps_url.is.null,maxpreps_url.eq.")
+        // Skip schools a human has already confirmed have no MaxPreps
+        // page, and closed/discontinued schools -- see lib/dataQuality.js.
+        .eq("maxpreps_not_available", false)
+        .eq("is_closed", false);
       if (error) throw error;
       setMissingCount(count ?? null);
     } catch (_) {
@@ -95,6 +99,8 @@ export default function BulkMaxPrepsPage() {
         .select("id,name,city,state,maxpreps_url")
         .gt("id", cursorId)
         .or("maxpreps_url.is.null,maxpreps_url.eq.")
+        .eq("maxpreps_not_available", false)
+        .eq("is_closed", false)
         .order("id", { ascending: true })
         .limit(batchSize);
       if (error) throw error;
