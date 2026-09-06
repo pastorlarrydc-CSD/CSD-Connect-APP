@@ -81,9 +81,10 @@ export default function BulkSocialPage() {
         .not("hc_last_name", "is", null)
         .neq("hc_last_name", "")
         .or("hc_twitter.is.null,hc_twitter.eq.,hc_facebook.is.null,hc_facebook.eq.")
-        // Skip schools a human has already confirmed have no social media --
-        // see lib/dataQuality.js.
-        .eq("social_not_available", false);
+        // Skip schools a human has already confirmed have no social media,
+        // and closed/discontinued schools -- see lib/dataQuality.js.
+        .eq("social_not_available", false)
+        .eq("is_closed", false);
       if (error) throw error;
       setMissingCount(count ?? null);
     } catch (_) {
@@ -113,6 +114,7 @@ export default function BulkSocialPage() {
         .neq("hc_last_name", "")
         .or("hc_twitter.is.null,hc_twitter.eq.,hc_facebook.is.null,hc_facebook.eq.")
         .eq("social_not_available", false)
+        .eq("is_closed", false)
         .order("id", { ascending: true })
         .limit(batchSize);
       if (error) throw error;
