@@ -213,6 +213,9 @@ export default function SchoolProfilePage() {
   const [maxprepsDraft, setMaxprepsDraft] = useState("");
   const [maxprepsSaving, setMaxprepsSaving] = useState(false);
   const [maxprepsError, setMaxprepsError] = useState("");
+  // Lets a human confirm "this program has no MaxPreps page" as distinct
+  // from "nobody's checked" -- see lib/dataQuality.js's hasFullCoachRecord.
+  const [maxprepsNotAvailable, setMaxprepsNotAvailable] = useState(false);
   // "Find MaxPreps page" -- same Google-search-backed lookup the Data
   // Quality Quick Fix panel offers (see app/api/schools/[id]/discover-
   // maxpreps), just reachable from the school's own profile so a MaxPreps
@@ -231,6 +234,10 @@ export default function SchoolProfilePage() {
   const [athleticsDraft, setAthleticsDraft] = useState("");
   const [athleticsSaving, setAthleticsSaving] = useState(false);
   const [athleticsError, setAthleticsError] = useState("");
+  // Lets a human confirm "this program has no separate athletics website"
+  // as distinct from "nobody's checked" -- see lib/dataQuality.js's
+  // hasFullCoachRecord.
+  const [athleticsNotAvailable, setAthleticsNotAvailable] = useState(false);
   // "Find athletics page" -- same Serper-backed lookup as "Find MaxPreps
   // page" above, just not restricted to a single domain (see
   // app/api/schools/[id]/discover-athletics). Separate state from the
@@ -631,6 +638,7 @@ export default function SchoolProfilePage() {
   function startEditMaxpreps() {
     setMaxprepsDraft(school.maxpreps_url || "");
     setMaxprepsError("");
+    setMaxprepsNotAvailable(!!school.maxpreps_not_available);
     setDiscoverError("");
     setSuggestions([]);
     setEditingMaxpreps(true);
@@ -674,9 +682,11 @@ export default function SchoolProfilePage() {
     try {
       const newVal = maxprepsDraft.trim() || null;
       const oldVal = school.maxpreps_url || null;
+      const newNotAvailable = !!maxprepsNotAvailable;
+      const oldNotAvailable = !!school.maxpreps_not_available;
       const { error } = await supabase
         .from("schools")
-        .update({ maxpreps_url: newVal, updated_at: new Date().toISOString() })
+        .update({ maxpreps_url: newVal, maxpreps_not_available: newNotAvailable, updated_at: new Date().toISOString() })
         .eq("id", id);
       if (error) throw error;
       if (newVal !== oldVal && user?.id) {
@@ -685,6 +695,16 @@ export default function SchoolProfilePage() {
           field_name: "maxpreps_url",
           old_value: oldVal,
           new_value: newVal,
+          source: "Edited directly by verification staff",
+          changed_by: user.id,
+        });
+      }
+      if (newNotAvailable !== oldNotAvailable && user?.id) {
+        await supabase.from("school_change_log").insert({
+          school_id: id,
+          field_name: "maxpreps_not_available",
+          old_value: String(oldNotAvailable),
+          new_value: String(newNotAvailable),
           source: "Edited directly by verification staff",
           changed_by: user.id,
         });
@@ -701,6 +721,7 @@ export default function SchoolProfilePage() {
   function startEditAthletics() {
     setAthleticsDraft(school.athletics_url || "");
     setAthleticsError("");
+    setAthleticsNotAvailable(!!school.athletics_not_available);
     setDiscoverAthleticsError("");
     setAthleticsSuggestions([]);
     setEditingAthletics(true);
@@ -744,9 +765,11 @@ export default function SchoolProfilePage() {
     try {
       const newVal = athleticsDraft.trim() || null;
       const oldVal = school.athletics_url || null;
+      const newNotAvailable = !!athleticsNotAvailable;
+      const oldNotAvailable = !!school.athletics_not_available;
       const { error } = await supabase
         .from("schools")
-        .update({ athletics_url: newVal, updated_at: new Date().toISOString() })
+        .update({ athletics_url: newVal, athletics_not_available: newNotAvailable, updated_at: new Date().toISOString() })
         .eq("id", id);
       if (error) throw error;
       if (newVal !== oldVal && user?.id) {
@@ -755,6 +778,16 @@ export default function SchoolProfilePage() {
           field_name: "athletics_url",
           old_value: oldVal,
           new_value: newVal,
+          source: "Edited directly by verification staff",
+          changed_by: user.id,
+        });
+      }
+      if (newNotAvailable !== oldNotAvailable && user?.id) {
+        await supabase.from("school_change_log").insert({
+          school_id: id,
+          field_name: "athletics_not_available",
+          old_value: String(oldNotAvailable),
+          new_value: String(newNotAvailable),
           source: "Edited directly by verification staff",
           changed_by: user.id,
         });
@@ -1294,6 +1327,8 @@ export default function SchoolProfilePage() {
                     <a href={withProtocol(school.maxpreps_url)} target="_blank" rel="noopener noreferrer">
                       {school.maxpreps_url}
                     </a>
+                  ) : school.maxpreps_not_available ? (
+                    <span style={{ color: "#1d7a4c" }}>✓ Confirmed — no MaxPreps page</span>
                   ) : (
                     "—"
                   ))}
@@ -1305,6 +1340,8 @@ export default function SchoolProfilePage() {
                     <a href={withProtocol(school.athletics_url)} target="_blank" rel="noopener noreferrer">
                       {school.athletics_url}
                     </a>
+                  ) : school.athletics_not_available ? (
+                    <span style={{ color: "#1d7a4c" }}>✓ Confirmed — no athletics website</span>
                   ) : (
                     "—"
                   ))}
@@ -1418,6 +1455,16 @@ export default function SchoolProfilePage() {
                 <p style={{ fontSize: 11.5, color: "#9aa5b1", marginTop: -4, marginBottom: 8 }}>
                   Used as a fallback by Coach-Change Radar when the school&apos;s own website doesn&apos;t confirm the head coach&apos;s name.
                 </p>
+                <div className="form-field" style={{ marginBottom: 8 }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, fontWeight: 400 }}>
+                    <input
+                      type="checkbox"
+                      checked={maxprepsNotAvailable}
+                      onChange={(e) => setMaxprepsNotAvailable(e.target.checked)}
+                    />
+                    No MaxPreps page for this program (confirmed, not just unchecked)
+                  </label>
+                </div>
                 <div style={{ marginBottom: 8 }}>
                   <button type="button" className="btn btn-sm" disabled={discovering} onClick={discoverMaxPreps}>
                     {discovering ? "Searching…" : "Find MaxPreps page"}
@@ -1460,6 +1507,16 @@ export default function SchoolProfilePage() {
                 <p style={{ fontSize: 11.5, color: "#9aa5b1", marginTop: -4, marginBottom: 8 }}>
                   Checked FIRST by Coach-Change Radar, ahead of the school website below -- athletics sites are much more likely to actually list the head coach by name.
                 </p>
+                <div className="form-field" style={{ marginBottom: 8 }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, fontWeight: 400 }}>
+                    <input
+                      type="checkbox"
+                      checked={athleticsNotAvailable}
+                      onChange={(e) => setAthleticsNotAvailable(e.target.checked)}
+                    />
+                    No separate athletics website for this program (confirmed, not just unchecked)
+                  </label>
+                </div>
                 <div style={{ marginBottom: 8 }}>
                   <button type="button" className="btn btn-sm" disabled={discoveringAthletics} onClick={discoverAthletics}>
                     {discoveringAthletics ? "Searching…" : "Find athletics page"}
