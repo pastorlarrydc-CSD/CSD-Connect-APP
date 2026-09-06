@@ -251,6 +251,12 @@ export default function SchoolProfilePage() {
   const [staffEditing, setStaffEditing] = useState(false);
   const [staffCoachChangeFrom, setStaffCoachChangeFrom] = useState(null);
   const [staffEditValues, setStaffEditValues] = useState(EMPTY_STAFF_FORM);
+  // Lets a human confirm "no social media exists for this program" as
+  // distinct from "nobody's checked" -- see lib/dataQuality.js's
+  // hasFullCoachRecord for why that distinction matters. Not part of
+  // STAFF_EDIT_FIELDS/staffEditValues since it's a checkbox, not a text
+  // field, and the save loop below trims every STAFF_EDIT_FIELDS value.
+  const [staffSocialNotAvailable, setStaffSocialNotAvailable] = useState(false);
   const [staffSaving, setStaffSaving] = useState(false);
   const [staffSaveError, setStaffSaveError] = useState("");
   // "Suggest Coach Info (AI)" and "Find Social Media" -- same two
@@ -816,6 +822,7 @@ export default function SchoolProfilePage() {
       ad_name: school.ad_name || "",
       ad_email: school.ad_email || "",
     });
+    setStaffSocialNotAvailable(!!school.social_not_available);
     setAiSuggestError("");
     setAiSuggestInfo(null);
     setDiscoverSocialError("");
@@ -826,11 +833,14 @@ export default function SchoolProfilePage() {
   // Same editor, opened to record a head coach change specifically: fields
   // start blank instead of pre-filled, and the save gets tagged "Head
   // coach change (manual)" in school_change_log so it shows up correctly
-  // in the Coach Change History report.
+  // in the Coach Change History report. The "no social available" flag is
+  // about the outgoing coach, so it resets too -- the new coach's social
+  // presence hasn't been checked yet.
   function startStaffCoachChange() {
     setStaffCoachChangeFrom(school);
     setStaffSaveError("");
     setStaffEditValues(EMPTY_STAFF_FORM);
+    setStaffSocialNotAvailable(false);
     setStaffEditing(true);
   }
 
@@ -936,6 +946,19 @@ export default function SchoolProfilePage() {
           });
         }
       });
+      const newSocialNotAvailable = !!staffSocialNotAvailable;
+      const oldSocialNotAvailable = !!school.social_not_available;
+      if (newSocialNotAvailable !== oldSocialNotAvailable) {
+        update.social_not_available = newSocialNotAvailable;
+        changes.push({
+          school_id: id,
+          field_name: "social_not_available",
+          old_value: String(oldSocialNotAvailable),
+          new_value: String(newSocialNotAvailable),
+          source: isCoachChange ? "Head coach change (manual)" : "School profile (quick fix)",
+          changed_by: user.id,
+        });
+      }
       // confidence_score isn't set here -- the schools table recomputes it
       // itself on every write via trg_set_school_confidence_score.
       const { error } = await supabase.from("schools").update(update).eq("id", id);
@@ -1500,6 +1523,12 @@ export default function SchoolProfilePage() {
               <div className="v">{school.hc_twitter || <span className="empty-state">not on file</span>}</div>
               <div className="k">Facebook</div>
               <div className="v">{school.hc_facebook || <span className="empty-state">not on file</span>}</div>
+              {school.social_not_available && (
+                <>
+                  <div className="k">Social Media</div>
+                  <div className="v" style={{ color: "#1d7a4c" }}>✓ Confirmed — no social media for this program</div>
+                </>
+              )}
               <div className="k">Athletic Director</div>
               <div className="v">{school.ad_name || <span className="empty-state">not on file</span>}</div>
               <div className="k">AD email</div>
@@ -1524,6 +1553,16 @@ export default function SchoolProfilePage() {
                       <input value={staffEditValues[field]} onChange={(e) => setStaffEditValues((v) => ({ ...v, [field]: e.target.value }))} />
                     </div>
                   ))}
+                </div>
+                <div className="form-field" style={{ marginBottom: 8 }}>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6, fontWeight: 400 }}>
+                    <input
+                      type="checkbox"
+                      checked={staffSocialNotAvailable}
+                      onChange={(e) => setStaffSocialNotAvailable(e.target.checked)}
+                    />
+                    No social media available for this program (confirmed, not just unchecked)
+                  </label>
                 </div>
                 <div style={{ marginBottom: 8 }}>
                   <button type="button" className="btn btn-sm" disabled={aiSuggesting} onClick={suggestCoachInfo}>
