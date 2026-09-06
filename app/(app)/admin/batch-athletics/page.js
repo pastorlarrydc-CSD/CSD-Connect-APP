@@ -298,6 +298,12 @@ export default function BatchAthleticsPage() {
         .from("schools")
         .select("id,name,city,state")
         .or("athletics_url.is.null,athletics_url.eq.")
+        // Skip schools a human has already confirmed have no separate
+        // athletics website, and closed/discontinued schools -- neither
+        // will ever have a real athletics site to find. See
+        // lib/dataQuality.js.
+        .eq("athletics_not_available", false)
+        .eq("is_closed", false)
         .order("id", { ascending: true })
         .limit(targetCount * 3);
       if (scopeMode !== "all" || states.length) {
