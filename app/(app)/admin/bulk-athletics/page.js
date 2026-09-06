@@ -72,7 +72,12 @@ export default function BulkAthleticsPage() {
       const { count, error } = await supabase
         .from("schools")
         .select("id", { count: "exact", head: true })
-        .or("athletics_url.is.null,athletics_url.eq.");
+        .or("athletics_url.is.null,athletics_url.eq.")
+        // Skip schools a human has already confirmed have no separate
+        // athletics website, and closed/discontinued schools -- see
+        // lib/dataQuality.js.
+        .eq("athletics_not_available", false)
+        .eq("is_closed", false);
       if (error) throw error;
       setMissingCount(count ?? null);
     } catch (_) {
@@ -99,6 +104,8 @@ export default function BulkAthleticsPage() {
         .select("id,name,city,state,athletics_url")
         .gt("id", cursorId)
         .or("athletics_url.is.null,athletics_url.eq.")
+        .eq("athletics_not_available", false)
+        .eq("is_closed", false)
         .order("id", { ascending: true })
         .limit(batchSize);
       if (error) throw error;
