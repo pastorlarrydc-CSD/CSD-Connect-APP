@@ -121,6 +121,22 @@ const RECHECK_RESULT_CLASS = {
   fetch_error: "notice danger",
 };
 
+// "Mark Reviewed" -- lets staff tell Coach-Change Radar's nightly sweep
+// (api/cron/recheck-schools, via the school_recheck_priority view) to skip
+// this school for a while after a human has personally confirmed the coach
+// info is current. Must match the interval in that view's SQL exactly, or
+// the button's "excluded until <date>" text will drift from what the
+// database actually does. Not permanent -- see the
+// add_coach_radar_reviewed_at_to_schools migration for why it auto-expires
+// instead of excluding a school forever.
+const COACH_RADAR_REVIEW_EXCLUSION_MONTHS = 6;
+
+function reviewExcludedUntil(reviewedAtIso) {
+  const d = new Date(reviewedAtIso);
+  d.setMonth(d.getMonth() + COACH_RADAR_REVIEW_EXCLUSION_MONTHS);
+  return d;
+}
+
 export default function SchoolProfilePage() {
   const { id } = useParams();
   const router = useRouter();
@@ -286,6 +302,13 @@ export default function SchoolProfilePage() {
   // own once `load()` re-reads the row.
   const [markingVerified, setMarkingVerified] = useState(false);
   const [markVerifiedError, setMarkVerifiedError] = useState("");
+
+  // "Mark Reviewed" / undo -- separate loading/error state per action, same
+  // pattern as markingClosed/reopening below for is_closed.
+  const [markingReviewed, setMarkingReviewed] = useState(false);
+  const [markReviewedError, setMarkReviewedError] = useState("");
+  const [undoingReviewed, setUndoingReviewed] = useState(false);
+  const [undoReviewedError, setUndoReviewedError] = useState("");
 
   const load = useCallback(async () => {
     const { data: schoolData } = await supabase.from("schools").select("*").eq("id", id).maybeSingle();
@@ -1029,6 +1052,61 @@ export default function SchoolProfilePage() {
     }
   }
 
+  // Tells Coach-Change Radar's nightly sweep to leave this school alone for
+  // the next COACH_RADAR_REVIEW_EXCLUSION_MONTHS (school_recheck_priority
+  // excludes it while coach_radar_reviewed_at is set and recent) -- for
+  // when a human has personally confirmed the coach info is current and
+  // there's no point spending a nightly check-run reconfirming it.
+  // Separate from Mark Verified above: this doesn't touch
+  // verification_status at all, it only affects whether the nightly sweep
+  // touches this record.
+  async function markReviewed() {
+    setMarkingReviewed(true);
+    setMarkReviewedError("");
+    try {
+      const now = new Date().toISOString();
+      const { error } = await supabase.from("schools").update({ coach_radar_reviewed_at: now }).eq("id", id);
+      if (error) throw error;
+      await supabase.from("school_change_log").insert({
+        school_id: id,
+        field_name: "coach_radar_reviewed_at",
+        old_value: school.coach_radar_reviewed_at || "null",
+        new_value: now,
+        source: `Marked reviewed -- excluded from nightly Coach-Change Radar recheck for ${COACH_RADAR_REVIEW_EXCLUSION_MONTHS} months (manual)`,
+        changed_by: user.id,
+      });
+      load();
+    } catch (err) {
+      setMarkReviewedError(err.message || "Could not mark this school reviewed.");
+    } finally {
+      setMarkingReviewed(false);
+    }
+  }
+
+  // Reverses markReviewed() -- puts the school back in tonight's nightly
+  // sweep instead of waiting out the rest of the exclusion window.
+  async function undoMarkReviewed() {
+    setUndoingReviewed(true);
+    setUndoReviewedError("");
+    try {
+      const { error } = await supabase.from("schools").update({ coach_radar_reviewed_at: null }).eq("id", id);
+      if (error) throw error;
+      await supabase.from("school_change_log").insert({
+        school_id: id,
+        field_name: "coach_radar_reviewed_at",
+        old_value: school.coach_radar_reviewed_at || "null",
+        new_value: "null",
+        source: "Un-marked reviewed -- resumed nightly Coach-Change Radar eligibility (manual)",
+        changed_by: user.id,
+      });
+      load();
+    } catch (err) {
+      setUndoReviewedError(err.message || "Could not undo this.");
+    } finally {
+      setUndoingReviewed(false);
+    }
+  }
+
   // Soft-close instead of deleting the row -- see the add_school_closed_status
   // migration for why. Requires a reason (optional, but kept on file for
   // context if the closure is ever questioned or reopened). Same
@@ -1168,6 +1246,33 @@ export default function SchoolProfilePage() {
                 </div>
               )}
             </div>
+
+            {isStaff && (
+              <div style={{ marginTop: 10, borderTop: "1px solid #eef0f3", paddingTop: 10 }}>
+                {school.coach_radar_reviewed_at && reviewExcludedUntil(school.coach_radar_reviewed_at) > new Date() ? (
+                  <>
+                    <div className="notice" style={{ marginBottom: 8 }}>
+                      ✓ Marked reviewed on {new Date(school.coach_radar_reviewed_at).toLocaleDateString()} — the nightly Coach-Change Radar sweep will skip this school until{" "}
+                      {reviewExcludedUntil(school.coach_radar_reviewed_at).toLocaleDateString()}, when it automatically resumes.
+                    </div>
+                    {undoReviewedError && <div className="notice danger" style={{ marginBottom: 8 }}>{undoReviewedError}</div>}
+                    <button className="btn btn-sm" disabled={undoingReviewed} onClick={undoMarkReviewed}>
+                      {undoingReviewed ? "Undoing…" : "Undo — resume nightly recheck now"}
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <button className="btn btn-sm" disabled={markingReviewed} onClick={markReviewed}>
+                      {markingReviewed ? "Marking…" : "Mark Reviewed"}
+                    </button>
+                    <p style={{ fontSize: 11.5, color: "#9aa5b1", marginTop: 6 }}>
+                      I personally checked this school&apos;s coach info — skip it in the nightly Coach-Change Radar sweep for the next {COACH_RADAR_REVIEW_EXCLUSION_MONTHS} months (it automatically resumes after that, in case the coach changes later).
+                    </p>
+                    {markReviewedError && <div className="notice danger" style={{ marginTop: 8 }}>{markReviewedError}</div>}
+                  </>
+                )}
+              </div>
+            )}
 
             {!showFlagForm && !(myFlag && myFlag.status === "pending") && (
               <button className="btn btn-sm" style={{ marginTop: 10 }} onClick={() => setShowFlagForm(true)}>
