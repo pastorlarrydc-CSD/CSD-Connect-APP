@@ -986,7 +986,8 @@ export default function SchoolProfilePage() {
     try {
       const isCoachChange = !!staffCoachChangeFrom;
       const changes = [];
-      const update = { verification_status: "verified", last_verified_at: new Date().toISOString() };
+      const nowIso = new Date().toISOString();
+      const update = { verification_status: "verified", last_verified_at: nowIso, coach_radar_reviewed_at: nowIso };
       STAFF_EDIT_FIELDS.forEach(([field]) => {
         const newVal = staffEditValues[field].trim() || null;
         const oldVal = school[field] || null;
@@ -1039,7 +1040,8 @@ export default function SchoolProfilePage() {
     setMarkingVerified(true);
     setMarkVerifiedError("");
     try {
-      const update = { verification_status: "verified", last_verified_at: new Date().toISOString() };
+      const nowIso = new Date().toISOString();
+      const update = { verification_status: "verified", last_verified_at: nowIso, coach_radar_reviewed_at: nowIso };
       const { error } = await supabase.from("schools").update(update).eq("id", id);
       if (error) throw error;
       await logManualVerification({ ...school, ...update });
