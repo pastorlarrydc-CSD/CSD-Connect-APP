@@ -859,7 +859,10 @@ export default function DataQualityPage() {
   // app -- means Today's List (and its count) reflects reality again
   // without Larry having to do anything extra. Doesn't touch scanning/
   // result (the Scan Results queue) or any other section; those aren't
-  // what backs Today's List.
+  // what backs Today's List. (Browse Schools by Coverage has its own,
+  // identical visibilitychange refresh further down, right after
+  // loadProgress is defined -- kept separate rather than added here since
+  // loadProgress isn't declared yet at this point in the component.)
   useEffect(() => {
     function onVisibilityChange() {
       if (document.visibilityState === "visible") {
@@ -1147,6 +1150,25 @@ export default function DataQualityPage() {
   useEffect(() => {
     if (pageTab === "progress" && !progressStats) loadProgress();
   }, [pageTab, progressStats, loadProgress]);
+
+  // Same idea as the Today's List visibilitychange refresh above, for
+  // Browse Schools by Coverage: its Open link now opens the school profile
+  // in a NEW tab (matching Open Profile elsewhere on this page) instead of
+  // navigating this tab away, so the coverage table -- rows, checkmarks,
+  // and whatever filter/state/search Larry had picked ("Missing coach
+  // info" or otherwise) -- is still sitting right there when he switches
+  // back, just stale until re-pulled. Re-running loadProgress on every
+  // return to this tab means a school he just fixed shows its new ✓ marks
+  // without a manual re-load, and without losing the filter he had set.
+  useEffect(() => {
+    function onCoverageVisibilityChange() {
+      if (document.visibilityState === "visible" && pageTab === "progress") {
+        loadProgress();
+      }
+    }
+    document.addEventListener("visibilitychange", onCoverageVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", onCoverageVisibilityChange);
+  }, [pageTab, loadProgress]);
 
   const coverageStates = useMemo(() => {
     const set = new Set();
@@ -2677,7 +2699,7 @@ export default function DataQualityPage() {
                         <td>{s.hasMaxpreps ? (s.maxprepsNotAvailable ? "N/A" : "✓") : "—"}</td>
                         <td>{s.hasSocial ? (s.socialNotAvailable ? "N/A" : "✓") : "—"}</td>
                         <td>
-                          <Link href={`/schools/${s.id}`} className="btn btn-sm">
+                          <Link href={`/schools/${s.id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">
                             Open
                           </Link>
                         </td>
