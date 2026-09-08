@@ -268,7 +268,11 @@ export default function SearchPage() {
                   </td>
                   <td>{s.classification || "—"}</td>
                   <td>
-                    {s.hc_first_name} {s.hc_last_name}
+                    {s.hc_first_name || s.hc_last_name ? (
+                      `${s.hc_first_name || ""} ${s.hc_last_name || ""}`.trim()
+                    ) : (
+                      <span className="empty-state">Head Coach Unassigned</span>
+                    )}
                   </td>
                   <td>{s.hc_email || <span className="empty-state">none on file</span>}</td>
                   <td>{fmtPhone(s.hc_cell) || fmtPhone(s.hc_office) || <span className="empty-state">none on file</span>}</td>
