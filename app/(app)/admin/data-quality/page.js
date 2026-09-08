@@ -79,6 +79,29 @@ const SCROLL_CACHE_KEY = "csd_dq_scroll_cache_v1";
 // caches above.
 const PAGE_TAB_CACHE_KEY = "csd_dq_page_tab_cache_v1";
 
+// Reads PAGE_TAB_CACHE_KEY synchronously, for use as a useState lazy
+// initializer (see pageTab/coverageFilter/coverageStateFilter/coverageSearch
+// below). The first version of this fix restored the cache from a
+// useEffect after mount instead -- but that effect ran alongside another
+// effect (the one that WRITES this same cache on every pageTab/filter
+// change) that also fires on mount, and on mount it fires using the
+// component's just-initialized "radar"/"all" defaults, not yet knowing
+// about the restore that was about to happen in the same effects pass.
+// That write landed after the restore's setPageTab/setCoverageFilter calls
+// were scheduled, so it clobbered the cache back to the defaults right
+// after every remount -- meaning the FIRST navigation away and back after
+// any real remount always found nothing to restore. Reading synchronously
+// during initial render (before any effect runs, and before that write
+// effect ever fires) removes the race entirely.
+function readPageTabCache() {
+  try {
+    const raw = sessionStorage.getItem(PAGE_TAB_CACHE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
 function fmtRelativeTime(date) {
   if (!date) return "";
   const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
@@ -315,7 +338,7 @@ export default function DataQualityPage() {
   // the ones that never had web-presence data at all). pageTab switches
   // between the two views on this same page; everything below only loads
   // once the Progress tab is actually opened.
-  const [pageTab, setPageTab] = useState("radar"); // "radar" | "progress"
+  const [pageTab, setPageTab] = useState(() => readPageTabCache()?.pageTab || "radar"); // "radar" | "progress"
   const [progressStats, setProgressStats] = useState(null);
   const [progressToday, setProgressToday] = useState(null);
   const [progressPace, setProgressPace] = useState([]);
@@ -330,35 +353,24 @@ export default function DataQualityPage() {
   // digest use, so this view can never quietly disagree with those about
   // what "done" means.
   const [progressSchools, setProgressSchools] = useState([]);
-  const [coverageFilter, setCoverageFilter] = useState("all");
-  const [coverageStateFilter, setCoverageStateFilter] = useState("");
-  const [coverageSearch, setCoverageSearch] = useState("");
+  const [coverageFilter, setCoverageFilter] = useState(() => readPageTabCache()?.coverageFilter || "all");
+  const [coverageStateFilter, setCoverageStateFilter] = useState(() => readPageTabCache()?.coverageStateFilter || "");
+  const [coverageSearch, setCoverageSearch] = useState(() => {
+    const cached = readPageTabCache();
+    return typeof cached?.coverageSearch === "string" ? cached.coverageSearch : "";
+  });
   const [coverageExporting, setCoverageExporting] = useState(false);
   const [coverageExportError, setCoverageExportError] = useState("");
   const coverageBrowseRef = useRef(null);
   const [progressError, setProgressError] = useState("");
   const [progressLoadedAt, setProgressLoadedAt] = useState(null);
 
-  // Restore the last-open tab and Browse-by-Coverage filter (if any) on
-  // mount -- see PAGE_TAB_CACHE_KEY above. This only restores WHICH tab
-  // and WHICH filter Larry had open; the actual data still loads fresh
-  // normally (the pageTab === "progress" && !progressStats effect below
-  // fires once pageTab is restored to "progress", same as a first visit).
-  useEffect(() => {
-    try {
-      const raw = sessionStorage.getItem(PAGE_TAB_CACHE_KEY);
-      if (!raw) return;
-      const cached = JSON.parse(raw);
-      if (cached?.pageTab) setPageTab(cached.pageTab);
-      if (cached?.coverageFilter) setCoverageFilter(cached.coverageFilter);
-      if (cached?.coverageStateFilter) setCoverageStateFilter(cached.coverageStateFilter);
-      if (typeof cached?.coverageSearch === "string") setCoverageSearch(cached.coverageSearch);
-    } catch {
-      // Corrupt or unavailable cache -- falls back to the normal defaults.
-    }
-  }, []);
-
-  // Keep that cache in sync with whichever tab/filter is live right now.
+  // pageTab/coverageFilter/coverageStateFilter/coverageSearch above already
+  // restore themselves from PAGE_TAB_CACHE_KEY at initial render (their
+  // useState lazy initializers read readPageTabCache() directly) -- no
+  // separate restore-on-mount effect needed, and importantly none of the
+  // effect-ordering race that approach had. Keep that cache in sync with
+  // whichever tab/filter is live right now.
   useEffect(() => {
     try {
       sessionStorage.setItem(
