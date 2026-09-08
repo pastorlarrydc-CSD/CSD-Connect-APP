@@ -101,6 +101,24 @@ function confidenceColor(score) {
   return "#b3312c";
 }
 
+// Reframes the verification badge from a binary "click me to make this
+// trustworthy" into a tier driven by the confidence score that's already
+// computed automatically (schools.confidence_score, via the
+// compute_school_confidence_score DB trigger). "Verified by Staff" still
+// means a human personally confirmed it -- that's the top tier and still
+// requires Mark Verified. But a school that's never been clicked can
+// still read as High Confidence if the data itself checks out, so staff
+// attention is only pulled toward the ones that actually need it.
+function verificationTierLabel(school) {
+  const score = school.confidence_score ?? 0;
+  if (school.verification_status === "verified") {
+    return { text: "✓ Verified by Staff", bg: "#e6f4ea", fg: "#1a7f37" };
+  }
+  if (score >= 70) return { text: "High Confidence", bg: "#e6f4ea", fg: "#1a7f37" };
+  if (score >= 40) return { text: "Needs Review", bg: "#fff4dc", fg: "#8a6100" };
+  return { text: "Needs Attention", bg: "#fbe9e7", fg: "#b3312c" };
+}
+
 const RECHECK_RESULT_LABEL = {
   confirmed: "Head coach confirmed on the school's website.",
   confirmed_weak: "Last name found on the school's website, but the first name wasn't found nearby — lower confidence, worth a quick glance.",
@@ -1207,7 +1225,9 @@ export default function SchoolProfilePage() {
           <div className="card" style={{ marginBottom: 14 }}>
             <h3>Verification</h3>
             <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 6, flexWrap: "wrap" }}>
-              <span className="badge badge-unverified">{school.verification_status === "verified" ? "Verified" : "Not yet verified"}</span>
+              <span className="badge" style={{ background: verificationTierLabel(school).bg, color: verificationTierLabel(school).fg }}>
+                {verificationTierLabel(school).text}
+              </span>
               <span style={{ fontSize: 12, fontWeight: 600, color: confidenceColor(school.confidence_score ?? 0) }}>
                 Confidence score: {school.confidence_score ?? 0}%
               </span>
@@ -1675,7 +1695,7 @@ export default function SchoolProfilePage() {
             <div className="kv" style={{ marginTop: 10 }}>
               <div className="k">Name</div>
               <div className="v">
-                {school.hc_first_name || school.hc_last_name ? `${school.hc_first_name} ${school.hc_last_name}` : <span className="empty-state">not on file</span>}
+                {school.hc_first_name || school.hc_last_name ? `${school.hc_first_name} ${school.hc_last_name}` : <span className="empty-state">Head Coach Unassigned</span>}
               </div>
               <div className="k">Email</div>
               <div className="v">{school.hc_email || <span className="empty-state">not on file</span>}</div>
