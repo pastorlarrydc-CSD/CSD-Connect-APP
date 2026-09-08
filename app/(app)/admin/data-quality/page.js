@@ -1,4 +1,4 @@
-"use client";
+ "use client";
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import Link from "next/link";
 import Papa from "papaparse";
@@ -1151,23 +1151,27 @@ export default function DataQualityPage() {
     if (pageTab === "progress" && !progressStats) loadProgress();
   }, [pageTab, progressStats, loadProgress]);
 
-  // Same idea as the Today's List visibilitychange refresh above, for
-  // Browse Schools by Coverage: its Open link now opens the school profile
-  // in a NEW tab (matching Open Profile elsewhere on this page) instead of
-  // navigating this tab away, so the coverage table -- rows, checkmarks,
-  // and whatever filter/state/search Larry had picked ("Missing coach
-  // info" or otherwise) -- is still sitting right there when he switches
-  // back, just stale until re-pulled. Re-running loadProgress on every
-  // return to this tab means a school he just fixed shows its new ✓ marks
-  // without a manual re-load, and without losing the filter he had set.
+  // Browse Schools by Coverage's Open link goes to the school profile in
+  // THIS SAME TAB (so Larry's browser Back button is the way back, same as
+  // it's always been), which rules out the visibilitychange trick used for
+  // Today's List above -- that only fires on a tab switch, not a same-tab
+  // Back press. Next.js's client-side router keeps this page's component
+  // (and its state -- coverageFilter, coverageSearch, etc.) alive across a
+  // Back navigation rather than remounting it, which is why the filter was
+  // never lost, but it also means the mount effect above never reran and
+  // progressSchools stayed frozen at whatever it was before he left. The
+  // browser's native "popstate" event fires specifically on a Back/Forward
+  // press (App Router's own navigation is built on the History API, so it
+  // fires for in-app Back too, not just full page loads) -- listening for
+  // it here and re-running loadProgress means the school he just fixed
+  // shows its new ✓ marks the moment he lands back on this page, with the
+  // filter he had picked still in place.
   useEffect(() => {
-    function onCoverageVisibilityChange() {
-      if (document.visibilityState === "visible" && pageTab === "progress") {
-        loadProgress();
-      }
+    function onPopState() {
+      if (pageTab === "progress") loadProgress();
     }
-    document.addEventListener("visibilitychange", onCoverageVisibilityChange);
-    return () => document.removeEventListener("visibilitychange", onCoverageVisibilityChange);
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
   }, [pageTab, loadProgress]);
 
   const coverageStates = useMemo(() => {
@@ -2699,7 +2703,7 @@ export default function DataQualityPage() {
                         <td>{s.hasMaxpreps ? (s.maxprepsNotAvailable ? "N/A" : "✓") : "—"}</td>
                         <td>{s.hasSocial ? (s.socialNotAvailable ? "N/A" : "✓") : "—"}</td>
                         <td>
-                          <Link href={`/schools/${s.id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">
+                          <Link href={`/schools/${s.id}`} className="btn btn-sm">
                             Open
                           </Link>
                         </td>
