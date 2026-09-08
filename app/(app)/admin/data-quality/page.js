@@ -1,4 +1,4 @@
- "use client";
+"use client";
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import Link from "next/link";
 import Papa from "papaparse";
@@ -67,6 +67,17 @@ const FIND_SCHOOL_CACHE_KEY = "csd_dq_find_school_cache_v1";
 // had to be scrolled back down to from scratch. Session-scoped like the
 // caches above: just "where was I," cleared when the tab closes.
 const SCROLL_CACHE_KEY = "csd_dq_scroll_cache_v1";
+
+// Same idea again, but for which of the two tabs (Coach-Change Radar vs
+// Progress) was open, plus the Browse Schools by Coverage filter/state/
+// search underneath it. The page always remounts on a navigation away and
+// back (see SCROLL_CACHE_KEY above), which resets pageTab to its "radar"
+// default -- so leaving the Progress tab to open a school (Browse Schools
+// by Coverage's Open link, same tab) and pressing Back was dropping Larry
+// back on the Radar tab instead of where he'd been working, with
+// "Missing coach info" reset back to "All". Session-scoped like the
+// caches above.
+const PAGE_TAB_CACHE_KEY = "csd_dq_page_tab_cache_v1";
 
 function fmtRelativeTime(date) {
   if (!date) return "";
@@ -327,6 +338,38 @@ export default function DataQualityPage() {
   const coverageBrowseRef = useRef(null);
   const [progressError, setProgressError] = useState("");
   const [progressLoadedAt, setProgressLoadedAt] = useState(null);
+
+  // Restore the last-open tab and Browse-by-Coverage filter (if any) on
+  // mount -- see PAGE_TAB_CACHE_KEY above. This only restores WHICH tab
+  // and WHICH filter Larry had open; the actual data still loads fresh
+  // normally (the pageTab === "progress" && !progressStats effect below
+  // fires once pageTab is restored to "progress", same as a first visit).
+  useEffect(() => {
+    try {
+      const raw = sessionStorage.getItem(PAGE_TAB_CACHE_KEY);
+      if (!raw) return;
+      const cached = JSON.parse(raw);
+      if (cached?.pageTab) setPageTab(cached.pageTab);
+      if (cached?.coverageFilter) setCoverageFilter(cached.coverageFilter);
+      if (cached?.coverageStateFilter) setCoverageStateFilter(cached.coverageStateFilter);
+      if (typeof cached?.coverageSearch === "string") setCoverageSearch(cached.coverageSearch);
+    } catch {
+      // Corrupt or unavailable cache -- falls back to the normal defaults.
+    }
+  }, []);
+
+  // Keep that cache in sync with whichever tab/filter is live right now.
+  useEffect(() => {
+    try {
+      sessionStorage.setItem(
+        PAGE_TAB_CACHE_KEY,
+        JSON.stringify({ pageTab, coverageFilter, coverageStateFilter, coverageSearch })
+      );
+    } catch {
+      // Storage full/unavailable -- the tab/filter just won't survive a
+      // navigation away and back. Not worth surfacing an error for.
+    }
+  }, [pageTab, coverageFilter, coverageStateFilter, coverageSearch]);
   // On-demand Coach-Change News Check -- runs the same batch the nightly
   // cron does, right now, instead of waiting for the fixed schedule.
   const [runningNewsCheck, setRunningNewsCheck] = useState(false);
