@@ -87,6 +87,7 @@ const FILTERS = [
   { key: "bad_cell", label: "Malformed cell" },
   { key: "bad_office", label: "Malformed office phone" },
   { key: "no_name", label: "No coach name" },
+  { key: "no_email", label: "No email on file" },
 ];
 
 const SORTS = [
