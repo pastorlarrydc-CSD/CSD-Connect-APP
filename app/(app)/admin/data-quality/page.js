@@ -328,10 +328,18 @@ export default function DataQualityPage() {
   // rows included.
   const [radarHideReviewed, setRadarHideReviewed] = useState(true);
   const [radarReviewingId, setRadarReviewingId] = useState(null);
+  // Per-row feedback for a Mark Reviewed click that didn't actually save --
+  // e.g. a database permission gap that silently matches zero rows instead
+  // of returning an error (this exact failure mode is what caused reviewed
+  // marks to revert on refresh before school_recheck_log had an UPDATE
+  // policy). Keyed by recheck_log row id, same shape as radarUrlErrors
+  // below.
+  const [radarReviewErrors, setRadarReviewErrors] = useState({});
   // Bulk "Mark all Confirmed handled" -- Confirmed rows mean the sweep
   // found the right coach already on the site, nothing to fix, so
   // clicking through them one at a time is pure busywork.
   const [radarBulkMarking, setRadarBulkMarking] = useState(false);
+  const [radarBulkMarkError, setRadarBulkMarkError] = useState("");
   // Inline "fix this URL" editor on Could Not Load rows -- keyed by
   // recheck_log row id. radarUrlDrafts holds the in-progress text (only
   // written to once the field's been touched; falls back to the row's
@@ -1557,10 +1565,25 @@ export default function DataQualityPage() {
   // just local state that resets the moment you navigate away.
   async function toggleRadarReviewed(row) {
     setRadarReviewingId(row.id);
+    setRadarReviewErrors((prev) => ({ ...prev, [row.id]: "" }));
     const nowReviewed = !row.reviewed_at;
     const patch = nowReviewed ? { reviewed_at: new Date().toISOString(), reviewed_by: user.id } : { reviewed_at: null, reviewed_by: null };
-    const { error } = await supabase.from("school_recheck_log").update(patch).eq("id", row.id);
-    if (!error) {
+    // .select("id") after the update is what makes a silent failure
+    // detectable: a database permission rule can reject this write while
+    // matching zero rows, and Postgres/PostgREST both treat "matched zero
+    // rows" as success (error stays null) -- there's no error to catch.
+    // Asking for the row back confirms a row was actually written; no row
+    // back means nothing was saved, so that's handled as its own failure
+    // case below rather than folded into the `error` branch.
+    const { data, error } = await supabase.from("school_recheck_log").update(patch).eq("id", row.id).select("id");
+    if (error) {
+      setRadarReviewErrors((prev) => ({ ...prev, [row.id]: error.message || "Could not save -- please try again." }));
+    } else if (!data || data.length === 0) {
+      setRadarReviewErrors((prev) => ({
+        ...prev,
+        [row.id]: "This didn't save -- your account may not have permission to update this record. Nothing changed.",
+      }));
+    } else {
       setRadarRows((prev) => prev.map((r) => (r.id === row.id ? { ...r, ...patch } : r)));
     }
     setRadarReviewingId(null);
@@ -1576,11 +1599,31 @@ export default function DataQualityPage() {
     const ids = radarRows.filter((r) => r.result === "confirmed" && !isRadarRowDone(r)).map((r) => r.id);
     if (!ids.length) return;
     setRadarBulkMarking(true);
+    setRadarBulkMarkError("");
     const now = new Date().toISOString();
-    const { error } = await supabase.from("school_recheck_log").update({ reviewed_at: now, reviewed_by: user.id }).in("id", ids);
-    if (!error) {
-      const idSet = new Set(ids);
-      setRadarRows((prev) => prev.map((r) => (idSet.has(r.id) ? { ...r, reviewed_at: now, reviewed_by: user.id } : r)));
+    // Same .select("id") guard as toggleRadarReviewed: only the ids
+    // Supabase actually confirms writing get applied to local state, so a
+    // permission failure can't make rows look handled that were never
+    // really saved.
+    const { data, error } = await supabase
+      .from("school_recheck_log")
+      .update({ reviewed_at: now, reviewed_by: user.id })
+      .in("id", ids)
+      .select("id");
+    if (error) {
+      setRadarBulkMarkError(error.message || "Could not save -- please try again.");
+    } else {
+      const savedIds = new Set((data || []).map((r) => r.id));
+      if (savedIds.size > 0) {
+        setRadarRows((prev) => prev.map((r) => (savedIds.has(r.id) ? { ...r, reviewed_at: now, reviewed_by: user.id } : r)));
+      }
+      if (savedIds.size < ids.length) {
+        setRadarBulkMarkError(
+          savedIds.size === 0
+            ? "None of these saved -- your account may not have permission to update these records. Nothing changed."
+            : `Only ${savedIds.size} of ${ids.length} saved -- the rest didn't go through. Nothing else changed.`
+        );
+      }
     }
     setRadarBulkMarking(false);
   }
@@ -3267,6 +3310,7 @@ export default function DataQualityPage() {
                 </label>
               </div>
             </div>
+            {radarBulkMarkError && <div className="notice danger" style={{ marginTop: 8 }}>{radarBulkMarkError}</div>}
 
             <div style={{ marginTop: 10 }}>
               {radarFilteredRows.length === 0 ? (
@@ -3362,6 +3406,9 @@ export default function DataQualityPage() {
                                 {radarReviewingId === row.id ? "…" : isReviewed ? "✓ Reviewed" : isAutoComplete ? "Mark Reviewed too" : "Mark Reviewed"}
                               </button>
                             </div>
+                            {radarReviewErrors[row.id] && (
+                              <div style={{ fontSize: 11.5, color: "#b3261e", maxWidth: 220, textAlign: "right" }}>{radarReviewErrors[row.id]}</div>
+                            )}
                             <span style={{ fontSize: 11, color: "#9aa2b1", whiteSpace: "nowrap" }}>
                               {row.checked_at ? new Date(row.checked_at).toLocaleString() : ""}
                             </span>
