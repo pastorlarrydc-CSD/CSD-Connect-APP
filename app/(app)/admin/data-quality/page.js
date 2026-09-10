@@ -316,7 +316,17 @@ export default function DataQualityPage() {
   // from "haven't looked at it yet"). Stored on school_recheck_log itself
   // (reviewed_at/reviewed_by) so it survives a refresh, a new tab, or
   // coming back tomorrow -- not just local component state.
-  const [radarHideReviewed, setRadarHideReviewed] = useState(false);
+  // Defaults to true -- Larry's ask was specifically "once I mark it
+  // confirmed/reviewed, I don't want to keep seeing it," and a checkbox
+  // that resets to unchecked on every page load doesn't deliver that: a
+  // row you just handled stays sitting in the list (dimmed, with a
+  // checkmark, but still there) until you remember to flip this on again.
+  // Defaulting it on means marking a row Reviewed -- or it auto-completing
+  // because every field is now filled in -- immediately drops it out of
+  // view, matching what "mark confirmed" is supposed to mean here. Still a
+  // real checkbox: uncheck it any time to audit the full list, handled
+  // rows included.
+  const [radarHideReviewed, setRadarHideReviewed] = useState(true);
   const [radarReviewingId, setRadarReviewingId] = useState(null);
   // Bulk "Mark all Confirmed handled" -- Confirmed rows mean the sweep
   // found the right coach already on the site, nothing to fix, so
