@@ -554,11 +554,36 @@ export default function BatchCoachInfoPage() {
           changes.push({ school_id: s.id, field_name: f, old_value: s[f] || null, new_value: newVal, source, changed_by: user.id });
         }
       });
+      // A manual Apply click is a human looking at the AI's suggestion and
+      // deciding it's right -- worth the same verification_status a Quick
+      // Fix save on the school's own profile page gets, so this record
+      // doesn't sit there looking "not verified" forever just because the
+      // review happened here instead of on that page. Deliberately NOT
+      // applied when the suggestion's email is only a pattern-estimated
+      // guess (firstname.lastname@domain, never actually found stated
+      // anywhere) -- a human clicking Apply on that is still endorsing a
+      // guess, not confirming a fact, so the record stays unverified until
+      // someone checks that email a different way. Also never touched by
+      // autoApplyHighConfidenceSuggestion (lib/coachInfoLookup.js) -- that
+      // path writes unattended overnight with nobody reviewing it at all,
+      // so it must never claim a human verified anything.
+      if (!sug.hc_email_estimated) {
+        update.verification_status = "verified";
+        update.last_verified_at = new Date().toISOString();
+      }
       if (Object.keys(update).length > 0) {
         const { error: updateErr } = await supabase.from("schools").update(update).eq("id", s.id);
         if (updateErr) throw updateErr;
-        const { error: logErr } = await supabase.from("school_change_log").insert(changes);
-        if (logErr) throw logErr;
+        // changes can be empty here (e.g. the suggestion matched what was
+        // already on file field-for-field, so verification_status/
+        // last_verified_at above are the only thing actually changing) --
+        // skip the log insert rather than calling .insert([]), which
+        // school_change_log doesn't need to see anyway since neither of
+        // those two columns is itself a logged field.
+        if (changes.length > 0) {
+          const { error: logErr } = await supabase.from("school_change_log").insert(changes);
+          if (logErr) throw logErr;
+        }
       }
       const { error: itemErr } = await supabase
         .from("coach_info_batch_items")
