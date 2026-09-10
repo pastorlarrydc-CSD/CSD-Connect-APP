@@ -29,18 +29,32 @@ const MAX_TOKENS = 400; // matches app/api/admin/batch-coach-info/[runId]/submit
 // Targets "missing_email" candidates (a coach name already on file, no
 // email) rather than "no_name" -- checked against live data on
 // 2026-09-02: the "no coach name at all" gap this tool originally
-// targeted is essentially closed in every priority state (0-2 schools
-// each), while missing email is the real remaining gap (~121 schools
-// across TX/FL/GA/CA/OH/IN). Same query condition the manual tool's own
-// "missing_email" mode uses (app/(app)/admin/batch-coach-info/page.js) --
-// both name fields present, email blank -- and, matching that mode,
-// doesn't require an athletics/website URL: the name-targeted search
-// buildSearchQuery() builds once a coach name is already known is usually
-// enough on its own, and requiring a URL here would needlessly shrink an
-// already-small candidate pool. Same CRON_SECRET auth and
-// system_settings kill-switch pattern (key: weekly_coach_info_batch_enabled)
-// as every other cron route in this app.
-const PRIORITY_STATES = ["TX", "FL", "GA", "CA", "OH", "IN"];
+// targeted is essentially closed everywhere, priority states and beyond,
+// while missing email is the real remaining gap. Same query condition the
+// manual tool's own "missing_email" mode uses
+// (app/(app)/admin/batch-coach-info/page.js) -- both name fields present,
+// email blank -- and, matching that mode, doesn't require an
+// athletics/website URL: the name-targeted search buildSearchQuery()
+// builds once a coach name is already known is usually enough on its
+// own, and requiring a URL here would needlessly shrink an already-small
+// candidate pool.
+//
+// Runs against every state, not scoped to the priority recruiting ones
+// (TX/FL/GA/CA/OH/IN) the way the other three weekly-*-batch crons still
+// are. Checked against live data on 2026-09-10: inside those six states
+// this gap is already closed (4,141 of 4,147 schools have a full name
+// and email on file, only 6 short), so keeping this cron fenced to them
+// would leave it with essentially nothing left to do most weeks. The
+// remaining ~741 missing-email schools are the exact same shape of gap,
+// just spread across every other state -- opening this cron up lets it
+// keep draining that backlog a few hundred schools a week on its own,
+// instead of someone having to remember to run the manual "All states"
+// mode by hand. state_filter is left null on the inserted run row for
+// the same reason the manual tool's own "All states" mode does -- see
+// app/(app)/admin/batch-coach-info/page.js.
+//
+// Same CRON_SECRET auth and system_settings kill-switch pattern (key:
+// weekly_coach_info_batch_enabled) as every other cron route in this app.
 const WEEKLY_TARGET_COUNT = 300; // matches the manual tool's own default run size
 const FETCH_CONCURRENCY = 8; // no live user waiting on this one -- matches the other three weekly-*-batch crons' own concurrency
 const TIME_BUDGET_MS = 45_000; // leaves headroom under maxDuration=60 for the Anthropic Batch submit call after the fetch loop
@@ -100,20 +114,19 @@ export async function GET(req) {
       // Closed/discontinued schools will never have a real coach to find
       // -- see lib/dataQuality.js.
       .eq("is_closed", false)
-      .in("state", PRIORITY_STATES)
       .order("id", { ascending: true })
       .limit(WEEKLY_TARGET_COUNT * 3);
     if (candErr) throw candErr;
 
     const candidates = (rawCandidates || []).filter((s) => !excludedIds.has(s.id)).slice(0, WEEKLY_TARGET_COUNT);
     if (candidates.length === 0) {
-      console.log("cron weekly-coach-info-batch: skipped -- no eligible schools (everyone with a coach name on file in the priority states already has an email, or has already been through this tool before)");
-      return NextResponse.json({ skipped: true, reason: "No eligible schools -- everyone with a coach name on file in the priority states already has an email, or has already been through this tool before." });
+      console.log("cron weekly-coach-info-batch: skipped -- no eligible schools (everyone with a coach name on file already has an email, or has already been through this tool before)");
+      return NextResponse.json({ skipped: true, reason: "No eligible schools -- everyone with a coach name on file already has an email, or has already been through this tool before." });
     }
 
     const { data: runRow, error: runErr } = await supabase
       .from("coach_info_batch_runs")
-      .insert({ status: "collecting", state_filter: PRIORITY_STATES, requested_count: candidates.length, created_by: SYSTEM_USER_ID, candidate_mode: "missing_email" })
+      .insert({ status: "collecting", state_filter: null, requested_count: candidates.length, created_by: SYSTEM_USER_ID, candidate_mode: "missing_email" })
       .select()
       .single();
     if (runErr) throw runErr;
