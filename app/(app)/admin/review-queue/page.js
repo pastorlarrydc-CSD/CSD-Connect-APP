@@ -239,6 +239,23 @@ export default function ReviewQueuePage() {
             changes.push({ school_id: s.id, field_name: f, old_value: s[f] || null, new_value: newVal, source, changed_by: user.id });
           }
         });
+        // A manual Apply click here is a human looking at the AI's
+        // suggestion and deciding it's right -- worth the same
+        // verification_status a Quick Fix save on the school's own profile
+        // page gets, matching the individual Batch Coach-Info page's own
+        // apply logic exactly (see that page's applySuggestionCore for the
+        // full reasoning). Skipped when the suggestion's email is only a
+        // pattern-estimated guess -- endorsing a guessed address isn't the
+        // same as confirming a fact -- and never touched by
+        // autoApplyHighConfidenceSuggestion's unattended overnight writes,
+        // which have no human review to credit at all. Athletics/MaxPreps/
+        // Social suggestions (below) don't touch verification_status --
+        // this is specifically about confirming a person's identity and
+        // contact info, which only the coach-info tool suggests.
+        if (!sug.hc_email_estimated) {
+          update.verification_status = "verified";
+          update.last_verified_at = new Date().toISOString();
+        }
       } else if (row.tool === "athletics" || row.tool === "maxpreps") {
         const field = row.tool === "athletics" ? "athletics_url" : "maxpreps_url";
         if (sug.best_url && sug.best_url !== (s[field] || "")) {
@@ -259,8 +276,16 @@ export default function ReviewQueuePage() {
       if (Object.keys(update).length > 0) {
         const { error: updateErr } = await supabase.from("schools").update(update).eq("id", s.id);
         if (updateErr) throw updateErr;
-        const { error: logErr } = await supabase.from("school_change_log").insert(changes);
-        if (logErr) throw logErr;
+        // changes can be empty here for a coach-info row whose suggestion
+        // matched what was already on file field-for-field, so
+        // verification_status/last_verified_at above are the only thing
+        // actually changing -- skip the log insert rather than calling
+        // .insert([]), since neither of those columns is itself a logged
+        // field.
+        if (changes.length > 0) {
+          const { error: logErr } = await supabase.from("school_change_log").insert(changes);
+          if (logErr) throw logErr;
+        }
       }
 
       const { error: itemErr } = await supabase
