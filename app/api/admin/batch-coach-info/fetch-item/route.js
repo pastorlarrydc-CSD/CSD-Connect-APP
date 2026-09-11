@@ -1,9 +1,17 @@
 import { NextResponse } from "next/server";
 import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
 import { withProtocol } from "@/lib/schoolRecheck";
-import { fetchPageText, searchWeb, buildSourceBlocks, buildSearchQuery } from "@/lib/coachInfoLookup";
+import { fetchPageText, searchWeb, findDirectoryPage, buildSourceBlocks, buildSearchQuery } from "@/lib/coachInfoLookup";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
+// findDirectoryPage (lib/coachInfoLookup) below runs its own search THEN
+// its own fetch, one after the other -- up to double FETCH_TIMEOUT_MS
+// (~16s) even though it runs alongside the other fetches in the same
+// Promise.all. No maxDuration was set here before (this route previously
+// only did three ~8s-bounded calls in parallel); set explicitly now so a
+// slow directory lookup can't run into whatever shorter default this
+// project's plan would otherwise apply.
+export const maxDuration = 30;
 
 // Prep stage of the overnight Coach-Info Batch API job (see the spec doc in
 // the project docs). Anthropic's Batch API can't fetch web pages itself --
@@ -73,13 +81,25 @@ export async function POST(req) {
     // came from the "missing email" targeting mode) -- see buildSearchQuery.
     const searchQuery = buildSearchQuery(school);
 
-    const [athleticsFetch, websiteFetch, searchResults] = await Promise.all([
+    const [athleticsFetch, websiteFetch, searchResults, directoryResult] = await Promise.all([
       athleticsUrl ? fetchPageText(athleticsUrl) : Promise.resolve(null),
       websiteUrl ? fetchPageText(websiteUrl) : Promise.resolve(null),
       searchWeb(searchQuery, serperKey),
+      // Second, more targeted search for the school's own staff/faculty
+      // directory page -- see findDirectoryPage's own comment for why
+      // this exists alongside the primary search above.
+      findDirectoryPage({ school, serperKey }),
     ]);
 
-    const { hasUsableContent, userMessage, defaultSource } = buildSourceBlocks({ school, athleticsFetch, websiteFetch, searchResults, searchQuery });
+    const { hasUsableContent, userMessage, defaultSource } = buildSourceBlocks({
+      school,
+      athleticsFetch,
+      websiteFetch,
+      searchResults,
+      searchQuery,
+      directoryPage: directoryResult.page,
+      directorySearchResults: directoryResult.results,
+    });
 
     if (!hasUsableContent) {
       await supabase.from("coach_info_batch_items").update({ fetch_status: "no_content" }).eq("id", itemId);
