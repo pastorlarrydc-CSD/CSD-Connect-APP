@@ -1,7 +1,17 @@
 import { NextResponse } from "next/server";
 import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
 import { withProtocol } from "@/lib/schoolRecheck";
-import { fetchPageText, searchWeb, SYSTEM_PROMPT, parseModelJson, normalizeSuggestion, buildSourceBlocks, buildSearchQuery, MODEL } from "@/lib/coachInfoLookup";
+import {
+  fetchPageText,
+  searchWeb,
+  findDirectoryPage,
+  SYSTEM_PROMPT,
+  parseModelJson,
+  normalizeSuggestion,
+  buildSourceBlocks,
+  buildSearchQuery,
+  MODEL,
+} from "@/lib/coachInfoLookup";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
 // Every other network call in this route (fetchPageText, searchWeb) is
@@ -14,7 +24,14 @@ const REVIEWER_ROLES = ["verifier", "sysadmin"];
 // "Looking…" forever with no error. See the matching client-side fix in
 // the Quick Fix / school profile pages for the other half of this.
 const AI_TIMEOUT_MS = 20000;
-export const maxDuration = 35; // fetch/search stage (up to ~8s) + AI_TIMEOUT_MS, plus headroom
+// findDirectoryPage (lib/coachInfoLookup) runs its own search THEN its own
+// fetch, one after the other, so its own worst case is up to double
+// FETCH_TIMEOUT_MS (~16s) even though it runs alongside the other fetches
+// below in the same Promise.all -- that's now the slower branch driving
+// this stage's total, not the roughly-8s the other three branches take on
+// their own. maxDuration bumped accordingly (16s fetch/search stage +
+// AI_TIMEOUT_MS, plus headroom).
+export const maxDuration = 45;
 
 // AI auto-fill for the Quick Fix panel: instead of a human reading a
 // school's site by hand (or Googling it) to find and retype the head
@@ -111,13 +128,25 @@ export async function POST(req, { params }) {
     // the legal/CSD name) when no name is on file yet.
     const searchQuery = buildSearchQuery(school);
 
-    const [athleticsFetch, websiteFetch, searchResults] = await Promise.all([
+    const [athleticsFetch, websiteFetch, searchResults, directoryResult] = await Promise.all([
       athleticsUrl ? fetchPageText(athleticsUrl) : Promise.resolve(null),
       websiteUrl ? fetchPageText(websiteUrl) : Promise.resolve(null),
       searchWeb(searchQuery, serperKey),
+      // Second, more targeted search for the school's own staff/faculty
+      // directory page -- see findDirectoryPage's own comment for why
+      // this exists alongside the primary search above.
+      findDirectoryPage({ school, serperKey }),
     ]);
 
-    const { hasUsableContent, userMessage, defaultSource } = buildSourceBlocks({ school, athleticsFetch, websiteFetch, searchResults, searchQuery });
+    const { hasUsableContent, userMessage, defaultSource } = buildSourceBlocks({
+      school,
+      athleticsFetch,
+      websiteFetch,
+      searchResults,
+      searchQuery,
+      directoryPage: directoryResult.page,
+      directorySearchResults: directoryResult.results,
+    });
 
     if (!hasUsableContent) {
       return NextResponse.json(
