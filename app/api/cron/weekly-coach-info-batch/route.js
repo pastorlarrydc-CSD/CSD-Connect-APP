@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
 import { withProtocol } from "@/lib/schoolRecheck";
-import { fetchPageText, searchWeb, buildSourceBlocks, buildSearchQuery, SYSTEM_PROMPT, MODEL } from "@/lib/coachInfoLookup";
+import { fetchPageText, searchWeb, findDirectoryPage, buildSourceBlocks, buildSearchQuery, SYSTEM_PROMPT, MODEL } from "@/lib/coachInfoLookup";
 
 export const maxDuration = 60;
 const MAX_TOKENS = 400; // matches app/api/admin/batch-coach-info/[runId]/submit's own constant
@@ -157,13 +157,25 @@ export async function GET(req) {
           const websiteUrl = withProtocol(school.website);
           const searchQuery = buildSearchQuery(school);
 
-          const [athleticsFetch, websiteFetch, searchResults] = await Promise.all([
+          const [athleticsFetch, websiteFetch, searchResults, directoryResult] = await Promise.all([
             athleticsUrl ? fetchPageText(athleticsUrl) : Promise.resolve(null),
             websiteUrl ? fetchPageText(websiteUrl) : Promise.resolve(null),
             searchWeb(searchQuery, serperKey),
+            // Second, more targeted search for the school's own staff/faculty
+            // directory page -- see findDirectoryPage's own comment for why
+            // this exists alongside the primary search above.
+            findDirectoryPage({ school, serperKey }),
           ]);
 
-          const { hasUsableContent, userMessage, defaultSource } = buildSourceBlocks({ school, athleticsFetch, websiteFetch, searchResults, searchQuery });
+          const { hasUsableContent, userMessage, defaultSource } = buildSourceBlocks({
+            school,
+            athleticsFetch,
+            websiteFetch,
+            searchResults,
+            searchQuery,
+            directoryPage: directoryResult.page,
+            directorySearchResults: directoryResult.results,
+          });
 
           if (!hasUsableContent) {
             await supabase.from("coach_info_batch_items").update({ fetch_status: "no_content" }).eq("id", item.id);
