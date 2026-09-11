@@ -3,7 +3,7 @@ import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
 import { withProtocol } from "@/lib/schoolRecheck";
 import {
   fetchPageText,
-  searchWeb,
+  searchWebWithGraph,
   findDirectoryPage,
   SYSTEM_PROMPT,
   parseModelJson,
@@ -128,10 +128,15 @@ export async function POST(req, { params }) {
     // the legal/CSD name) when no name is on file yet.
     const searchQuery = buildSearchQuery(school);
 
-    const [athleticsFetch, websiteFetch, searchResults, directoryResult] = await Promise.all([
+    const [athleticsFetch, websiteFetch, primarySearch, directoryResult] = await Promise.all([
       athleticsUrl ? fetchPageText(athleticsUrl) : Promise.resolve(null),
       websiteUrl ? fetchPageText(websiteUrl) : Promise.resolve(null),
-      searchWeb(searchQuery, serperKey),
+      // searchWebWithGraph makes the exact same Serper call searchWeb always
+      // did -- it just also keeps the knowledgeGraph/answerBox fields
+      // Serper already returns alongside the organic results, instead of
+      // throwing them away. See that function's own comment in
+      // lib/coachInfoLookup.js.
+      searchWebWithGraph(searchQuery, serperKey),
       // Second, more targeted search for the school's own staff/faculty
       // directory page -- see findDirectoryPage's own comment for why
       // this exists alongside the primary search above.
@@ -142,10 +147,12 @@ export async function POST(req, { params }) {
       school,
       athleticsFetch,
       websiteFetch,
-      searchResults,
+      searchResults: primarySearch.organic,
       searchQuery,
       directoryPage: directoryResult.page,
       directorySearchResults: directoryResult.results,
+      knowledgeGraph: primarySearch.knowledgeGraph,
+      answerBox: primarySearch.answerBox,
     });
 
     if (!hasUsableContent) {
