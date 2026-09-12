@@ -65,6 +65,13 @@ export async function POST(req) {
       return NextResponse.json({ error: "Batch item not found." }, { status: 404 });
     }
 
+    // Only the "missing_email" candidate mode has an independent reason to
+    // already trust the on-file name (see buildSearchQuery's own comment in
+    // lib/coachInfoLookup.js) -- every other mode gets the safe, open
+    // identity-confirming query by default.
+    const { data: run } = await supabase.from("coach_info_batch_runs").select("candidate_mode").eq("id", item.batch_run_id).maybeSingle();
+    const contactOnly = run?.candidate_mode === "missing_email";
+
     const { data: school, error: schoolErr } = await supabase
       .from("schools")
       .select("id,name,city,state,athletics_url,website,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,ad_name,ad_email")
@@ -77,9 +84,10 @@ export async function POST(req) {
 
     const athleticsUrl = withProtocol(school.athletics_url);
     const websiteUrl = withProtocol(school.website);
-    // Name-targeted search when a coach is already on file (e.g. this item
-    // came from the "missing email" targeting mode) -- see buildSearchQuery.
-    const searchQuery = buildSearchQuery(school);
+    // Name-targeted search only for "missing_email" runs (see contactOnly
+    // above and buildSearchQuery's own comment) -- every other mode gets
+    // the open, identity-confirming query.
+    const searchQuery = buildSearchQuery(school, { contactOnly });
 
     const [athleticsFetch, websiteFetch, primarySearch, directoryResult] = await Promise.all([
       athleticsUrl ? fetchPageText(athleticsUrl) : Promise.resolve(null),
