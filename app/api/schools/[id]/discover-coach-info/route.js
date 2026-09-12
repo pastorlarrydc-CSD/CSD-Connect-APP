@@ -120,12 +120,12 @@ export async function POST(req, { params }) {
     const athleticsUrl = withProtocol(school.athletics_url);
     const websiteUrl = withProtocol(school.website);
 
-    // Name-targeted search when a coach is already on file -- e.g. a
-    // reviewer re-running this on a school that has a name but no email
-    // yet. See buildSearchQuery: falls back to the original school-only
-    // query (no exact-phrase quoting around school.name, since a school's
-    // public-facing name in search results sometimes differs slightly from
-    // the legal/CSD name) when no name is on file yet.
+    // Always the open, identity-confirming query here -- this button is
+    // exactly where a reviewer re-checks a school whose on-file name might
+    // be wrong or stale (e.g. a "double check the HFC" review-queue item),
+    // so it must not anchor its search to that name. See buildSearchQuery's
+    // own comment in lib/coachInfoLookup.js for the full reasoning (and the
+    // Clyde A. Erwin HS incident that surfaced this).
     const searchQuery = buildSearchQuery(school);
 
     const [athleticsFetch, websiteFetch, primarySearch, directoryResult] = await Promise.all([
