@@ -155,7 +155,13 @@ export async function GET(req) {
         try {
           const athleticsUrl = withProtocol(school.athletics_url);
           const websiteUrl = withProtocol(school.website);
-          const searchQuery = buildSearchQuery(school);
+          // This cron always targets "missing_email" candidates (see the
+          // file header comment) -- the one mode with an independent reason
+          // to already trust the on-file name, so it keeps the
+          // name-anchored search. See buildSearchQuery's own comment in
+          // lib/coachInfoLookup.js for why every other caller defaults to
+          // the open query instead.
+          const searchQuery = buildSearchQuery(school, { contactOnly: true });
 
           const [athleticsFetch, websiteFetch, primarySearch, directoryResult] = await Promise.all([
             athleticsUrl ? fetchPageText(athleticsUrl) : Promise.resolve(null),
