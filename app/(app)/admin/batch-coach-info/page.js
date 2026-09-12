@@ -97,10 +97,12 @@ export default function BatchCoachInfoPage() {
   // coach name but is missing just the email (and often phone/socials) --
   // a much smaller, much closer-to-done pool that the original targeting
   // never touched (it required BOTH name fields blank). Since the coach's
-  // name is already known here, fetch-item's search is name-targeted
-  // (buildSearchQuery in lib/coachInfoLookup.js) instead of the generic
-  // "who is the coach" search, so it's more likely to actually surface an
-  // email rather than just re-confirming a name already on file.
+  // name is already known here, fetch-item passes contactOnly:true and
+  // gets buildSearchQuery's name-targeted query (lib/coachInfoLookup.js)
+  // instead of the generic "who is the coach" search, so it's more likely
+  // to actually surface an email. Every other mode -- and the single-
+  // school button -- gets the open query by default, precisely so a wrong
+  // or stale on-file name can still be caught rather than re-confirmed.
   const [candidateMode, setCandidateMode] = useState("no_name"); // "no_name" | "missing_email"
   const [scopeMode, setScopeMode] = useState("priority"); // "priority" | "all"
   const [customStates, setCustomStates] = useState(PRIORITY_STATES.join(", "));
