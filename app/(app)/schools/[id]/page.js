@@ -328,84 +328,106 @@ export default function SchoolProfilePage() {
   const [undoingReviewed, setUndoingReviewed] = useState(false);
   const [undoReviewedError, setUndoReviewedError] = useState("");
 
-  const load = useCallback(async () => {
-    const { data: schoolData } = await supabase.from("schools").select("*").eq("id", id).maybeSingle();
-    setSchool(schoolData);
-    if (schoolData) {
-      setCorrectionForm({
-        hc_first_name: schoolData.hc_first_name || "",
-        hc_last_name: schoolData.hc_last_name || "",
-        hc_email: schoolData.hc_email || "",
-        hc_cell: schoolData.hc_cell || "",
-        hc_office: schoolData.hc_office || "",
-        note: "",
-      });
-      setOwnerForm({
-        hc_first_name: schoolData.hc_first_name || "",
-        hc_last_name: schoolData.hc_last_name || "",
-        hc_email: schoolData.hc_email || "",
-        hc_cell: schoolData.hc_cell || "",
-        hc_office: schoolData.hc_office || "",
-        website: schoolData.website || "",
-        note: "",
-      });
-      setWebsiteDraft(schoolData.website || "");
-    }
+  const load = useCallback(
+    async function loadSchool(attempt = 0) {
+      // Route params can be momentarily unresolved right after a
+      // back/forward navigation (this component gets reused across two
+      // different school ids without unmounting) -- querying with an
+      // empty id would come back with no row and flash "School not
+      // found." Just wait for the next render with a real id instead.
+      if (!id) return;
+      if (attempt === 0) setLoading(true);
 
-    if (user?.id) {
-      const [{ data: suggestion }, { data: claim }, { data: flag }] = await Promise.all([
-        supabase
-          .from("school_edit_suggestions")
-          .select("*")
-          .eq("school_id", id)
-          .eq("suggested_by", user.id)
-          .order("created_at", { ascending: false })
-          .limit(1)
-          .maybeSingle(),
-        supabase
-          .from("school_claims")
-          .select("*")
-          .eq("school_id", id)
-          .eq("user_id", user.id)
-          .order("created_at", { ascending: false })
-          .limit(1)
-          .maybeSingle(),
-        supabase
-          .from("school_flags")
-          .select("*")
-          .eq("school_id", id)
-          .eq("flagged_by", user.id)
-          .order("created_at", { ascending: false })
-          .limit(1)
-          .maybeSingle(),
-      ]);
-      setMySuggestion(suggestion || null);
-      setMyClaim(claim || null);
-      setMyFlag(flag || null);
-    }
+      const { data: schoolData, error: schoolError } = await supabase.from("schools").select("*").eq("id", id).maybeSingle();
+      // A failed/interrupted request -- common right after using the
+      // browser's back button, or a background token refresh landing
+      // mid-flight -- comes back with `error` set and `schoolData` null.
+      // That used to look identical to "this school genuinely doesn't
+      // exist" and would show "School not found." for a school that's
+      // very much still there. Retry a couple of times (with backoff)
+      // before accepting the fetch actually came back empty.
+      if (schoolError && attempt < 2) {
+        await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+        return loadSchool(attempt + 1);
+      }
+      if (!schoolError) setSchool(schoolData);
+      if (schoolData) {
+        setCorrectionForm({
+          hc_first_name: schoolData.hc_first_name || "",
+          hc_last_name: schoolData.hc_last_name || "",
+          hc_email: schoolData.hc_email || "",
+          hc_cell: schoolData.hc_cell || "",
+          hc_office: schoolData.hc_office || "",
+          note: "",
+        });
+        setOwnerForm({
+          hc_first_name: schoolData.hc_first_name || "",
+          hc_last_name: schoolData.hc_last_name || "",
+          hc_email: schoolData.hc_email || "",
+          hc_cell: schoolData.hc_cell || "",
+          hc_office: schoolData.hc_office || "",
+          website: schoolData.website || "",
+          note: "",
+        });
+        setWebsiteDraft(schoolData.website || "");
+      }
 
-    const { data: recheckRows } = await supabase
-      .from("school_recheck_log")
-      .select("*")
-      .eq("school_id", id)
-      .order("checked_at", { ascending: false })
-      .limit(1);
-    setLastRecheck((recheckRows && recheckRows[0]) || null);
+      if (user?.id) {
+        const [{ data: suggestion }, { data: claim }, { data: flag }] = await Promise.all([
+          supabase
+            .from("school_edit_suggestions")
+            .select("*")
+            .eq("school_id", id)
+            .eq("suggested_by", user.id)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle(),
+          supabase
+            .from("school_claims")
+            .select("*")
+            .eq("school_id", id)
+            .eq("user_id", user.id)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle(),
+          supabase
+            .from("school_flags")
+            .select("*")
+            .eq("school_id", id)
+            .eq("flagged_by", user.id)
+            .order("created_at", { ascending: false })
+            .limit(1)
+            .maybeSingle(),
+        ]);
+        setMySuggestion(suggestion || null);
+        setMyClaim(claim || null);
+        setMyFlag(flag || null);
+      }
 
-    if (college?.id) {
-      const [{ data: logs }, { data: assign }, { data: watch }, { data: noteRows }] = await Promise.all([
-        supabase.from("contact_logs").select("*").eq("college_id", college.id).eq("school_id", id).order("created_at", { ascending: false }),
-        supabase.from("coach_assignments").select("*").eq("college_id", college.id).eq("school_id", id).maybeSingle(),
-        supabase.from("watchlist_items").select("*").eq("college_id", college.id).eq("school_id", id).maybeSingle(),
-        supabase.from("school_notes").select("*").eq("college_id", college.id).eq("school_id", id).order("created_at", { ascending: false }),
-      ]);
-      setContactLogs(logs || []);
-      setAssignment(assign || null);
-      setWatchlisted(!!watch);
-      setNotes(noteRows || []);
-    }
-    setLoading(false);
-  }, [supabase, id, college, user]);
+      const { data: recheckRows } = await supabase
+        .from("school_recheck_log")
+        .select("*")
+        .eq("school_id", id)
+        .order("checked_at", { ascending: false })
+        .limit(1);
+      setLastRecheck((recheckRows && recheckRows[0]) || null);
+
+      if (college?.id) {
+        const [{ data: logs }, { data: assign }, { data: watch }, { data: noteRows }] = await Promise.all([
+          supabase.from("contact_logs").select("*").eq("college_id", college.id).eq("school_id", id).order("created_at", { ascending: false }),
+          supabase.from("coach_assignments").select("*").eq("college_id", college.id).eq("school_id", id).maybeSingle(),
+          supabase.from("watchlist_items").select("*").eq("college_id", college.id).eq("school_id", id).maybeSingle(),
+          supabase.from("school_notes").select("*").eq("college_id", college.id).eq("school_id", id).order("created_at", { ascending: false }),
+        ]);
+        setContactLogs(logs || []);
+        setAssignment(assign || null);
+        setWatchlisted(!!watch);
+        setNotes(noteRows || []);
+      }
+      setLoading(false);
+    },
+    [supabase, id, college, user]
+  );
 
   useEffect(() => {
     load();
