@@ -44,6 +44,39 @@ const EMPTY_FORM = {
   mobile: "",
   office_phone: "",
   notes: "",
+  next_callback_at: "",
+};
+
+function todayISO() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function fmtDate(d) {
+  if (!d) return "";
+  return new Date(d + "T00:00:00").toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
+// Overdue / due-today / due-this-week badge for a lead's next_callback_at.
+// Plain date-string math (YYYY-MM-DD) avoids timezone drift from parsing
+// into a Date and comparing.
+function callbackBadge(nextCallbackAt) {
+  if (!nextCallbackAt) return null;
+  const today = todayISO();
+  if (nextCallbackAt < today) {
+    const days = Math.round((new Date(today) - new Date(nextCallbackAt)) / 86400000);
+    return { label: `Overdue ${days}d`, tone: "danger" };
+  }
+  if (nextCallbackAt === today) return { label: "Due today", tone: "today" };
+  const weekOut = new Date();
+  weekOut.setDate(weekOut.getDate() + 7);
+  if (nextCallbackAt <= weekOut.toISOString().slice(0, 10)) return { label: `Due ${fmtDate(nextCallbackAt)}`, tone: "week" };
+  return { label: `Due ${fmtDate(nextCallbackAt)}`, tone: "later" };
+}
+const BADGE_STYLE = {
+  danger: { background: "#fbe4e1", color: "#b3312c" },
+  today: { background: "#fff1c2", color: "#8a6400" },
+  week: { background: "#e3ecff", color: "#2246b3" },
+  later: { background: "#eef0f4", color: "#697386" },
 };
 
 // Header synonyms for CSV import -- keeps this forgiving of whatever
@@ -73,6 +106,203 @@ function fmtPhone(v) {
   if (!v) return "";
   const digits = String(v).replace(/\D/g, "");
   return digits.length === 10 ? `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}` : v;
+}
+
+// One row's worth of UI -- shared between the "Due for a Callback" panel
+// and the main paginated list, so status changes, edits, and the
+// notes/call-log panel work identically in both places. Deliberately a
+// top-level component (not nested inside CollegeLeadsPage) so its identity
+// stays stable across renders -- a component defined inside another
+// component's body gets a new function identity every render, which would
+// make React remount this row (and its inputs, losing focus mid-keystroke)
+// every time any state in the page changed.
+function LeadRow({
+  lead,
+  isEditing,
+  isExpanded,
+  editForm,
+  setEditField,
+  editError,
+  saving,
+  onSaveEdit,
+  onCancelEdit,
+  statusSavingId,
+  onUpdateStatus,
+  onToggleNotes,
+  onStartEdit,
+  onDelete,
+  deletingId,
+  noteError,
+  newNoteText,
+  setNewNoteText,
+  newNoteCallback,
+  setNewNoteCallback,
+  savingNote,
+  onAddNote,
+  notesLoading,
+  notes,
+}) {
+  const badge = callbackBadge(lead.next_callback_at);
+  return (
+    <div className="log-item" style={{ paddingBottom: 12 }}>
+      {isEditing ? (
+        <form onSubmit={onSaveEdit} style={{ background: "#f7f8fa", border: "1px solid #dde1e7", borderRadius: 8, padding: 10 }}>
+          {editError && <div className="notice danger" style={{ marginBottom: 8 }}>{editError}</div>}
+          <div className="grid grid-2" style={{ marginBottom: 8 }}>
+            <div className="form-field" style={{ marginBottom: 0 }}>
+              <label>College / Program</label>
+              <input value={editForm.college_name} onChange={(e) => setEditField("college_name", e.target.value)} />
+            </div>
+            <div className="form-field" style={{ marginBottom: 0 }}>
+              <label>Division</label>
+              <select value={editForm.division} onChange={(e) => setEditField("division", e.target.value)}>
+                <option value="">Select…</option>
+                {DIVISIONS.map((d) => (
+                  <option key={d} value={d}>{d}</option>
+                ))}
+              </select>
+            </div>
+            <div className="form-field" style={{ marginBottom: 0 }}>
+              <label>State</label>
+              <input value={editForm.state} onChange={(e) => setEditField("state", e.target.value)} />
+            </div>
+            <div className="form-field" style={{ marginBottom: 0 }}>
+              <label>Title</label>
+              <input value={editForm.title} onChange={(e) => setEditField("title", e.target.value)} />
+            </div>
+            <div className="form-field" style={{ marginBottom: 0 }}>
+              <label>Coach First Name</label>
+              <input value={editForm.coach_first_name} onChange={(e) => setEditField("coach_first_name", e.target.value)} />
+            </div>
+            <div className="form-field" style={{ marginBottom: 0 }}>
+              <label>Coach Last Name</label>
+              <input value={editForm.coach_last_name} onChange={(e) => setEditField("coach_last_name", e.target.value)} />
+            </div>
+            <div className="form-field" style={{ marginBottom: 0 }}>
+              <label>Email</label>
+              <input type="email" value={editForm.email} onChange={(e) => setEditField("email", e.target.value)} />
+            </div>
+            <div className="form-field" style={{ marginBottom: 0 }}>
+              <label>Mobile</label>
+              <input value={editForm.mobile} onChange={(e) => setEditField("mobile", e.target.value)} />
+            </div>
+            <div className="form-field" style={{ marginBottom: 0 }}>
+              <label>Office Number</label>
+              <input value={editForm.office_phone} onChange={(e) => setEditField("office_phone", e.target.value)} />
+            </div>
+            <div className="form-field" style={{ marginBottom: 0 }}>
+              <label>Next Callback</label>
+              <input type="date" value={editForm.next_callback_at} onChange={(e) => setEditField("next_callback_at", e.target.value)} />
+            </div>
+          </div>
+          <div className="form-field">
+            <label>Notes</label>
+            <input value={editForm.notes} onChange={(e) => setEditField("notes", e.target.value)} />
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button className="btn btn-sm btn-gold" disabled={saving}>{saving ? "Saving…" : "Save"}</button>
+            <button type="button" className="btn btn-sm" onClick={onCancelEdit} disabled={saving}>Cancel</button>
+          </div>
+        </form>
+      ) : (
+        <>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+            <div>
+              <strong>{lead.college_name}</strong>
+              {lead.division ? ` — ${lead.division}` : ""}
+              {lead.state ? `, ${lead.state}` : ""}
+              {badge && (
+                <span
+                  style={{
+                    marginLeft: 8,
+                    fontSize: 11,
+                    fontWeight: 700,
+                    padding: "2px 7px",
+                    borderRadius: 20,
+                    ...BADGE_STYLE[badge.tone],
+                  }}
+                >
+                  📞 {badge.label}
+                </span>
+              )}
+              <div style={{ fontSize: 12.5, color: "#3c4658", marginTop: 3 }}>
+                {[lead.coach_first_name, lead.coach_last_name].filter(Boolean).join(" ") || <span className="empty-state" style={{ padding: 0 }}>no coach name on file</span>}
+                {lead.title ? ` · ${lead.title}` : ""}
+              </div>
+              <div style={{ fontSize: 12, color: "#697386", marginTop: 2, display: "flex", gap: 10, flexWrap: "wrap" }}>
+                {lead.email && <span>✉️ {lead.email}</span>}
+                {lead.mobile && <span>📱 {fmtPhone(lead.mobile)}</span>}
+                {lead.office_phone && <span>☎️ {fmtPhone(lead.office_phone)} (office)</span>}
+                {!lead.email && !lead.mobile && !lead.office_phone && <span>No contact info on file</span>}
+              </div>
+              {lead.notes && <div style={{ fontSize: 12, color: "#3c4658", marginTop: 4 }}>📝 {lead.notes}</div>}
+              {lead.last_contacted_at && <div style={{ fontSize: 11, color: "#697386", marginTop: 2 }}>Last contacted {lead.last_contacted_at}</div>}
+            </div>
+            <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
+              <select
+                value={lead.status}
+                onChange={(e) => onUpdateStatus(lead, e.target.value)}
+                disabled={statusSavingId === lead.id}
+                className={STATUS_BADGE[lead.status]}
+                style={{ border: "none", padding: "4px 6px", borderRadius: 20, fontWeight: 700, fontSize: 11 }}
+              >
+                {STATUS_OPTIONS.map((s) => (
+                  <option key={s} value={s}>{STATUS_LABEL[s]}</option>
+                ))}
+              </select>
+              <button className="btn btn-sm" onClick={() => onToggleNotes(lead.id)}>{isExpanded ? "Hide Notes" : "Notes & Calls"}</button>
+              <button className="btn btn-sm" onClick={() => onStartEdit(lead)}>Edit</button>
+              <button className="btn btn-sm btn-danger" onClick={() => onDelete(lead.id)} disabled={deletingId === lead.id}>
+                {deletingId === lead.id ? "…" : "Delete"}
+              </button>
+            </div>
+          </div>
+          {isExpanded && (
+            <div style={{ marginTop: 10, background: "#f7f8fa", border: "1px solid #dde1e7", borderRadius: 8, padding: 10 }}>
+              {noteError && <div className="notice danger" style={{ marginBottom: 8 }}>{noteError}</div>}
+              <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10, alignItems: "flex-end" }}>
+                <div className="form-field" style={{ marginBottom: 0, flex: "1 1 240px" }}>
+                  <label>New note</label>
+                  <input
+                    placeholder="What happened on this call / email…"
+                    value={newNoteText}
+                    onChange={(e) => setNewNoteText(e.target.value)}
+                  />
+                </div>
+                <div className="form-field" style={{ marginBottom: 0 }}>
+                  <label>Set next callback (optional)</label>
+                  <input type="date" value={newNoteCallback} onChange={(e) => setNewNoteCallback(e.target.value)} />
+                </div>
+                <button className="btn btn-sm btn-gold" onClick={() => onAddNote(lead.id)} disabled={savingNote}>
+                  {savingNote ? "Saving…" : "Save Note"}
+                </button>
+              </div>
+              {notesLoading ? (
+                <div className="empty-state">Loading…</div>
+              ) : (notes || []).length === 0 ? (
+                <div className="empty-state">No notes yet — log your first call above.</div>
+              ) : (
+                (notes || []).map((n) => (
+                  <div key={n.id} style={{ fontSize: 12.5, padding: "6px 0", borderBottom: "1px solid #e5e8ee" }}>
+                    <div style={{ color: "#697386", fontSize: 11 }}>
+                      {new Date(n.created_at).toLocaleString(undefined, {
+                        month: "short",
+                        day: "numeric",
+                        year: "numeric",
+                        hour: "numeric",
+                        minute: "2-digit",
+                      })}
+                    </div>
+                    <div>{n.note}</div>
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
 }
 
 export default function CollegeLeadsPage() {
@@ -110,6 +340,24 @@ export default function CollegeLeadsPage() {
 
   const [statusFilter, setStatusFilter] = useState("");
   const [divisionFilter, setDivisionFilter] = useState("");
+  const [callbackFilter, setCallbackFilter] = useState(""); // "" | "due" | "week"
+
+  // Due-for-a-callback panel -- counts for the pills, and the actual
+  // overdue/today leads shown inline (capped) so the most urgent calls are
+  // visible without an extra click.
+  const [dueCounts, setDueCounts] = useState({ overdue: 0, today: 0, week: 0 });
+  const [dueItems, setDueItems] = useState([]);
+  const [dueLoading, setDueLoading] = useState(true);
+
+  // Notes/call log -- one lead expanded at a time, notes lazy-loaded on
+  // expand rather than fetched for every row on the page.
+  const [expandedNotesId, setExpandedNotesId] = useState(null);
+  const [notesByLead, setNotesByLead] = useState({});
+  const [notesLoading, setNotesLoading] = useState(false);
+  const [newNoteText, setNewNoteText] = useState("");
+  const [newNoteCallback, setNewNoteCallback] = useState("");
+  const [savingNote, setSavingNote] = useState(false);
+  const [noteError, setNoteError] = useState("");
 
   const [showAdd, setShowAdd] = useState(false);
   const [addForm, setAddForm] = useState(EMPTY_FORM);
@@ -144,19 +392,30 @@ export default function CollegeLeadsPage() {
     let query = supabase.from("college_leads").select("*", { count: "exact" });
     if (statusFilter) query = query.eq("status", statusFilter);
     if (divisionFilter) query = query.eq("division", divisionFilter);
+    if (callbackFilter === "due") query = query.lte("next_callback_at", todayISO());
+    else if (callbackFilter === "week") {
+      const weekOut = new Date();
+      weekOut.setDate(weekOut.getDate() + 7);
+      query = query.not("next_callback_at", "is", null).lte("next_callback_at", weekOut.toISOString().slice(0, 10));
+    }
     if (search.trim()) {
       const q = search.trim().replace(/[%,()]/g, "");
       query = query.or(
         `college_name.ilike.%${q}%,coach_first_name.ilike.%${q}%,coach_last_name.ilike.%${q}%,state.ilike.%${q}%,email.ilike.%${q}%`
       );
     }
-    query = query.order("updated_at", { ascending: false }).range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+    // Sorting by soonest-due makes sense once a callback filter is active;
+    // otherwise default to most-recently-touched, same as before.
+    query = callbackFilter
+      ? query.order("next_callback_at", { ascending: true })
+      : query.order("updated_at", { ascending: false });
+    query = query.range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
     const { data, error, count } = await query;
     if (error) setLoadError(error.message);
     setLeads(data || []);
     setTotal(count || 0);
     setLoading(false);
-  }, [supabase, statusFilter, divisionFilter, search, page]);
+  }, [supabase, statusFilter, divisionFilter, callbackFilter, search, page]);
 
   const loadStats = useCallback(async () => {
     const [{ count: totalCount }, { count: interestedCount }, { count: trialCount }, { count: customerCount }] = await Promise.all([
@@ -168,9 +427,29 @@ export default function CollegeLeadsPage() {
     setStats({ total: totalCount || 0, interested: interestedCount || 0, trial: trialCount || 0, customer: customerCount || 0 });
   }, [supabase]);
 
+  // Counts + the actual overdue/today leads for the "Due for a Callback"
+  // panel. Independent of the main list's filters/page so it always shows
+  // the true urgent list.
+  const loadDue = useCallback(async () => {
+    setDueLoading(true);
+    const today = todayISO();
+    const weekOut = new Date();
+    weekOut.setDate(weekOut.getDate() + 7);
+    const weekOutISO = weekOut.toISOString().slice(0, 10);
+    const [{ count: overdueCount }, { count: todayCount }, { count: weekCount }, { data: items }] = await Promise.all([
+      supabase.from("college_leads").select("*", { count: "exact", head: true }).lt("next_callback_at", today),
+      supabase.from("college_leads").select("*", { count: "exact", head: true }).eq("next_callback_at", today),
+      supabase.from("college_leads").select("*", { count: "exact", head: true }).gt("next_callback_at", today).lte("next_callback_at", weekOutISO),
+      supabase.from("college_leads").select("*").lte("next_callback_at", today).order("next_callback_at", { ascending: true }).limit(12),
+    ]);
+    setDueCounts({ overdue: overdueCount || 0, today: todayCount || 0, week: weekCount || 0 });
+    setDueItems(items || []);
+    setDueLoading(false);
+  }, [supabase]);
+
   const refreshAll = useCallback(async () => {
-    await Promise.all([loadLeads(), loadStats()]);
-  }, [loadLeads, loadStats]);
+    await Promise.all([loadLeads(), loadStats(), loadDue()]);
+  }, [loadLeads, loadStats, loadDue]);
 
   useEffect(() => {
     loadLeads();
@@ -179,6 +458,10 @@ export default function CollegeLeadsPage() {
   useEffect(() => {
     loadStats();
   }, [loadStats]);
+
+  useEffect(() => {
+    loadDue();
+  }, [loadDue]);
 
   function field(setter) {
     return (key, val) => setter((prev) => ({ ...prev, [key]: val }));
@@ -225,6 +508,7 @@ export default function CollegeLeadsPage() {
       mobile: lead.mobile || "",
       office_phone: lead.office_phone || "",
       notes: lead.notes || "",
+      next_callback_at: lead.next_callback_at || "",
     });
   }
 
@@ -279,6 +563,69 @@ export default function CollegeLeadsPage() {
       await refreshAll();
     } finally {
       setDeletingId(null);
+    }
+  }
+
+  async function toggleNotes(leadId) {
+    if (expandedNotesId === leadId) {
+      setExpandedNotesId(null);
+      return;
+    }
+    setExpandedNotesId(leadId);
+    setNoteError("");
+    setNewNoteText("");
+    setNewNoteCallback("");
+    if (!notesByLead[leadId]) {
+      setNotesLoading(true);
+      const { data, error } = await supabase
+        .from("lead_notes")
+        .select("*")
+        .eq("lead_id", leadId)
+        .order("created_at", { ascending: false });
+      if (!error) setNotesByLead((prev) => ({ ...prev, [leadId]: data || [] }));
+      setNotesLoading(false);
+    }
+  }
+
+  // Adding a note and setting the next callback date are the same everyday
+  // action ("talked to him, follow up Tuesday"), so one small form does
+  // both -- the callback date is optional.
+  async function addNote(leadId) {
+    setNoteError("");
+    if (!newNoteText.trim()) {
+      setNoteError("Write a note before saving.");
+      return;
+    }
+    setSavingNote(true);
+    try {
+      const { error: noteErr } = await supabase.from("lead_notes").insert({
+        lead_id: leadId,
+        note: newNoteText.trim(),
+        written_by: user.id,
+      });
+      if (noteErr) throw noteErr;
+
+      if (newNoteCallback) {
+        const { error: cbErr } = await supabase
+          .from("college_leads")
+          .update({ next_callback_at: newNoteCallback, updated_at: new Date().toISOString() })
+          .eq("id", leadId);
+        if (cbErr) throw cbErr;
+      }
+
+      const { data } = await supabase
+        .from("lead_notes")
+        .select("*")
+        .eq("lead_id", leadId)
+        .order("created_at", { ascending: false });
+      setNotesByLead((prev) => ({ ...prev, [leadId]: data || [] }));
+      setNewNoteText("");
+      setNewNoteCallback("");
+      await refreshAll();
+    } catch (err) {
+      setNoteError(err.message || "Could not save this note.");
+    } finally {
+      setSavingNote(false);
     }
   }
 
@@ -436,6 +783,76 @@ export default function CollegeLeadsPage() {
         </div>
       </div>
 
+      <div className="card" style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+          <h3 style={{ margin: 0 }}>📞 Due for a Callback</h3>
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+            <button
+              className="btn btn-sm"
+              style={{ ...(callbackFilter === "due" ? { background: "#131a2b", color: "#fff" } : {}) }}
+              onClick={() => {
+                setCallbackFilter((f) => (f === "due" ? "" : "due"));
+                setPage(0);
+              }}
+            >
+              Overdue + Today ({(dueCounts.overdue + dueCounts.today).toLocaleString()})
+            </button>
+            <button
+              className="btn btn-sm"
+              style={{ ...(callbackFilter === "week" ? { background: "#131a2b", color: "#fff" } : {}) }}
+              onClick={() => {
+                setCallbackFilter((f) => (f === "week" ? "" : "week"));
+                setPage(0);
+              }}
+            >
+              This Week ({dueCounts.week.toLocaleString()})
+            </button>
+          </div>
+        </div>
+        {dueLoading ? (
+          <div className="empty-state">Loading…</div>
+        ) : dueItems.length === 0 ? (
+          <div className="empty-state">Nothing overdue or due today — you&apos;re caught up.</div>
+        ) : (
+          <div style={{ marginTop: 8 }}>
+            {dueItems.map((lead) => (
+              <LeadRow
+                key={lead.id}
+                lead={lead}
+                isEditing={editingId === lead.id}
+                isExpanded={expandedNotesId === lead.id}
+                editForm={editForm}
+                setEditField={setEditField}
+                editError={editError}
+                saving={saving}
+                onSaveEdit={saveEdit}
+                onCancelEdit={() => setEditingId(null)}
+                statusSavingId={statusSavingId}
+                onUpdateStatus={updateStatus}
+                onToggleNotes={toggleNotes}
+                onStartEdit={startEdit}
+                onDelete={deleteLead}
+                deletingId={deletingId}
+                noteError={noteError}
+                newNoteText={newNoteText}
+                setNewNoteText={setNewNoteText}
+                newNoteCallback={newNoteCallback}
+                setNewNoteCallback={setNewNoteCallback}
+                savingNote={savingNote}
+                onAddNote={addNote}
+                notesLoading={notesLoading}
+                notes={notesByLead[lead.id]}
+              />
+            ))}
+            {dueCounts.overdue + dueCounts.today > dueItems.length && (
+              <div className="notice" style={{ marginTop: 8 }}>
+                +{(dueCounts.overdue + dueCounts.today - dueItems.length).toLocaleString()} more overdue/today — use the filter above to see all of them below.
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
       {showAdd && (
         <div className="card" style={{ marginBottom: 14 }}>
           <h3>Add a Lead</h3>
@@ -482,6 +899,10 @@ export default function CollegeLeadsPage() {
               <div className="form-field">
                 <label>Office Number</label>
                 <input value={addForm.office_phone} onChange={(e) => setAddField("office_phone", e.target.value)} />
+              </div>
+              <div className="form-field">
+                <label>Next Callback</label>
+                <input type="date" value={addForm.next_callback_at} onChange={(e) => setAddField("next_callback_at", e.target.value)} />
               </div>
             </div>
             <div className="form-field">
@@ -583,106 +1004,35 @@ export default function CollegeLeadsPage() {
         ) : leads.length === 0 ? (
           <div className="empty-state">No leads match. Add one above, import a CSV, or clear a filter.</div>
         ) : (
-          leads.map((lead) => {
-            const isEditing = editingId === lead.id;
-            return (
-              <div className="log-item" key={lead.id} style={{ paddingBottom: 12 }}>
-                {isEditing ? (
-                  <form onSubmit={saveEdit} style={{ background: "#f7f8fa", border: "1px solid #dde1e7", borderRadius: 8, padding: 10 }}>
-                    {editError && <div className="notice danger" style={{ marginBottom: 8 }}>{editError}</div>}
-                    <div className="grid grid-2" style={{ marginBottom: 8 }}>
-                      <div className="form-field" style={{ marginBottom: 0 }}>
-                        <label>College / Program</label>
-                        <input value={editForm.college_name} onChange={(e) => setEditField("college_name", e.target.value)} />
-                      </div>
-                      <div className="form-field" style={{ marginBottom: 0 }}>
-                        <label>Division</label>
-                        <select value={editForm.division} onChange={(e) => setEditField("division", e.target.value)}>
-                          <option value="">Select…</option>
-                          {DIVISIONS.map((d) => (
-                            <option key={d} value={d}>{d}</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div className="form-field" style={{ marginBottom: 0 }}>
-                        <label>State</label>
-                        <input value={editForm.state} onChange={(e) => setEditField("state", e.target.value)} />
-                      </div>
-                      <div className="form-field" style={{ marginBottom: 0 }}>
-                        <label>Title</label>
-                        <input value={editForm.title} onChange={(e) => setEditField("title", e.target.value)} />
-                      </div>
-                      <div className="form-field" style={{ marginBottom: 0 }}>
-                        <label>Coach First Name</label>
-                        <input value={editForm.coach_first_name} onChange={(e) => setEditField("coach_first_name", e.target.value)} />
-                      </div>
-                      <div className="form-field" style={{ marginBottom: 0 }}>
-                        <label>Coach Last Name</label>
-                        <input value={editForm.coach_last_name} onChange={(e) => setEditField("coach_last_name", e.target.value)} />
-                      </div>
-                      <div className="form-field" style={{ marginBottom: 0 }}>
-                        <label>Email</label>
-                        <input type="email" value={editForm.email} onChange={(e) => setEditField("email", e.target.value)} />
-                      </div>
-                      <div className="form-field" style={{ marginBottom: 0 }}>
-                        <label>Mobile</label>
-                        <input value={editForm.mobile} onChange={(e) => setEditField("mobile", e.target.value)} />
-                      </div>
-                      <div className="form-field" style={{ marginBottom: 0 }}>
-                        <label>Office Number</label>
-                        <input value={editForm.office_phone} onChange={(e) => setEditField("office_phone", e.target.value)} />
-                      </div>
-                    </div>
-                    <div className="form-field">
-                      <label>Notes</label>
-                      <input value={editForm.notes} onChange={(e) => setEditField("notes", e.target.value)} />
-                    </div>
-                    <div style={{ display: "flex", gap: 8 }}>
-                      <button className="btn btn-sm btn-gold" disabled={saving}>{saving ? "Saving…" : "Save"}</button>
-                      <button type="button" className="btn btn-sm" onClick={() => setEditingId(null)} disabled={saving}>Cancel</button>
-                    </div>
-                  </form>
-                ) : (
-                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
-                    <div>
-                      <strong>{lead.college_name}</strong>
-                      {lead.division ? ` — ${lead.division}` : ""}
-                      {lead.state ? `, ${lead.state}` : ""}
-                      <div style={{ fontSize: 12.5, color: "#3c4658", marginTop: 3 }}>
-                        {[lead.coach_first_name, lead.coach_last_name].filter(Boolean).join(" ") || <span className="empty-state" style={{ padding: 0 }}>no coach name on file</span>}
-                        {lead.title ? ` · ${lead.title}` : ""}
-                      </div>
-                      <div style={{ fontSize: 12, color: "#697386", marginTop: 2, display: "flex", gap: 10, flexWrap: "wrap" }}>
-                        {lead.email && <span>✉️ {lead.email}</span>}
-                        {lead.mobile && <span>📱 {fmtPhone(lead.mobile)}</span>}
-                        {lead.office_phone && <span>☎️ {fmtPhone(lead.office_phone)} (office)</span>}
-                        {!lead.email && !lead.mobile && !lead.office_phone && <span>No contact info on file</span>}
-                      </div>
-                      {lead.notes && <div style={{ fontSize: 12, color: "#3c4658", marginTop: 4 }}>📝 {lead.notes}</div>}
-                      {lead.last_contacted_at && <div style={{ fontSize: 11, color: "#697386", marginTop: 2 }}>Last contacted {lead.last_contacted_at}</div>}
-                    </div>
-                    <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
-                      <select
-                        value={lead.status}
-                        onChange={(e) => updateStatus(lead, e.target.value)}
-                        disabled={statusSavingId === lead.id}
-                        className={STATUS_BADGE[lead.status]}
-                        style={{ border: "none", padding: "4px 6px", borderRadius: 20, fontWeight: 700, fontSize: 11 }}
-                      >
-                        {STATUS_OPTIONS.map((s) => (
-                          <option key={s} value={s}>{STATUS_LABEL[s]}</option>
-                        ))}
-                      </select>
-                      <button className="btn btn-sm" onClick={() => startEdit(lead)}>Edit</button>
-                      <button className="btn btn-sm btn-danger" onClick={() => deleteLead(lead.id)} disabled={deletingId === lead.id}>
-                        {deletingId === lead.id ? "…" : "Delete"}
-                      </button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            );
-          })
+          leads.map((lead) => (
+            <LeadRow
+              key={lead.id}
+              lead={lead}
+              isEditing={editingId === lead.id}
+              isExpanded={expandedNotesId === lead.id}
+              editForm={editForm}
+              setEditField={setEditField}
+              editError={editError}
+              saving={saving}
+              onSaveEdit={saveEdit}
+              onCancelEdit={() => setEditingId(null)}
+              statusSavingId={statusSavingId}
+              onUpdateStatus={updateStatus}
+              onToggleNotes={toggleNotes}
+              onStartEdit={startEdit}
+              onDelete={deleteLead}
+              deletingId={deletingId}
+              noteError={noteError}
+              newNoteText={newNoteText}
+              setNewNoteText={setNewNoteText}
+              newNoteCallback={newNoteCallback}
+              setNewNoteCallback={setNewNoteCallback}
+              savingNote={savingNote}
+              onAddNote={addNote}
+              notesLoading={notesLoading}
+              notes={notesByLead[lead.id]}
+            />
+          ))
         )}
         {!loading && total > 0 && (
           <div className="pager">
