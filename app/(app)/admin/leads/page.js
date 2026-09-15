@@ -5,6 +5,16 @@ import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 
+const PAGE_SIZE = 50;
+const IMPORT_CHUNK = 500;
+
+// Canonical division labels -- matches the values already on file from the
+// August 2026 College Coaches Database import (see college_leads rows).
+// Used for BOTH the browse filter and the Add/Edit form's Division select,
+// so every lead lands in one of these buckets instead of free-typed
+// variants ("D2" vs "NCAA DII") that would silently fall outside the filter.
+const DIVISIONS = ["FBS", "FCS", "NCAA DII", "NCAA DIII", "NAIA", "JC", "JC-CCCAA"];
+
 const STATUS_OPTIONS = ["not_contacted", "contacted", "interested", "trial", "customer", "not_interested"];
 const STATUS_LABEL = {
   not_contacted: "Not Contacted",
@@ -72,11 +82,34 @@ export default function CollegeLeadsPage() {
   const fileInputRef = useRef(null);
 
   const [leads, setLeads] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(0);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
 
+  // Pipeline totals shown in the stat cards -- counted with head:true
+  // queries against the whole table (not the current filter/page), so they
+  // stay accurate no matter what's being searched or filtered below.
+  const [stats, setStats] = useState({ total: 0, interested: 0, trial: 0, customer: 0 });
+
+  // searchInput updates instantly as Larry types (so the box feels
+  // responsive); search is the debounced value actually sent to Supabase,
+  // so a fast typist doesn't fire a query on every keystroke against 9,000+
+  // rows.
+  const [searchInput, setSearchInput] = useState("");
   const [search, setSearch] = useState("");
+  const searchDebounceRef = useRef(null);
+  function handleSearchInput(v) {
+    setSearchInput(v);
+    if (searchDebounceRef.current) clearTimeout(searchDebounceRef.current);
+    searchDebounceRef.current = setTimeout(() => {
+      setSearch(v);
+      setPage(0);
+    }, 300);
+  }
+
   const [statusFilter, setStatusFilter] = useState("");
+  const [divisionFilter, setDivisionFilter] = useState("");
 
   const [showAdd, setShowAdd] = useState(false);
   const [addForm, setAddForm] = useState(EMPTY_FORM);
@@ -97,22 +130,55 @@ export default function CollegeLeadsPage() {
   const [importError, setImportError] = useState("");
   const [applyingImport, setApplyingImport] = useState(false);
   const [importResult, setImportResult] = useState(null);
+  const [importProgress, setImportProgress] = useState(0);
 
-  const load = useCallback(async () => {
+  // Server-side filtered + paginated fetch -- previously this loaded the
+  // entire table with a plain .select("*") and filtered/counted in the
+  // browser, which silently capped at Supabase's 1000-row default and, even
+  // fixed, would mean shipping and re-rendering 9,000+ leads on every
+  // keystroke. Filtering, counting, and paging all happen in Postgres now;
+  // the browser only ever holds one page (PAGE_SIZE rows) at a time.
+  const loadLeads = useCallback(async () => {
     setLoading(true);
     setLoadError("");
-    const { data, error } = await supabase
-      .from("college_leads")
-      .select("*")
-      .order("updated_at", { ascending: false });
+    let query = supabase.from("college_leads").select("*", { count: "exact" });
+    if (statusFilter) query = query.eq("status", statusFilter);
+    if (divisionFilter) query = query.eq("division", divisionFilter);
+    if (search.trim()) {
+      const q = search.trim().replace(/[%,()]/g, "");
+      query = query.or(
+        `college_name.ilike.%${q}%,coach_first_name.ilike.%${q}%,coach_last_name.ilike.%${q}%,state.ilike.%${q}%,email.ilike.%${q}%`
+      );
+    }
+    query = query.order("updated_at", { ascending: false }).range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
+    const { data, error, count } = await query;
     if (error) setLoadError(error.message);
     setLeads(data || []);
+    setTotal(count || 0);
     setLoading(false);
+  }, [supabase, statusFilter, divisionFilter, search, page]);
+
+  const loadStats = useCallback(async () => {
+    const [{ count: totalCount }, { count: interestedCount }, { count: trialCount }, { count: customerCount }] = await Promise.all([
+      supabase.from("college_leads").select("*", { count: "exact", head: true }),
+      supabase.from("college_leads").select("*", { count: "exact", head: true }).eq("status", "interested"),
+      supabase.from("college_leads").select("*", { count: "exact", head: true }).eq("status", "trial"),
+      supabase.from("college_leads").select("*", { count: "exact", head: true }).eq("status", "customer"),
+    ]);
+    setStats({ total: totalCount || 0, interested: interestedCount || 0, trial: trialCount || 0, customer: customerCount || 0 });
   }, [supabase]);
 
+  const refreshAll = useCallback(async () => {
+    await Promise.all([loadLeads(), loadStats()]);
+  }, [loadLeads, loadStats]);
+
   useEffect(() => {
-    load();
-  }, [load]);
+    loadLeads();
+  }, [loadLeads]);
+
+  useEffect(() => {
+    loadStats();
+  }, [loadStats]);
 
   function field(setter) {
     return (key, val) => setter((prev) => ({ ...prev, [key]: val }));
@@ -136,7 +202,8 @@ export default function CollegeLeadsPage() {
       if (error) throw error;
       setAddForm(EMPTY_FORM);
       setShowAdd(false);
-      await load();
+      setPage(0);
+      await refreshAll();
     } catch (err) {
       setAddError(err.message || "Could not add this lead.");
     } finally {
@@ -179,7 +246,7 @@ export default function CollegeLeadsPage() {
         .eq("id", editingId);
       if (error) throw error;
       setEditingId(null);
-      await load();
+      await refreshAll();
     } catch (err) {
       setEditError(err.message || "Could not save changes.");
     } finally {
@@ -198,7 +265,7 @@ export default function CollegeLeadsPage() {
           updated_at: new Date().toISOString(),
         })
         .eq("id", lead.id);
-      await load();
+      await refreshAll();
     } finally {
       setStatusSavingId(null);
     }
@@ -209,7 +276,7 @@ export default function CollegeLeadsPage() {
     setDeletingId(id);
     try {
       await supabase.from("college_leads").delete().eq("id", id);
-      await load();
+      await refreshAll();
     } finally {
       setDeletingId(null);
     }
@@ -280,28 +347,46 @@ export default function CollegeLeadsPage() {
   async function applyImport() {
     setApplyingImport(true);
     setImportError("");
+    setImportProgress(0);
+    const payload = importRows.map((r) => ({
+      college_name: r.college_name,
+      division: r.division || null,
+      state: r.state || null,
+      coach_first_name: r.coach_first_name || null,
+      coach_last_name: r.coach_last_name || null,
+      title: r.title || null,
+      email: r.email || null,
+      mobile: r.mobile || null,
+      office_phone: r.office_phone || null,
+      notes: r.notes || null,
+      created_by: user.id,
+    }));
+    // Insert in chunks rather than one giant request -- a single insert of
+    // several thousand rows risks hitting a request-size/timeout limit and,
+    // worse, gives no way to tell a full success from a silent partial one.
+    // Chunking means a failure part-way through stops cleanly with an exact
+    // count of what made it in, instead of leaving that ambiguous.
+    let inserted = 0;
     try {
-      const payload = importRows.map((r) => ({
-        college_name: r.college_name,
-        division: r.division || null,
-        state: r.state || null,
-        coach_first_name: r.coach_first_name || null,
-        coach_last_name: r.coach_last_name || null,
-        title: r.title || null,
-        email: r.email || null,
-        mobile: r.mobile || null,
-        office_phone: r.office_phone || null,
-        notes: r.notes || null,
-        created_by: user.id,
-      }));
-      const { error } = await supabase.from("college_leads").insert(payload);
-      if (error) throw error;
-      setImportResult({ count: payload.length });
+      for (let i = 0; i < payload.length; i += IMPORT_CHUNK) {
+        const chunk = payload.slice(i, i + IMPORT_CHUNK);
+        const { error } = await supabase.from("college_leads").insert(chunk);
+        if (error) {
+          throw new Error(
+            `Stopped after ${inserted.toLocaleString()} of ${payload.length.toLocaleString()} rows: ${error.message}`
+          );
+        }
+        inserted += chunk.length;
+        setImportProgress(inserted);
+      }
+      setImportResult({ count: inserted });
       setImportRows([]);
       if (fileInputRef.current) fileInputRef.current.value = "";
-      await load();
+      setPage(0);
+      await refreshAll();
     } catch (err) {
       setImportError(err.message || "Could not import these rows.");
+      if (inserted > 0) await refreshAll();
     } finally {
       setApplyingImport(false);
     }
@@ -315,20 +400,7 @@ export default function CollegeLeadsPage() {
     );
   }
 
-  const filtered = leads.filter((l) => {
-    if (statusFilter && l.status !== statusFilter) return false;
-    if (search.trim()) {
-      const q = search.trim().toLowerCase();
-      const hay = `${l.college_name} ${l.coach_first_name || ""} ${l.coach_last_name || ""} ${l.state || ""}`.toLowerCase();
-      if (!hay.includes(q)) return false;
-    }
-    return true;
-  });
-
-  const counts = STATUS_OPTIONS.reduce((acc, s) => {
-    acc[s] = leads.filter((l) => l.status === s).length;
-    return acc;
-  }, {});
+  const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
   return (
     <div className="view">
@@ -348,19 +420,19 @@ export default function CollegeLeadsPage() {
       <div className="grid grid-4" style={{ marginBottom: 14 }}>
         <div className="card stat-card">
           <div className="label">Total Leads</div>
-          <div className="num">{leads.length}</div>
+          <div className="num">{stats.total.toLocaleString()}</div>
         </div>
         <div className="card stat-card">
           <div className="label">Interested</div>
-          <div className="num">{counts.interested}</div>
+          <div className="num">{stats.interested.toLocaleString()}</div>
         </div>
         <div className="card stat-card">
           <div className="label">Trial</div>
-          <div className="num">{counts.trial}</div>
+          <div className="num">{stats.trial.toLocaleString()}</div>
         </div>
         <div className="card stat-card">
           <div className="label">Customers</div>
-          <div className="num">{counts.customer}</div>
+          <div className="num">{stats.customer.toLocaleString()}</div>
         </div>
       </div>
 
@@ -376,7 +448,12 @@ export default function CollegeLeadsPage() {
               </div>
               <div className="form-field">
                 <label>Division</label>
-                <input value={addForm.division} onChange={(e) => setAddField("division", e.target.value)} placeholder="D2, D3, NAIA, JUCO…" />
+                <select value={addForm.division} onChange={(e) => setAddField("division", e.target.value)}>
+                  <option value="">Select…</option>
+                  {DIVISIONS.map((d) => (
+                    <option key={d} value={d}>{d}</option>
+                  ))}
+                </select>
               </div>
               <div className="form-field">
                 <label>State</label>
@@ -450,7 +527,9 @@ export default function CollegeLeadsPage() {
             </div>
             <div style={{ display: "flex", gap: 8 }}>
               <button className="btn btn-sm btn-gold" onClick={applyImport} disabled={applyingImport}>
-                {applyingImport ? "Importing…" : `Import ${importRows.length} Lead${importRows.length === 1 ? "" : "s"}`}
+                {applyingImport
+                  ? `Importing… ${importProgress.toLocaleString()} / ${importRows.length.toLocaleString()}`
+                  : `Import ${importRows.length.toLocaleString()} Lead${importRows.length === 1 ? "" : "s"}`}
               </button>
               <button className="btn btn-sm" onClick={cancelImport} disabled={applyingImport}>Cancel</button>
             </div>
@@ -461,14 +540,35 @@ export default function CollegeLeadsPage() {
       <div className="filters">
         <div className="field" style={{ minWidth: 220 }}>
           <label>Search</label>
-          <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="College, coach, state…" />
+          <input value={searchInput} onChange={(e) => handleSearchInput(e.target.value)} placeholder="College, coach, state, email…" />
+        </div>
+        <div className="field">
+          <label>Division</label>
+          <select
+            value={divisionFilter}
+            onChange={(e) => {
+              setDivisionFilter(e.target.value);
+              setPage(0);
+            }}
+          >
+            <option value="">All</option>
+            {DIVISIONS.map((d) => (
+              <option key={d} value={d}>{d}</option>
+            ))}
+          </select>
         </div>
         <div className="field">
           <label>Status</label>
-          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+          <select
+            value={statusFilter}
+            onChange={(e) => {
+              setStatusFilter(e.target.value);
+              setPage(0);
+            }}
+          >
             <option value="">All</option>
             {STATUS_OPTIONS.map((s) => (
-              <option key={s} value={s}>{STATUS_LABEL[s]} ({counts[s]})</option>
+              <option key={s} value={s}>{STATUS_LABEL[s]}</option>
             ))}
           </select>
         </div>
@@ -477,13 +577,13 @@ export default function CollegeLeadsPage() {
       {loadError && <div className="notice danger" style={{ marginBottom: 14 }}>{loadError}</div>}
 
       <div className="card">
-        <h3>Leads ({filtered.length})</h3>
+        <h3>Leads ({total.toLocaleString()})</h3>
         {loading ? (
           <div className="empty-state">Loading…</div>
-        ) : filtered.length === 0 ? (
-          <div className="empty-state">No leads match. Add one above or import a CSV.</div>
+        ) : leads.length === 0 ? (
+          <div className="empty-state">No leads match. Add one above, import a CSV, or clear a filter.</div>
         ) : (
-          filtered.map((lead) => {
+          leads.map((lead) => {
             const isEditing = editingId === lead.id;
             return (
               <div className="log-item" key={lead.id} style={{ paddingBottom: 12 }}>
@@ -497,7 +597,12 @@ export default function CollegeLeadsPage() {
                       </div>
                       <div className="form-field" style={{ marginBottom: 0 }}>
                         <label>Division</label>
-                        <input value={editForm.division} onChange={(e) => setEditField("division", e.target.value)} />
+                        <select value={editForm.division} onChange={(e) => setEditField("division", e.target.value)}>
+                          <option value="">Select…</option>
+                          {DIVISIONS.map((d) => (
+                            <option key={d} value={d}>{d}</option>
+                          ))}
+                        </select>
                       </div>
                       <div className="form-field" style={{ marginBottom: 0 }}>
                         <label>State</label>
@@ -578,6 +683,21 @@ export default function CollegeLeadsPage() {
               </div>
             );
           })
+        )}
+        {!loading && total > 0 && (
+          <div className="pager">
+            <span>
+              Showing {total ? page * PAGE_SIZE + 1 : 0}-{Math.min(page * PAGE_SIZE + PAGE_SIZE, total)} of {total.toLocaleString()}
+            </span>
+            <div style={{ display: "flex", gap: 6 }}>
+              <button className="btn btn-sm" disabled={page <= 0} onClick={() => setPage((p) => p - 1)}>
+                Prev
+              </button>
+              <button className="btn btn-sm" disabled={page + 1 >= totalPages} onClick={() => setPage((p) => p + 1)}>
+                Next
+              </button>
+            </div>
+          </div>
         )}
       </div>
     </div>
