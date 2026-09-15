@@ -5,12 +5,14 @@ import {
   fetchPageText,
   searchWebWithGraph,
   findDirectoryPage,
+  findRecentGameEvidence,
   SYSTEM_PROMPT,
   parseModelJson,
   normalizeSuggestion,
   buildSourceBlocks,
   buildSearchQuery,
   MODEL,
+  RESPONSE_MAX_TOKENS,
 } from "@/lib/coachInfoLookup";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
@@ -24,13 +26,15 @@ const REVIEWER_ROLES = ["verifier", "sysadmin"];
 // "Looking…" forever with no error. See the matching client-side fix in
 // the Quick Fix / school profile pages for the other half of this.
 const AI_TIMEOUT_MS = 20000;
-// findDirectoryPage (lib/coachInfoLookup) runs its own search THEN its own
-// fetch, one after the other, so its own worst case is up to double
-// FETCH_TIMEOUT_MS (~16s) even though it runs alongside the other fetches
-// below in the same Promise.all -- that's now the slower branch driving
-// this stage's total, not the roughly-8s the other three branches take on
-// their own. maxDuration bumped accordingly (16s fetch/search stage +
-// AI_TIMEOUT_MS, plus headroom).
+// findDirectoryPage and findRecentGameEvidence (lib/coachInfoLookup) each
+// run their own search THEN their own fetch, one after the other, so each
+// one's own worst case is up to double FETCH_TIMEOUT_MS (~16s) even though
+// both run alongside the other fetches below in the same Promise.all --
+// since Promise.all's total time is set by its SLOWEST branch, not the sum
+// of all of them, having two ~16s branches instead of one doesn't double
+// this stage's total; it's still bounded at roughly 16s, same as before
+// findRecentGameEvidence was added. maxDuration bumped accordingly (16s
+// fetch/search stage + AI_TIMEOUT_MS, plus headroom).
 export const maxDuration = 45;
 
 // AI auto-fill for the Quick Fix panel: instead of a human reading a
@@ -128,7 +132,7 @@ export async function POST(req, { params }) {
     // Clyde A. Erwin HS incident that surfaced this).
     const searchQuery = buildSearchQuery(school);
 
-    const [athleticsFetch, websiteFetch, primarySearch, directoryResult] = await Promise.all([
+    const [athleticsFetch, websiteFetch, primarySearch, directoryResult, recencyResult] = await Promise.all([
       athleticsUrl ? fetchPageText(athleticsUrl) : Promise.resolve(null),
       websiteUrl ? fetchPageText(websiteUrl) : Promise.resolve(null),
       // searchWebWithGraph makes the exact same Serper call searchWeb always
@@ -141,6 +145,11 @@ export async function POST(req, { params }) {
       // directory page -- see findDirectoryPage's own comment for why
       // this exists alongside the primary search above.
       findDirectoryPage({ school, serperKey }),
+      // Third, recency-focused search for the program's current-season
+      // schedule/scores -- see findRecentGameEvidence's own comment. This
+      // is what actually lets the model say "confirmed active by a Week 3
+      // score" instead of just "confidently named on an undated page."
+      findRecentGameEvidence({ school, serperKey }),
     ]);
 
     const { hasUsableContent, userMessage, defaultSource } = buildSourceBlocks({
@@ -151,6 +160,8 @@ export async function POST(req, { params }) {
       searchQuery,
       directoryPage: directoryResult.page,
       directorySearchResults: directoryResult.results,
+      recencyPage: recencyResult.page,
+      recencySearchResults: recencyResult.results,
       knowledgeGraph: primarySearch.knowledgeGraph,
       answerBox: primarySearch.answerBox,
     });
@@ -175,7 +186,7 @@ export async function POST(req, { params }) {
         },
         body: JSON.stringify({
           model: MODEL,
-          max_tokens: 400,
+          max_tokens: RESPONSE_MAX_TOKENS,
           system: SYSTEM_PROMPT,
           messages: [{ role: "user", content: userMessage }],
         }),
