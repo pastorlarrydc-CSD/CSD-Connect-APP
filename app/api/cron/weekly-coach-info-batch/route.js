@@ -1,10 +1,23 @@
 import { NextResponse } from "next/server";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
 import { withProtocol } from "@/lib/schoolRecheck";
-import { fetchPageText, searchWebWithGraph, findDirectoryPage, buildSourceBlocks, buildSearchQuery, SYSTEM_PROMPT, MODEL } from "@/lib/coachInfoLookup";
+import {
+  fetchPageText,
+  searchWebWithGraph,
+  findDirectoryPage,
+  findRecentGameEvidence,
+  buildSourceBlocks,
+  buildSearchQuery,
+  SYSTEM_PROMPT,
+  MODEL,
+  RESPONSE_MAX_TOKENS,
+} from "@/lib/coachInfoLookup";
 
 export const maxDuration = 60;
-const MAX_TOKENS = 400; // matches app/api/admin/batch-coach-info/[runId]/submit's own constant
+// RESPONSE_MAX_TOKENS now lives in lib/coachInfoLookup, imported above --
+// this used to be a locally hardcoded `const MAX_TOKENS = 400` here AND in
+// app/api/admin/batch-coach-info/[runId]/submit, with nothing enforcing the
+// two stayed equal. Centralizing it removes that drift risk entirely.
 
 // Weekly automated kickoff for Batch Coach-Info Discovery -- the fourth and
 // last of the four discovery tools to get this treatment (Athletics,
@@ -163,7 +176,7 @@ export async function GET(req) {
           // the open query instead.
           const searchQuery = buildSearchQuery(school, { contactOnly: true });
 
-          const [athleticsFetch, websiteFetch, primarySearch, directoryResult] = await Promise.all([
+          const [athleticsFetch, websiteFetch, primarySearch, directoryResult, recencyResult] = await Promise.all([
             athleticsUrl ? fetchPageText(athleticsUrl) : Promise.resolve(null),
             websiteUrl ? fetchPageText(websiteUrl) : Promise.resolve(null),
             // searchWebWithGraph makes the exact same Serper call searchWeb
@@ -176,6 +189,13 @@ export async function GET(req) {
             // directory page -- see findDirectoryPage's own comment for why
             // this exists alongside the primary search above.
             findDirectoryPage({ school, serperKey }),
+            // Third, recency-focused search for the program's current-season
+            // schedule/scores -- see findRecentGameEvidence's own comment.
+            // Kept in this weekly cron too so a batch-collected suggestion
+            // carries the same recency evidence a live button click would
+            // have found -- the whole point of sharing lib/coachInfoLookup
+            // is that these never drift apart.
+            findRecentGameEvidence({ school, serperKey }),
           ]);
 
           const { hasUsableContent, userMessage, defaultSource } = buildSourceBlocks({
@@ -186,6 +206,8 @@ export async function GET(req) {
             searchQuery,
             directoryPage: directoryResult.page,
             directorySearchResults: directoryResult.results,
+            recencyPage: recencyResult.page,
+            recencySearchResults: recencyResult.results,
             knowledgeGraph: primarySearch.knowledgeGraph,
             answerBox: primarySearch.answerBox,
           });
@@ -234,7 +256,7 @@ export async function GET(req) {
 
     const requests = readyItems.map((item) => ({
       custom_id: `item-${item.id}`,
-      params: { model: MODEL, max_tokens: MAX_TOKENS, system: SYSTEM_PROMPT, messages: [{ role: "user", content: item.source_text }] },
+      params: { model: MODEL, max_tokens: RESPONSE_MAX_TOKENS, system: SYSTEM_PROMPT, messages: [{ role: "user", content: item.source_text }] },
     }));
 
     const batchRes = await fetch("https://api.anthropic.com/v1/messages/batches", {
