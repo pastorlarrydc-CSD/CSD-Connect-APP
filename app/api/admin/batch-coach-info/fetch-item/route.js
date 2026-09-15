@@ -1,16 +1,17 @@
 import { NextResponse } from "next/server";
 import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
 import { withProtocol } from "@/lib/schoolRecheck";
-import { fetchPageText, searchWebWithGraph, findDirectoryPage, buildSourceBlocks, buildSearchQuery } from "@/lib/coachInfoLookup";
+import { fetchPageText, searchWebWithGraph, findDirectoryPage, findRecentGameEvidence, buildSourceBlocks, buildSearchQuery } from "@/lib/coachInfoLookup";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
-// findDirectoryPage (lib/coachInfoLookup) below runs its own search THEN
-// its own fetch, one after the other -- up to double FETCH_TIMEOUT_MS
-// (~16s) even though it runs alongside the other fetches in the same
-// Promise.all. No maxDuration was set here before (this route previously
-// only did three ~8s-bounded calls in parallel); set explicitly now so a
-// slow directory lookup can't run into whatever shorter default this
-// project's plan would otherwise apply.
+// findDirectoryPage and findRecentGameEvidence (lib/coachInfoLookup) below
+// each run their own search THEN their own fetch, one after the other --
+// each up to double FETCH_TIMEOUT_MS (~16s) even though both run alongside
+// the other fetches in the same Promise.all. Promise.all's total time is
+// set by its slowest branch, not the sum, so having two ~16s branches
+// instead of one doesn't double this stage's total -- still bounded at
+// roughly 16s. maxDuration kept at 30 for the same headroom reasoning as
+// before findRecentGameEvidence was added.
 export const maxDuration = 30;
 
 // Prep stage of the overnight Coach-Info Batch API job (see the spec doc in
@@ -89,7 +90,7 @@ export async function POST(req) {
     // the open, identity-confirming query.
     const searchQuery = buildSearchQuery(school, { contactOnly });
 
-    const [athleticsFetch, websiteFetch, primarySearch, directoryResult] = await Promise.all([
+    const [athleticsFetch, websiteFetch, primarySearch, directoryResult, recencyResult] = await Promise.all([
       athleticsUrl ? fetchPageText(athleticsUrl) : Promise.resolve(null),
       websiteUrl ? fetchPageText(websiteUrl) : Promise.resolve(null),
       // searchWebWithGraph makes the exact same Serper call searchWeb always
@@ -102,6 +103,13 @@ export async function POST(req) {
       // directory page -- see findDirectoryPage's own comment for why
       // this exists alongside the primary search above.
       findDirectoryPage({ school, serperKey }),
+      // Third, recency-focused search for the program's current-season
+      // schedule/scores -- see findRecentGameEvidence's own comment. Kept
+      // in the batch prep path too so a batch-collected suggestion carries
+      // the same recency evidence a live button click would have found --
+      // the whole point of sharing lib/coachInfoLookup is that these never
+      // drift apart.
+      findRecentGameEvidence({ school, serperKey }),
     ]);
 
     const { hasUsableContent, userMessage, defaultSource } = buildSourceBlocks({
@@ -112,6 +120,8 @@ export async function POST(req) {
       searchQuery,
       directoryPage: directoryResult.page,
       directorySearchResults: directoryResult.results,
+      recencyPage: recencyResult.page,
+      recencySearchResults: recencyResult.results,
       knowledgeGraph: primarySearch.knowledgeGraph,
       answerBox: primarySearch.answerBox,
     });
