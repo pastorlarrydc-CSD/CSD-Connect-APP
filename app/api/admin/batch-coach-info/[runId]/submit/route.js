@@ -1,9 +1,12 @@
 import { NextResponse } from "next/server";
 import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
-import { SYSTEM_PROMPT, MODEL } from "@/lib/coachInfoLookup";
+import { SYSTEM_PROMPT, MODEL, RESPONSE_MAX_TOKENS } from "@/lib/coachInfoLookup";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
-const MAX_TOKENS = 400;
+// RESPONSE_MAX_TOKENS now lives in lib/coachInfoLookup, imported above --
+// this used to be a locally hardcoded `const MAX_TOKENS = 400` here AND in
+// app/api/cron/weekly-coach-info-batch, with nothing enforcing the two
+// stayed equal. Centralizing it removes that drift risk entirely.
 
 // Submit stage of the overnight Coach-Info Batch API job. Bundles every
 // item in this run that has usable fetched source text (fetch_status =
@@ -66,7 +69,7 @@ export async function POST(req, { params }) {
       custom_id: `item-${item.id}`,
       params: {
         model: MODEL,
-        max_tokens: MAX_TOKENS,
+        max_tokens: RESPONSE_MAX_TOKENS,
         system: SYSTEM_PROMPT,
         messages: [{ role: "user", content: item.source_text }],
       },
