@@ -140,6 +140,12 @@ const BADGE_STYLE = {
   later: { background: "#eef0f4", color: "#697386" },
 };
 
+const CONFIDENCE_STYLE = {
+  high: { background: "#dff3e6", color: "#1d7a4c" },
+  medium: { background: "#fff1c2", color: "#8a6400" },
+  low: { background: "#fbe4e1", color: "#b3312c" },
+};
+
 // Whole days between a YYYY-MM-DD date string and today -- same
 // plain-string-math approach as callbackBadge, to avoid timezone drift.
 function daysSince(dateStr) {
@@ -174,6 +180,21 @@ function fmtPhone(v) {
   if (!v) return "";
   const digits = String(v).replace(/\D/g, "");
   return digits.length === 10 ? `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}` : v;
+}
+
+// The AI coach-info lookup (web search + an Anthropic call server-side) can
+// legitimately take a while -- this keeps the browser from waiting forever
+// if something upstream stalls, same pattern/timeout as the school profile
+// page's own AI lookup buttons.
+const DISCOVERY_FETCH_TIMEOUT_MS = 40000;
+async function fetchWithTimeout(url, options = {}, timeoutMs = DISCOVERY_FETCH_TIMEOUT_MS) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
 }
 
 // Generic checkbox-pill multi-select. Used both for the top-of-page filter
@@ -264,6 +285,13 @@ function LeadRow({
   onAddNote,
   notesLoading,
   notes,
+  onLookupCoachInfo,
+  coachLookupLoading,
+  coachLookupError,
+  coachLookupSuggestion,
+  onApplyCoachField,
+  onApplyAllCoachSuggestion,
+  onDismissCoachSuggestion,
 }) {
   const badge = callbackBadge(lead.next_callback_at);
   return (
@@ -271,6 +299,62 @@ function LeadRow({
       {isEditing ? (
         <form onSubmit={onSaveEdit} style={{ background: "#f7f8fa", border: "1px solid #dde1e7", borderRadius: 8, padding: 10 }}>
           {editError && <div className="notice danger" style={{ marginBottom: 8 }}>{editError}</div>}
+
+          <div style={{ marginBottom: 10 }}>
+            <button type="button" className="btn btn-sm" onClick={onLookupCoachInfo} disabled={coachLookupLoading}>
+              {coachLookupLoading ? "Searching…" : "🔎 Find Coach Info (AI)"}
+            </button>
+            {coachLookupError && <div className="notice danger" style={{ marginTop: 8 }}>{coachLookupError}</div>}
+            {coachLookupSuggestion && (
+              <div style={{ marginTop: 8, background: "#fff", border: "1px solid #dde1e7", borderRadius: 8, padding: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, marginBottom: 6 }}>
+                  <span
+                    style={{
+                      fontSize: 11,
+                      fontWeight: 700,
+                      padding: "2px 8px",
+                      borderRadius: 20,
+                      ...CONFIDENCE_STYLE[coachLookupSuggestion.confidence],
+                    }}
+                  >
+                    {coachLookupSuggestion.confidence.toUpperCase()} CONFIDENCE
+                  </span>
+                  <button type="button" className="btn btn-sm" onClick={onDismissCoachSuggestion}>Dismiss</button>
+                </div>
+                {[
+                  ["Name", [coachLookupSuggestion.coach_first_name, coachLookupSuggestion.coach_last_name].filter(Boolean).join(" "), () => {
+                    onApplyCoachField("coach_first_name", coachLookupSuggestion.coach_first_name);
+                    onApplyCoachField("coach_last_name", coachLookupSuggestion.coach_last_name);
+                  }],
+                  ["Title", coachLookupSuggestion.title, () => onApplyCoachField("title", coachLookupSuggestion.title)],
+                  [
+                    "Email",
+                    coachLookupSuggestion.email + (coachLookupSuggestion.email_estimated ? " (estimated)" : ""),
+                    () => onApplyCoachField("email", coachLookupSuggestion.email),
+                  ],
+                  ["Mobile", fmtPhone(coachLookupSuggestion.mobile), () => onApplyCoachField("mobile", coachLookupSuggestion.mobile)],
+                  ["Office", fmtPhone(coachLookupSuggestion.office_phone), () => onApplyCoachField("office_phone", coachLookupSuggestion.office_phone)],
+                ]
+                  .filter(([, value]) => value)
+                  .map(([label, value, apply]) => (
+                    <div key={label} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, fontSize: 12.5, padding: "4px 0", borderBottom: "1px solid #f0f1f4" }}>
+                      <span><strong>{label}:</strong> {value}</span>
+                      <button type="button" className="btn btn-sm" onClick={apply}>Use</button>
+                    </div>
+                  ))}
+                {coachLookupSuggestion.notes && (
+                  <div style={{ fontSize: 11.5, color: "#697386", marginTop: 6 }}>
+                    {coachLookupSuggestion.source ? `Source: ${coachLookupSuggestion.source}. ` : ""}
+                    {coachLookupSuggestion.notes}
+                  </div>
+                )}
+                <button type="button" className="btn btn-sm btn-gold" style={{ marginTop: 8 }} onClick={onApplyAllCoachSuggestion}>
+                  Apply All
+                </button>
+              </div>
+            )}
+          </div>
+
           <div className="grid grid-2" style={{ marginBottom: 8 }}>
             <div className="form-field" style={{ marginBottom: 0 }}>
               <label>College / Program</label>
@@ -558,6 +642,13 @@ export default function CollegeLeadsPage() {
   const [editForm, setEditForm] = useState(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
   const [editError, setEditError] = useState("");
+
+  // AI "Find Coach Info" lookup -- scoped to whichever lead is currently
+  // being edited (only one edit form is ever open at a time), cleared
+  // whenever that changes so a suggestion never lingers for the wrong lead.
+  const [coachLookupLoading, setCoachLookupLoading] = useState(false);
+  const [coachLookupError, setCoachLookupError] = useState("");
+  const [coachLookupSuggestion, setCoachLookupSuggestion] = useState(null);
 
   const [deletingId, setDeletingId] = useState(null);
   const [statusSavingId, setStatusSavingId] = useState(null);
@@ -853,6 +944,8 @@ export default function CollegeLeadsPage() {
   function startEdit(lead) {
     setEditingId(lead.id);
     setEditError("");
+    setCoachLookupSuggestion(null);
+    setCoachLookupError("");
     setEditForm({
       college_name: lead.college_name || "",
       division: lead.division || "",
@@ -888,12 +981,70 @@ export default function CollegeLeadsPage() {
         .eq("id", editingId);
       if (error) throw error;
       setEditingId(null);
+      setCoachLookupSuggestion(null);
+      setCoachLookupError("");
       await refreshAll();
     } catch (err) {
       setEditError(err.message || "Could not save changes.");
     } finally {
       setSaving(false);
     }
+  }
+
+  function cancelEdit() {
+    setEditingId(null);
+    setCoachLookupSuggestion(null);
+    setCoachLookupError("");
+  }
+
+  // "Find Coach Info (AI)" -- looks up whichever lead is currently being
+  // edited via app/api/leads/[id]/discover-coach-info (web search + an
+  // Anthropic call server-side), same non-authoritative contract as the
+  // school profile page's AI lookups: this only ever returns a suggestion
+  // for the reviewer to accept field-by-field or all at once, never writes
+  // to college_leads on its own.
+  async function lookupCoachInfo() {
+    if (!editingId) return;
+    setCoachLookupError("");
+    setCoachLookupSuggestion(null);
+    setCoachLookupLoading(true);
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const res = await fetchWithTimeout(`/api/leads/${editingId}/discover-coach-info`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session?.access_token}` },
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || "Could not look up coach info.");
+      setCoachLookupSuggestion(json);
+    } catch (err) {
+      setCoachLookupError(err.name === "AbortError" ? "The lookup took too long to respond. Please try again." : err.message || "Could not look up coach info right now.");
+    } finally {
+      setCoachLookupLoading(false);
+    }
+  }
+
+  function applyCoachField(field, value) {
+    if (!value) return;
+    setEditField(field, value);
+  }
+
+  function applyAllCoachSuggestion() {
+    if (!coachLookupSuggestion) return;
+    const s = coachLookupSuggestion;
+    if (s.coach_first_name) setEditField("coach_first_name", s.coach_first_name);
+    if (s.coach_last_name) setEditField("coach_last_name", s.coach_last_name);
+    if (s.title) setEditField("title", s.title);
+    if (s.email) setEditField("email", s.email);
+    if (s.mobile) setEditField("mobile", s.mobile);
+    if (s.office_phone) setEditField("office_phone", s.office_phone);
+  }
+
+  function dismissCoachSuggestion() {
+    setCoachLookupSuggestion(null);
+    setCoachLookupError("");
   }
 
   async function updateStatus(lead, newStatus) {
@@ -1184,7 +1335,7 @@ export default function CollegeLeadsPage() {
                 editError={editError}
                 saving={saving}
                 onSaveEdit={saveEdit}
-                onCancelEdit={() => setEditingId(null)}
+                onCancelEdit={cancelEdit}
                 statusSavingId={statusSavingId}
                 onUpdateStatus={updateStatus}
                 onToggleNotes={toggleNotes}
@@ -1200,6 +1351,13 @@ export default function CollegeLeadsPage() {
                 onAddNote={addNote}
                 notesLoading={notesLoading}
                 notes={notesByLead[lead.id]}
+                onLookupCoachInfo={lookupCoachInfo}
+                coachLookupLoading={coachLookupLoading}
+                coachLookupError={coachLookupError}
+                coachLookupSuggestion={coachLookupSuggestion}
+                onApplyCoachField={applyCoachField}
+                onApplyAllCoachSuggestion={applyAllCoachSuggestion}
+                onDismissCoachSuggestion={dismissCoachSuggestion}
               />
             ))}
             {dueCounts.overdue + dueCounts.today > dueItems.length && (
@@ -1501,7 +1659,7 @@ export default function CollegeLeadsPage() {
               editError={editError}
               saving={saving}
               onSaveEdit={saveEdit}
-              onCancelEdit={() => setEditingId(null)}
+              onCancelEdit={cancelEdit}
               statusSavingId={statusSavingId}
               onUpdateStatus={updateStatus}
               onToggleNotes={toggleNotes}
@@ -1517,6 +1675,13 @@ export default function CollegeLeadsPage() {
               onAddNote={addNote}
               notesLoading={notesLoading}
               notes={notesByLead[lead.id]}
+              onLookupCoachInfo={lookupCoachInfo}
+              coachLookupLoading={coachLookupLoading}
+              coachLookupError={coachLookupError}
+              coachLookupSuggestion={coachLookupSuggestion}
+              onApplyCoachField={applyCoachField}
+              onApplyAllCoachSuggestion={applyAllCoachSuggestion}
+              onDismissCoachSuggestion={dismissCoachSuggestion}
             />
           ))
         )}
