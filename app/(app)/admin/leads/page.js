@@ -60,6 +60,18 @@ const SORT_OPTIONS = [
   { value: "college_asc", label: "College Name (A-Z)" },
   { value: "state_asc", label: "State" },
   { value: "callback_asc", label: "Next Callback" },
+  { value: "stale_first", label: "Longest Since Contact" },
+];
+
+// "30+ days" and "60+ days" etc. also pull in leads that have NEVER been
+// contacted (last_contacted_at is null) -- those are at least as stale as
+// any dated one, so they belong in every one of these buckets.
+const CONTACT_RECENCY_OPTIONS = [
+  { value: "", label: "All" },
+  { value: "never", label: "Never Contacted" },
+  { value: "30", label: "30+ Days Since Contact" },
+  { value: "60", label: "60+ Days Since Contact" },
+  { value: "90", label: "90+ Days Since Contact" },
 ];
 
 const STATUS_OPTIONS = ["not_contacted", "contacted", "interested", "trial", "customer", "not_interested"];
@@ -127,6 +139,13 @@ const BADGE_STYLE = {
   week: { background: "#e3ecff", color: "#2246b3" },
   later: { background: "#eef0f4", color: "#697386" },
 };
+
+// Whole days between a YYYY-MM-DD date string and today -- same
+// plain-string-math approach as callbackBadge, to avoid timezone drift.
+function daysSince(dateStr) {
+  if (!dateStr) return null;
+  return Math.round((new Date(todayISO()) - new Date(dateStr)) / 86400000);
+}
 
 // Header synonyms for CSV import -- keeps this forgiving of whatever
 // column names a real spreadsheet of leads happens to use.
@@ -356,7 +375,19 @@ function LeadRow({
                 {!lead.email && !lead.mobile && !lead.office_phone && <span>No contact info on file</span>}
               </div>
               {lead.notes && <div style={{ fontSize: 12, color: "#3c4658", marginTop: 4 }}>📝 {lead.notes}</div>}
-              {lead.last_contacted_at && <div style={{ fontSize: 11, color: "#697386", marginTop: 2 }}>Last contacted {lead.last_contacted_at}</div>}
+              {lead.last_contacted_at ? (
+                (() => {
+                  const d = daysSince(lead.last_contacted_at);
+                  const stale = d >= 60;
+                  return (
+                    <div style={{ fontSize: 11, color: stale ? "#b3312c" : "#697386", fontWeight: stale ? 700 : 400, marginTop: 2 }}>
+                      Last contacted {fmtDate(lead.last_contacted_at)} ({d}d ago){stale ? " — going cold" : ""}
+                    </div>
+                  );
+                })()
+              ) : (
+                <div style={{ fontSize: 11, color: "#b3312c", fontWeight: 700, marginTop: 2 }}>Never contacted</div>
+              )}
             </div>
             <div style={{ display: "flex", gap: 6, alignItems: "center", flexShrink: 0 }}>
               <select
@@ -463,8 +494,23 @@ export default function CollegeLeadsPage() {
   const [roleFilter, setRoleFilter] = useState("");
   const [positionFilter, setPositionFilter] = useState("");
   const [stateFilter, setStateFilter] = useState("");
+  const [hasEmailFilter, setHasEmailFilter] = useState(false);
+  const [hasPhoneFilter, setHasPhoneFilter] = useState(false);
+  const [recencyFilter, setRecencyFilter] = useState(""); // "" | "never" | "30" | "60" | "90"
   const [sortBy, setSortBy] = useState("updated_desc");
   const [callbackFilter, setCallbackFilter] = useState(""); // "" | "due" | "week"
+
+  const [exporting, setExporting] = useState(false);
+  const [exportError, setExportError] = useState("");
+
+  // Saved filter presets -- lets the team jump straight back to a named
+  // combination (e.g. "TX Recruiting Coordinators, not yet contacted")
+  // instead of re-picking every dropdown. Backed by lead_filter_presets.
+  const [presets, setPresets] = useState([]);
+  const [selectedPresetId, setSelectedPresetId] = useState("");
+  const [presetName, setPresetName] = useState("");
+  const [savingPreset, setSavingPreset] = useState(false);
+  const [presetError, setPresetError] = useState("");
 
   // Due-for-a-callback panel -- counts for the pills, and the actual
   // overdue/today leads shown inline (capped) so the most urgent calls are
@@ -504,6 +550,44 @@ export default function CollegeLeadsPage() {
   const [importResult, setImportResult] = useState(null);
   const [importProgress, setImportProgress] = useState(0);
 
+  // Applies every filter/search condition shared between the on-screen list
+  // and the "Export Filtered (CSV)" button, so the two can never drift out
+  // of sync with each other. Sorting and pagination are added separately by
+  // each caller since export doesn't page.
+  const applyLeadsFilters = useCallback(
+    (query) => {
+      if (statusFilter) query = query.eq("status", statusFilter);
+      if (divisionFilter) query = query.eq("division", divisionFilter);
+      if (roleFilter) query = query.eq("role_category", roleFilter);
+      if (positionFilter) query = query.contains("position_tags", [positionFilter]);
+      if (stateFilter) query = query.eq("state", stateFilter);
+      if (hasEmailFilter) query = query.not("email", "is", null);
+      if (hasPhoneFilter) query = query.or("mobile.not.is.null,office_phone.not.is.null");
+      if (recencyFilter === "never") {
+        query = query.is("last_contacted_at", null);
+      } else if (recencyFilter) {
+        const cutoff = new Date();
+        cutoff.setDate(cutoff.getDate() - parseInt(recencyFilter, 10));
+        const cutoffISO = cutoff.toISOString().slice(0, 10);
+        query = query.or(`last_contacted_at.is.null,last_contacted_at.lte.${cutoffISO}`);
+      }
+      if (callbackFilter === "due") query = query.lte("next_callback_at", todayISO());
+      else if (callbackFilter === "week") {
+        const weekOut = new Date();
+        weekOut.setDate(weekOut.getDate() + 7);
+        query = query.not("next_callback_at", "is", null).lte("next_callback_at", weekOut.toISOString().slice(0, 10));
+      }
+      if (search.trim()) {
+        const q = search.trim().replace(/[%,()]/g, "");
+        query = query.or(
+          `college_name.ilike.%${q}%,coach_first_name.ilike.%${q}%,coach_last_name.ilike.%${q}%,state.ilike.%${q}%,email.ilike.%${q}%,title.ilike.%${q}%`
+        );
+      }
+      return query;
+    },
+    [statusFilter, divisionFilter, roleFilter, positionFilter, stateFilter, hasEmailFilter, hasPhoneFilter, recencyFilter, callbackFilter, search]
+  );
+
   // Server-side filtered + paginated fetch -- previously this loaded the
   // entire table with a plain .select("*") and filtered/counted in the
   // browser, which silently capped at Supabase's 1000-row default and, even
@@ -514,23 +598,7 @@ export default function CollegeLeadsPage() {
     setLoading(true);
     setLoadError("");
     let query = supabase.from("college_leads").select("*", { count: "exact" });
-    if (statusFilter) query = query.eq("status", statusFilter);
-    if (divisionFilter) query = query.eq("division", divisionFilter);
-    if (roleFilter) query = query.eq("role_category", roleFilter);
-    if (positionFilter) query = query.contains("position_tags", [positionFilter]);
-    if (stateFilter) query = query.eq("state", stateFilter);
-    if (callbackFilter === "due") query = query.lte("next_callback_at", todayISO());
-    else if (callbackFilter === "week") {
-      const weekOut = new Date();
-      weekOut.setDate(weekOut.getDate() + 7);
-      query = query.not("next_callback_at", "is", null).lte("next_callback_at", weekOut.toISOString().slice(0, 10));
-    }
-    if (search.trim()) {
-      const q = search.trim().replace(/[%,()]/g, "");
-      query = query.or(
-        `college_name.ilike.%${q}%,coach_first_name.ilike.%${q}%,coach_last_name.ilike.%${q}%,state.ilike.%${q}%,email.ilike.%${q}%,title.ilike.%${q}%`
-      );
-    }
+    query = applyLeadsFilters(query);
     // A callback filter forces soonest-due-first sort (that's the whole
     // point of that view); otherwise honor whatever the Sort dropdown says.
     if (callbackFilter) {
@@ -541,6 +609,10 @@ export default function CollegeLeadsPage() {
       query = query.order("state", { ascending: true, nullsFirst: false });
     } else if (sortBy === "callback_asc") {
       query = query.order("next_callback_at", { ascending: true, nullsFirst: false });
+    } else if (sortBy === "stale_first") {
+      // Nulls (never contacted) sort first -- those are at least as
+      // overdue for a call as the oldest dated one.
+      query = query.order("last_contacted_at", { ascending: true, nullsFirst: true });
     } else {
       query = query.order("updated_at", { ascending: false });
     }
@@ -550,7 +622,7 @@ export default function CollegeLeadsPage() {
     setLeads(data || []);
     setTotal(count || 0);
     setLoading(false);
-  }, [supabase, statusFilter, divisionFilter, roleFilter, positionFilter, stateFilter, sortBy, callbackFilter, search, page]);
+  }, [supabase, applyLeadsFilters, sortBy, callbackFilter, page]);
 
   const loadStats = useCallback(async () => {
     const [{ count: totalCount }, { count: interestedCount }, { count: trialCount }, { count: customerCount }] = await Promise.all([
@@ -597,6 +669,122 @@ export default function CollegeLeadsPage() {
   useEffect(() => {
     loadDue();
   }, [loadDue]);
+
+  const loadPresets = useCallback(async () => {
+    const { data } = await supabase.from("lead_filter_presets").select("*").order("name", { ascending: true });
+    setPresets(data || []);
+  }, [supabase]);
+
+  useEffect(() => {
+    loadPresets();
+  }, [loadPresets]);
+
+  // Downloads every lead matching the CURRENT filters/search (not just the
+  // visible page) as a CSV, paging through in chunks of 1000 client-side --
+  // same pattern as the national database export on the Search page. Reuses
+  // applyLeadsFilters so this can never fall out of sync with what's shown
+  // on screen.
+  async function exportFilteredCsv() {
+    setExportError("");
+    setExporting(true);
+    try {
+      const rows = [];
+      let from = 0;
+      for (;;) {
+        let query = supabase.from("college_leads").select("*");
+        query = applyLeadsFilters(query);
+        query = query.order("college_name", { ascending: true }).range(from, from + 999);
+        const { data, error } = await query;
+        if (error) throw error;
+        rows.push(...(data || []));
+        if (!data || data.length < 1000) break;
+        from += 1000;
+      }
+      if (!rows.length) {
+        setExportError("No leads match the current filters.");
+        return;
+      }
+      const csv = Papa.unparse({
+        fields: [
+          "college_name", "division", "state", "role_category", "position_tags", "coach_first_name",
+          "coach_last_name", "title", "email", "mobile", "office_phone", "status", "next_callback_at",
+          "last_contacted_at", "notes",
+        ],
+        data: rows.map((r) => [
+          r.college_name, r.division, r.state, r.role_category, (r.position_tags || []).join("; "),
+          r.coach_first_name, r.coach_last_name, r.title, r.email, r.mobile, r.office_phone,
+          STATUS_LABEL[r.status] || r.status, r.next_callback_at || "", r.last_contacted_at || "", r.notes || "",
+        ]),
+      });
+      const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `csd-college-leads-${todayISO()}.csv`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      setExportError(err.message || "Could not export these leads.");
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  // Captures every filter/sort/search control as one JSON blob -- callback
+  // panel state and page number are deliberately left out since those are
+  // transient view toggles, not part of "the filter combination."
+  async function savePreset() {
+    setPresetError("");
+    if (!presetName.trim()) return;
+    setSavingPreset(true);
+    try {
+      const filters = {
+        search, statusFilter, divisionFilter, roleFilter, positionFilter, stateFilter,
+        hasEmailFilter, hasPhoneFilter, recencyFilter, sortBy,
+      };
+      const { error } = await supabase.from("lead_filter_presets").insert({
+        name: presetName.trim(),
+        filters,
+        created_by: user.id,
+      });
+      if (error) throw error;
+      setPresetName("");
+      await loadPresets();
+    } catch (err) {
+      setPresetError(err.message || "Could not save this filter.");
+    } finally {
+      setSavingPreset(false);
+    }
+  }
+
+  function applyPreset(id) {
+    setSelectedPresetId(id);
+    if (!id) return;
+    const preset = presets.find((p) => p.id === id);
+    if (!preset) return;
+    const f = preset.filters || {};
+    setSearchInput(f.search || "");
+    setSearch(f.search || "");
+    setStatusFilter(f.statusFilter || "");
+    setDivisionFilter(f.divisionFilter || "");
+    setRoleFilter(f.roleFilter || "");
+    setPositionFilter(f.positionFilter || "");
+    setStateFilter(f.stateFilter || "");
+    setHasEmailFilter(!!f.hasEmailFilter);
+    setHasPhoneFilter(!!f.hasPhoneFilter);
+    setRecencyFilter(f.recencyFilter || "");
+    setSortBy(f.sortBy || "updated_desc");
+    setPage(0);
+  }
+
+  async function deletePreset(id) {
+    if (!confirm("Delete this saved filter?")) return;
+    await supabase.from("lead_filter_presets").delete().eq("id", id);
+    if (selectedPresetId === id) setSelectedPresetId("");
+    await loadPresets();
+  }
 
   function field(setter) {
     return (key, val) => setter((prev) => ({ ...prev, [key]: val }));
@@ -1115,6 +1303,34 @@ export default function CollegeLeadsPage() {
         )}
       </div>
 
+      <div className="card" style={{ marginBottom: 14 }}>
+        <h3 style={{ marginTop: 0 }}>Saved Filters</h3>
+        {presetError && <div className="notice danger" style={{ marginBottom: 10 }}>{presetError}</div>}
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "flex-end" }}>
+          <div className="field" style={{ minWidth: 220 }}>
+            <label>Apply a saved filter</label>
+            <select value={selectedPresetId} onChange={(e) => applyPreset(e.target.value)}>
+              <option value="">Choose…</option>
+              {presets.map((p) => (
+                <option key={p.id} value={p.id}>{p.name}</option>
+              ))}
+            </select>
+          </div>
+          {selectedPresetId && (
+            <button type="button" className="btn btn-sm btn-danger" onClick={() => deletePreset(selectedPresetId)}>
+              Delete Selected
+            </button>
+          )}
+          <div className="field" style={{ minWidth: 220, flex: "1 1 220px" }}>
+            <label>Save the filters below as…</label>
+            <input value={presetName} onChange={(e) => setPresetName(e.target.value)} placeholder="e.g. TX Recruiting Coordinators" />
+          </div>
+          <button type="button" className="btn btn-sm btn-gold" onClick={savePreset} disabled={savingPreset || !presetName.trim()}>
+            {savingPreset ? "Saving…" : "Save Current Filters"}
+          </button>
+        </div>
+      </div>
+
       <div className="filters">
         <div className="field" style={{ minWidth: 220 }}>
           <label>Search</label>
@@ -1196,6 +1412,20 @@ export default function CollegeLeadsPage() {
           </select>
         </div>
         <div className="field">
+          <label>Contact Recency</label>
+          <select
+            value={recencyFilter}
+            onChange={(e) => {
+              setRecencyFilter(e.target.value);
+              setPage(0);
+            }}
+          >
+            {CONTACT_RECENCY_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>{o.label}</option>
+            ))}
+          </select>
+        </div>
+        <div className="field">
           <label>Sort</label>
           <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} disabled={!!callbackFilter} title={callbackFilter ? "Sort is set to soonest-due while a callback filter is active" : undefined}>
             {SORT_OPTIONS.map((o) => (
@@ -1203,12 +1433,46 @@ export default function CollegeLeadsPage() {
             ))}
           </select>
         </div>
+        <div className="field">
+          <label>&nbsp;</label>
+          <label style={{ flexDirection: "row", gap: 5, textTransform: "none", fontWeight: 600, color: "#131a2b", alignItems: "center", display: "flex" }}>
+            <input
+              type="checkbox"
+              checked={hasEmailFilter}
+              onChange={(e) => {
+                setHasEmailFilter(e.target.checked);
+                setPage(0);
+              }}
+            />
+            Has email
+          </label>
+        </div>
+        <div className="field">
+          <label>&nbsp;</label>
+          <label style={{ flexDirection: "row", gap: 5, textTransform: "none", fontWeight: 600, color: "#131a2b", alignItems: "center", display: "flex" }}>
+            <input
+              type="checkbox"
+              checked={hasPhoneFilter}
+              onChange={(e) => {
+                setHasPhoneFilter(e.target.checked);
+                setPage(0);
+              }}
+            />
+            Has phone
+          </label>
+        </div>
       </div>
 
       {loadError && <div className="notice danger" style={{ marginBottom: 14 }}>{loadError}</div>}
 
       <div className="card">
-        <h3>Leads ({total.toLocaleString()})</h3>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+          <h3 style={{ margin: 0 }}>Leads ({total.toLocaleString()})</h3>
+          <button className="btn btn-sm" onClick={exportFilteredCsv} disabled={exporting}>
+            {exporting ? "Exporting…" : "Export Filtered (CSV)"}
+          </button>
+        </div>
+        {exportError && <div className="notice danger" style={{ marginTop: 10 }}>{exportError}</div>}
         {loading ? (
           <div className="empty-state">Loading…</div>
         ) : leads.length === 0 ? (
