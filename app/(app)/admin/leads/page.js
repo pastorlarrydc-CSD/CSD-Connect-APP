@@ -15,6 +15,53 @@ const IMPORT_CHUNK = 500;
 // variants ("D2" vs "NCAA DII") that would silently fall outside the filter.
 const DIVISIONS = ["FBS", "FCS", "NCAA DII", "NCAA DIII", "NAIA", "JC", "JC-CCCAA"];
 
+// Mirrors the classify_college_lead_role() Postgres trigger (see the
+// add_lead_role_and_position_classification migration) which auto-fills
+// these from the free-text "title" column on import/add whenever they're
+// left blank. Keeping the option lists here in sync with the trigger's
+// CASE branches is what makes the filter dropdowns and the auto-detected
+// values line up.
+const ROLE_CATEGORIES = [
+  "Head Coach",
+  "Recruiting Coordinator",
+  "Coordinator",
+  "Recruiting & Player Personnel Staff",
+  "Position Coach",
+  "Operations/Support Staff",
+  "Other",
+];
+const POSITION_TAGS = [
+  "Quarterbacks",
+  "Running Backs",
+  "Wide Receivers",
+  "Tight Ends",
+  "Offensive Line",
+  "Defensive Line",
+  "Linebackers",
+  "Defensive Backs",
+  "Special Teams",
+];
+
+// college_leads.state stores full state names (from the CSV import), not
+// two-letter codes like the schools table does -- so this list has to be
+// the spelled-out names or the filter values would never match.
+const US_STATES = [
+  "Alabama", "Alaska", "Arizona", "Arkansas", "California", "Colorado", "Connecticut", "Delaware",
+  "District of Columbia", "Florida", "Georgia", "Hawaii", "Idaho", "Illinois", "Indiana", "Iowa", "Kansas",
+  "Kentucky", "Louisiana", "Maine", "Maryland", "Massachusetts", "Michigan", "Minnesota", "Mississippi",
+  "Missouri", "Montana", "Nebraska", "Nevada", "New Hampshire", "New Jersey", "New Mexico", "New York",
+  "North Carolina", "North Dakota", "Ohio", "Oklahoma", "Oregon", "Pennsylvania", "Rhode Island",
+  "South Carolina", "South Dakota", "Tennessee", "Texas", "Utah", "Vermont", "Virginia", "Washington",
+  "West Virginia", "Wisconsin", "Wyoming",
+];
+
+const SORT_OPTIONS = [
+  { value: "updated_desc", label: "Recently Updated" },
+  { value: "college_asc", label: "College Name (A-Z)" },
+  { value: "state_asc", label: "State" },
+  { value: "callback_asc", label: "Next Callback" },
+];
+
 const STATUS_OPTIONS = ["not_contacted", "contacted", "interested", "trial", "customer", "not_interested"];
 const STATUS_LABEL = {
   not_contacted: "Not Contacted",
@@ -45,6 +92,8 @@ const EMPTY_FORM = {
   office_phone: "",
   notes: "",
   next_callback_at: "",
+  role_category: "",
+  position_tags: [],
 };
 
 function todayISO() {
@@ -108,6 +157,45 @@ function fmtPhone(v) {
   return digits.length === 10 ? `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}` : v;
 }
 
+// Shared checkbox-pill picker for position_tags -- used by both the Add
+// Lead form and LeadRow's edit form so a coach who works with more than one
+// position group (e.g. "Running Backs" + "Special Teams") can be tagged
+// with both, without duplicating this markup in two places.
+function PositionTagsPicker({ value, onChange }) {
+  const selected = Array.isArray(value) ? value : [];
+  function toggle(tag) {
+    onChange(selected.includes(tag) ? selected.filter((t) => t !== tag) : [...selected, tag]);
+  }
+  return (
+    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+      {POSITION_TAGS.map((tag) => {
+        const active = selected.includes(tag);
+        return (
+          <label
+            key={tag}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 4,
+              fontSize: 11.5,
+              fontWeight: 600,
+              color: active ? "#2246b3" : "#3c4658",
+              background: active ? "#e3ecff" : "#f7f8fa",
+              border: `1px solid ${active ? "#2246b3" : "#dde1e7"}`,
+              borderRadius: 20,
+              padding: "3px 9px",
+              cursor: "pointer",
+            }}
+          >
+            <input type="checkbox" checked={active} onChange={() => toggle(tag)} style={{ margin: 0 }} />
+            {tag}
+          </label>
+        );
+      })}
+    </div>
+  );
+}
+
 // One row's worth of UI -- shared between the "Due for a Callback" panel
 // and the main paginated list, so status changes, edits, and the
 // notes/call-log panel work identically in both places. Deliberately a
@@ -164,7 +252,12 @@ function LeadRow({
             </div>
             <div className="form-field" style={{ marginBottom: 0 }}>
               <label>State</label>
-              <input value={editForm.state} onChange={(e) => setEditField("state", e.target.value)} />
+              <select value={editForm.state} onChange={(e) => setEditField("state", e.target.value)}>
+                <option value="">Select…</option>
+                {US_STATES.map((s) => (
+                  <option key={s} value={s}>{s}</option>
+                ))}
+              </select>
             </div>
             <div className="form-field" style={{ marginBottom: 0 }}>
               <label>Title</label>
@@ -194,6 +287,19 @@ function LeadRow({
               <label>Next Callback</label>
               <input type="date" value={editForm.next_callback_at} onChange={(e) => setEditField("next_callback_at", e.target.value)} />
             </div>
+            <div className="form-field" style={{ marginBottom: 0 }}>
+              <label>Role</label>
+              <select value={editForm.role_category} onChange={(e) => setEditField("role_category", e.target.value)}>
+                <option value="">Auto-detect from title</option>
+                {ROLE_CATEGORIES.map((r) => (
+                  <option key={r} value={r}>{r}</option>
+                ))}
+              </select>
+            </div>
+          </div>
+          <div className="form-field">
+            <label>Position(s) Coached</label>
+            <PositionTagsPicker value={editForm.position_tags} onChange={(tags) => setEditField("position_tags", tags)} />
           </div>
           <div className="form-field">
             <label>Notes</label>
@@ -229,6 +335,20 @@ function LeadRow({
                 {[lead.coach_first_name, lead.coach_last_name].filter(Boolean).join(" ") || <span className="empty-state" style={{ padding: 0 }}>no coach name on file</span>}
                 {lead.title ? ` · ${lead.title}` : ""}
               </div>
+              {(lead.role_category || (lead.position_tags && lead.position_tags.length > 0)) && (
+                <div style={{ marginTop: 4, display: "flex", gap: 5, flexWrap: "wrap" }}>
+                  {lead.role_category && (
+                    <span style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 7px", borderRadius: 20, background: "#eef0f4", color: "#3c4658" }}>
+                      {lead.role_category}
+                    </span>
+                  )}
+                  {(lead.position_tags || []).map((tag) => (
+                    <span key={tag} style={{ fontSize: 10.5, fontWeight: 700, padding: "2px 7px", borderRadius: 20, background: "#e3ecff", color: "#2246b3" }}>
+                      {tag}
+                    </span>
+                  ))}
+                </div>
+              )}
               <div style={{ fontSize: 12, color: "#697386", marginTop: 2, display: "flex", gap: 10, flexWrap: "wrap" }}>
                 {lead.email && <span>✉️ {lead.email}</span>}
                 {lead.mobile && <span>📱 {fmtPhone(lead.mobile)}</span>}
@@ -340,6 +460,10 @@ export default function CollegeLeadsPage() {
 
   const [statusFilter, setStatusFilter] = useState("");
   const [divisionFilter, setDivisionFilter] = useState("");
+  const [roleFilter, setRoleFilter] = useState("");
+  const [positionFilter, setPositionFilter] = useState("");
+  const [stateFilter, setStateFilter] = useState("");
+  const [sortBy, setSortBy] = useState("updated_desc");
   const [callbackFilter, setCallbackFilter] = useState(""); // "" | "due" | "week"
 
   // Due-for-a-callback panel -- counts for the pills, and the actual
@@ -392,6 +516,9 @@ export default function CollegeLeadsPage() {
     let query = supabase.from("college_leads").select("*", { count: "exact" });
     if (statusFilter) query = query.eq("status", statusFilter);
     if (divisionFilter) query = query.eq("division", divisionFilter);
+    if (roleFilter) query = query.eq("role_category", roleFilter);
+    if (positionFilter) query = query.contains("position_tags", [positionFilter]);
+    if (stateFilter) query = query.eq("state", stateFilter);
     if (callbackFilter === "due") query = query.lte("next_callback_at", todayISO());
     else if (callbackFilter === "week") {
       const weekOut = new Date();
@@ -401,21 +528,29 @@ export default function CollegeLeadsPage() {
     if (search.trim()) {
       const q = search.trim().replace(/[%,()]/g, "");
       query = query.or(
-        `college_name.ilike.%${q}%,coach_first_name.ilike.%${q}%,coach_last_name.ilike.%${q}%,state.ilike.%${q}%,email.ilike.%${q}%`
+        `college_name.ilike.%${q}%,coach_first_name.ilike.%${q}%,coach_last_name.ilike.%${q}%,state.ilike.%${q}%,email.ilike.%${q}%,title.ilike.%${q}%`
       );
     }
-    // Sorting by soonest-due makes sense once a callback filter is active;
-    // otherwise default to most-recently-touched, same as before.
-    query = callbackFilter
-      ? query.order("next_callback_at", { ascending: true })
-      : query.order("updated_at", { ascending: false });
+    // A callback filter forces soonest-due-first sort (that's the whole
+    // point of that view); otherwise honor whatever the Sort dropdown says.
+    if (callbackFilter) {
+      query = query.order("next_callback_at", { ascending: true });
+    } else if (sortBy === "college_asc") {
+      query = query.order("college_name", { ascending: true });
+    } else if (sortBy === "state_asc") {
+      query = query.order("state", { ascending: true, nullsFirst: false });
+    } else if (sortBy === "callback_asc") {
+      query = query.order("next_callback_at", { ascending: true, nullsFirst: false });
+    } else {
+      query = query.order("updated_at", { ascending: false });
+    }
     query = query.range(page * PAGE_SIZE, page * PAGE_SIZE + PAGE_SIZE - 1);
     const { data, error, count } = await query;
     if (error) setLoadError(error.message);
     setLeads(data || []);
     setTotal(count || 0);
     setLoading(false);
-  }, [supabase, statusFilter, divisionFilter, callbackFilter, search, page]);
+  }, [supabase, statusFilter, divisionFilter, roleFilter, positionFilter, stateFilter, sortBy, callbackFilter, search, page]);
 
   const loadStats = useCallback(async () => {
     const [{ count: totalCount }, { count: interestedCount }, { count: trialCount }, { count: customerCount }] = await Promise.all([
@@ -478,8 +613,10 @@ export default function CollegeLeadsPage() {
     }
     setAdding(true);
     try {
+      // position_tags is an array (no .trim()), everything else is a
+      // plain text field -- handle both without crashing on the array.
       const payload = Object.fromEntries(
-        Object.entries(addForm).map(([k, v]) => [k, v.trim() ? v.trim() : null])
+        Object.entries(addForm).map(([k, v]) => [k, Array.isArray(v) ? (v.length ? v : null) : v.trim() ? v.trim() : null])
       );
       const { error } = await supabase.from("college_leads").insert({ ...payload, created_by: user.id });
       if (error) throw error;
@@ -509,6 +646,8 @@ export default function CollegeLeadsPage() {
       office_phone: lead.office_phone || "",
       notes: lead.notes || "",
       next_callback_at: lead.next_callback_at || "",
+      role_category: lead.role_category || "",
+      position_tags: lead.position_tags || [],
     });
   }
 
@@ -522,7 +661,7 @@ export default function CollegeLeadsPage() {
     setSaving(true);
     try {
       const payload = Object.fromEntries(
-        Object.entries(editForm).map(([k, v]) => [k, v.trim() ? v.trim() : null])
+        Object.entries(editForm).map(([k, v]) => [k, Array.isArray(v) ? (v.length ? v : null) : v.trim() ? v.trim() : null])
       );
       const { error } = await supabase
         .from("college_leads")
@@ -874,7 +1013,12 @@ export default function CollegeLeadsPage() {
               </div>
               <div className="form-field">
                 <label>State</label>
-                <input value={addForm.state} onChange={(e) => setAddField("state", e.target.value)} placeholder="TX" />
+                <select value={addForm.state} onChange={(e) => setAddField("state", e.target.value)}>
+                  <option value="">Select…</option>
+                  {US_STATES.map((s) => (
+                    <option key={s} value={s}>{s}</option>
+                  ))}
+                </select>
               </div>
               <div className="form-field">
                 <label>Title</label>
@@ -904,6 +1048,19 @@ export default function CollegeLeadsPage() {
                 <label>Next Callback</label>
                 <input type="date" value={addForm.next_callback_at} onChange={(e) => setAddField("next_callback_at", e.target.value)} />
               </div>
+              <div className="form-field">
+                <label>Role</label>
+                <select value={addForm.role_category} onChange={(e) => setAddField("role_category", e.target.value)}>
+                  <option value="">Auto-detect from title</option>
+                  {ROLE_CATEGORIES.map((r) => (
+                    <option key={r} value={r}>{r}</option>
+                  ))}
+                </select>
+              </div>
+            </div>
+            <div className="form-field">
+              <label>Position(s) Coached</label>
+              <PositionTagsPicker value={addForm.position_tags} onChange={(tags) => setAddField("position_tags", tags)} />
             </div>
             <div className="form-field">
               <label>Notes</label>
@@ -990,6 +1147,59 @@ export default function CollegeLeadsPage() {
             <option value="">All</option>
             {STATUS_OPTIONS.map((s) => (
               <option key={s} value={s}>{STATUS_LABEL[s]}</option>
+            ))}
+          </select>
+        </div>
+        <div className="field">
+          <label>Role</label>
+          <select
+            value={roleFilter}
+            onChange={(e) => {
+              setRoleFilter(e.target.value);
+              setPage(0);
+            }}
+          >
+            <option value="">All</option>
+            {ROLE_CATEGORIES.map((r) => (
+              <option key={r} value={r}>{r}</option>
+            ))}
+          </select>
+        </div>
+        <div className="field">
+          <label>Position</label>
+          <select
+            value={positionFilter}
+            onChange={(e) => {
+              setPositionFilter(e.target.value);
+              setPage(0);
+            }}
+          >
+            <option value="">All</option>
+            {POSITION_TAGS.map((p) => (
+              <option key={p} value={p}>{p}</option>
+            ))}
+          </select>
+        </div>
+        <div className="field">
+          <label>State</label>
+          <select
+            value={stateFilter}
+            onChange={(e) => {
+              setStateFilter(e.target.value);
+              setPage(0);
+            }}
+          >
+            <option value="">All</option>
+            {US_STATES.map((s) => (
+              <option key={s} value={s}>{s}</option>
+            ))}
+          </select>
+        </div>
+        <div className="field">
+          <label>Sort</label>
+          <select value={sortBy} onChange={(e) => setSortBy(e.target.value)} disabled={!!callbackFilter} title={callbackFilter ? "Sort is set to soonest-due while a callback filter is active" : undefined}>
+            {SORT_OPTIONS.map((o) => (
+              <option key={o.value} value={o.value}>{o.label}</option>
             ))}
           </select>
         </div>
