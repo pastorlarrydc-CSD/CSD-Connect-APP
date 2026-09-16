@@ -176,22 +176,31 @@ function fmtPhone(v) {
   return digits.length === 10 ? `(${digits.slice(0, 3)}) ${digits.slice(3, 6)}-${digits.slice(6)}` : v;
 }
 
-// Shared checkbox-pill picker for position_tags -- used by both the Add
-// Lead form and LeadRow's edit form so a coach who works with more than one
-// position group (e.g. "Running Backs" + "Special Teams") can be tagged
-// with both, without duplicating this markup in two places.
-function PositionTagsPicker({ value, onChange }) {
+// Generic checkbox-pill multi-select. Used both for the top-of-page filter
+// bar (Division/Status/Role/Position/State can each match ANY of several
+// selected values, e.g. State = Texas + Florida + Georgia at once) and for
+// the per-lead Position(s) Coached picker on the Add/Edit forms.
+// `options` is [{ value, label }]; pass `maxHeight` to scroll a long list
+// (State has 50+ options) instead of blowing out the page layout.
+function MultiSelectPills({ options, value, onChange, maxHeight }) {
   const selected = Array.isArray(value) ? value : [];
-  function toggle(tag) {
-    onChange(selected.includes(tag) ? selected.filter((t) => t !== tag) : [...selected, tag]);
+  function toggle(v) {
+    onChange(selected.includes(v) ? selected.filter((x) => x !== v) : [...selected, v]);
   }
   return (
-    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-      {POSITION_TAGS.map((tag) => {
-        const active = selected.includes(tag);
+    <div
+      style={{
+        display: "flex",
+        flexWrap: "wrap",
+        gap: 6,
+        ...(maxHeight ? { maxHeight, overflowY: "auto", border: "1px solid #dde1e7", borderRadius: 8, padding: 6 } : {}),
+      }}
+    >
+      {options.map((opt) => {
+        const active = selected.includes(opt.value);
         return (
           <label
-            key={tag}
+            key={opt.value}
             style={{
               display: "flex",
               alignItems: "center",
@@ -206,13 +215,20 @@ function PositionTagsPicker({ value, onChange }) {
               cursor: "pointer",
             }}
           >
-            <input type="checkbox" checked={active} onChange={() => toggle(tag)} style={{ margin: 0 }} />
-            {tag}
+            <input type="checkbox" checked={active} onChange={() => toggle(opt.value)} style={{ margin: 0 }} />
+            {opt.label}
           </label>
         );
       })}
     </div>
   );
+}
+
+// Shared picker for position_tags -- used by both the Add Lead form and
+// LeadRow's edit form so a coach who works with more than one position
+// group (e.g. "Running Backs" + "Special Teams") can be tagged with both.
+function PositionTagsPicker({ value, onChange }) {
+  return <MultiSelectPills options={POSITION_TAGS.map((p) => ({ value: p, label: p }))} value={value} onChange={onChange} />;
 }
 
 // One row's worth of UI -- shared between the "Due for a Callback" panel
@@ -489,11 +505,15 @@ export default function CollegeLeadsPage() {
     }, 300);
   }
 
-  const [statusFilter, setStatusFilter] = useState("");
-  const [divisionFilter, setDivisionFilter] = useState("");
-  const [roleFilter, setRoleFilter] = useState("");
-  const [positionFilter, setPositionFilter] = useState("");
-  const [stateFilter, setStateFilter] = useState("");
+  // Each of these is an array now -- e.g. stateFilter = ["Texas", "Florida",
+  // "Georgia"] shows leads in ANY of those states, still narrowed together
+  // with whatever the other filters (Division, Role, search, etc.) are set
+  // to. An empty array means "don't filter on this."
+  const [statusFilter, setStatusFilter] = useState([]);
+  const [divisionFilter, setDivisionFilter] = useState([]);
+  const [roleFilter, setRoleFilter] = useState([]);
+  const [positionFilter, setPositionFilter] = useState([]);
+  const [stateFilter, setStateFilter] = useState([]);
   const [hasEmailFilter, setHasEmailFilter] = useState(false);
   const [hasPhoneFilter, setHasPhoneFilter] = useState(false);
   const [recencyFilter, setRecencyFilter] = useState(""); // "" | "never" | "30" | "60" | "90"
@@ -556,11 +576,13 @@ export default function CollegeLeadsPage() {
   // each caller since export doesn't page.
   const applyLeadsFilters = useCallback(
     (query) => {
-      if (statusFilter) query = query.eq("status", statusFilter);
-      if (divisionFilter) query = query.eq("division", divisionFilter);
-      if (roleFilter) query = query.eq("role_category", roleFilter);
-      if (positionFilter) query = query.contains("position_tags", [positionFilter]);
-      if (stateFilter) query = query.eq("state", stateFilter);
+      if (statusFilter.length) query = query.in("status", statusFilter);
+      if (divisionFilter.length) query = query.in("division", divisionFilter);
+      if (roleFilter.length) query = query.in("role_category", roleFilter);
+      // position_tags is itself an array column -- overlaps() matches a
+      // lead tagged with ANY of the selected positions, not all of them.
+      if (positionFilter.length) query = query.overlaps("position_tags", positionFilter);
+      if (stateFilter.length) query = query.in("state", stateFilter);
       if (hasEmailFilter) query = query.not("email", "is", null);
       if (hasPhoneFilter) query = query.or("mobile.not.is.null,office_phone.not.is.null");
       if (recencyFilter === "never") {
@@ -759,6 +781,15 @@ export default function CollegeLeadsPage() {
     }
   }
 
+  // Normalizes a saved filter value to an array -- handles both the
+  // current multi-select shape and any preset saved before that change
+  // (which stored a single string), so an old preset still applies cleanly
+  // instead of silently dropping that filter.
+  function toFilterArray(v) {
+    if (Array.isArray(v)) return v;
+    return v ? [v] : [];
+  }
+
   function applyPreset(id) {
     setSelectedPresetId(id);
     if (!id) return;
@@ -767,11 +798,11 @@ export default function CollegeLeadsPage() {
     const f = preset.filters || {};
     setSearchInput(f.search || "");
     setSearch(f.search || "");
-    setStatusFilter(f.statusFilter || "");
-    setDivisionFilter(f.divisionFilter || "");
-    setRoleFilter(f.roleFilter || "");
-    setPositionFilter(f.positionFilter || "");
-    setStateFilter(f.stateFilter || "");
+    setStatusFilter(toFilterArray(f.statusFilter));
+    setDivisionFilter(toFilterArray(f.divisionFilter));
+    setRoleFilter(toFilterArray(f.roleFilter));
+    setPositionFilter(toFilterArray(f.positionFilter));
+    setStateFilter(toFilterArray(f.stateFilter));
     setHasEmailFilter(!!f.hasEmailFilter);
     setHasPhoneFilter(!!f.hasPhoneFilter);
     setRecencyFilter(f.recencyFilter || "");
@@ -1336,80 +1367,61 @@ export default function CollegeLeadsPage() {
           <label>Search</label>
           <input value={searchInput} onChange={(e) => handleSearchInput(e.target.value)} placeholder="College, coach, state, email…" />
         </div>
-        <div className="field">
-          <label>Division</label>
-          <select
+        <div className="field" style={{ minWidth: 220 }}>
+          <label>Division{divisionFilter.length ? ` (${divisionFilter.length})` : ""}</label>
+          <MultiSelectPills
+            options={DIVISIONS.map((d) => ({ value: d, label: d }))}
             value={divisionFilter}
-            onChange={(e) => {
-              setDivisionFilter(e.target.value);
+            onChange={(v) => {
+              setDivisionFilter(v);
               setPage(0);
             }}
-          >
-            <option value="">All</option>
-            {DIVISIONS.map((d) => (
-              <option key={d} value={d}>{d}</option>
-            ))}
-          </select>
+          />
         </div>
-        <div className="field">
-          <label>Status</label>
-          <select
+        <div className="field" style={{ minWidth: 220 }}>
+          <label>Status{statusFilter.length ? ` (${statusFilter.length})` : ""}</label>
+          <MultiSelectPills
+            options={STATUS_OPTIONS.map((s) => ({ value: s, label: STATUS_LABEL[s] }))}
             value={statusFilter}
-            onChange={(e) => {
-              setStatusFilter(e.target.value);
+            onChange={(v) => {
+              setStatusFilter(v);
               setPage(0);
             }}
-          >
-            <option value="">All</option>
-            {STATUS_OPTIONS.map((s) => (
-              <option key={s} value={s}>{STATUS_LABEL[s]}</option>
-            ))}
-          </select>
+          />
         </div>
-        <div className="field">
-          <label>Role</label>
-          <select
+        <div className="field" style={{ minWidth: 240 }}>
+          <label>Role{roleFilter.length ? ` (${roleFilter.length})` : ""}</label>
+          <MultiSelectPills
+            options={ROLE_CATEGORIES.map((r) => ({ value: r, label: r }))}
             value={roleFilter}
-            onChange={(e) => {
-              setRoleFilter(e.target.value);
+            onChange={(v) => {
+              setRoleFilter(v);
               setPage(0);
             }}
-          >
-            <option value="">All</option>
-            {ROLE_CATEGORIES.map((r) => (
-              <option key={r} value={r}>{r}</option>
-            ))}
-          </select>
+          />
         </div>
-        <div className="field">
-          <label>Position</label>
-          <select
+        <div className="field" style={{ minWidth: 260 }}>
+          <label>Position{positionFilter.length ? ` (${positionFilter.length})` : ""}</label>
+          <MultiSelectPills
+            options={POSITION_TAGS.map((p) => ({ value: p, label: p }))}
             value={positionFilter}
-            onChange={(e) => {
-              setPositionFilter(e.target.value);
+            onChange={(v) => {
+              setPositionFilter(v);
               setPage(0);
             }}
-          >
-            <option value="">All</option>
-            {POSITION_TAGS.map((p) => (
-              <option key={p} value={p}>{p}</option>
-            ))}
-          </select>
+          />
         </div>
-        <div className="field">
-          <label>State</label>
-          <select
+        <div className="field" style={{ minWidth: 260 }}>
+          <label>State{stateFilter.length ? ` (${stateFilter.length})` : ""}</label>
+          <MultiSelectPills
+            options={US_STATES.map((s) => ({ value: s, label: s }))}
             value={stateFilter}
-            onChange={(e) => {
-              setStateFilter(e.target.value);
+            onChange={(v) => {
+              setStateFilter(v);
               setPage(0);
             }}
-          >
-            <option value="">All</option>
-            {US_STATES.map((s) => (
-              <option key={s} value={s}>{s}</option>
-            ))}
-          </select>
+            maxHeight={130}
+          />
         </div>
         <div className="field">
           <label>Contact Recency</label>
