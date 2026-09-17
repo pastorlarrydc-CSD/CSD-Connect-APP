@@ -1,6 +1,7 @@
 "use client";
 import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
+import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 
@@ -62,6 +63,7 @@ export default function BulkMaxPrepsPage() {
   const [applyError, setApplyError] = useState("");
   const [applyResult, setApplyResult] = useState(null); // {schools}
   const [sessionApplied, setSessionApplied] = useState(0);
+  const [hideApplied, setHideApplied] = useState(true);
 
   const refreshMissingCount = useCallback(async () => {
     try {
@@ -193,6 +195,27 @@ export default function BulkMaxPrepsPage() {
     }
   }
 
+  function exportBatchCsv() {
+    if (!batch.length) return;
+    const csv = Papa.unparse({
+      fields: ["school_id", "school_name", "city", "state", "current_maxpreps_url", "search_status", "selected_link", "applied"],
+      data: batch.map((s) => {
+        const r = results[s.id];
+        const status = !r ? "Not searched" : r.status === "searching" ? "Searching" : r.status === "error" ? "Error" : r.candidates?.length ? "Found candidates" : "No page found";
+        return [s.id, s.name, s.city, s.state, s.maxpreps_url || "", status, selections[s.id] || "", appliedIds.has(s.id) ? "Yes" : "No"];
+      }),
+    });
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `csd-bulk-maxpreps-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
   if (!canReview) {
     return (
       <div className="view">
@@ -203,6 +226,8 @@ export default function BulkMaxPrepsPage() {
 
   const hasSearchedAny = Object.keys(results).length > 0;
   const allApplied = batch.length > 0 && batch.every((s) => appliedIds.has(s.id));
+  const visibleBatch = hideApplied ? batch.filter((s) => !appliedIds.has(s.id)) : batch;
+  const appliedInBatchCount = batch.filter((s) => appliedIds.has(s.id)).length;
 
   return (
     <div className="view">
@@ -261,13 +286,30 @@ export default function BulkMaxPrepsPage() {
             <h3 style={{ margin: 0 }}>
               2. Search &amp; review — {batch.length} school{batch.length === 1 ? "" : "s"} in this batch
             </h3>
-            <button className="btn btn-sm" onClick={runSearch} disabled={searching || loadingBatch || allApplied}>
-              {searching ? `Searching ${searchedCount} of ${searchTotal}…` : hasSearchedAny ? "Search Again" : `Search This Batch (${batch.length} lookups)`}
-            </button>
+            <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+              <label style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}>
+                <input type="checkbox" checked={hideApplied} onChange={(e) => setHideApplied(e.target.checked)} />
+                Hide applied
+              </label>
+              <button className="btn btn-sm" onClick={exportBatchCsv}>
+                Export to CSV
+              </button>
+              <button className="btn btn-sm" onClick={runSearch} disabled={searching || loadingBatch || allApplied}>
+                {searching ? `Searching ${searchedCount} of ${searchTotal}…` : hasSearchedAny ? "Search Again" : `Search This Batch (${batch.length} lookups)`}
+              </button>
+            </div>
           </div>
+          {hideApplied && appliedInBatchCount > 0 && (
+            <div style={{ fontSize: 11.5, color: "#9aa1ab", marginBottom: 8 }}>
+              {appliedInBatchCount} applied school{appliedInBatchCount === 1 ? "" : "s"} hidden.
+            </div>
+          )}
 
           <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            {batch.map((s) => {
+            {visibleBatch.length === 0 && (
+              <div className="empty-state">Every school in this batch has been applied. Load the next batch above, or uncheck "Hide applied" to see them.</div>
+            )}
+            {visibleBatch.map((s) => {
               const r = results[s.id];
               const applied = appliedIds.has(s.id);
               return (
