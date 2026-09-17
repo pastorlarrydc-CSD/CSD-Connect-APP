@@ -1,6 +1,7 @@
 "use client";
 import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
+import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 
@@ -82,6 +83,8 @@ export default function BatchSocialPage() {
   const canReview = profile?.role === "verifier" || profile?.role === "sysadmin";
 
   const [runs, setRuns] = useState([]);
+  const [runPendingCounts, setRunPendingCounts] = useState({});
+  const [hideCompletedRuns, setHideCompletedRuns] = useState(true);
   const [loadingRuns, setLoadingRuns] = useState(true);
   const [selectedRunId, setSelectedRunId] = useState(null);
   const [items, setItems] = useState([]);
@@ -148,6 +151,14 @@ export default function BatchSocialPage() {
   const pendingReview = matchedItems.filter((i) => i.review_status === "pending");
   const reviewedItems = matchedItems.filter((i) => i.review_status !== "pending");
   const highConfidencePendingCount = pendingReview.filter((i) => i.suggestion?.confidence === "high").length;
+
+  function isRunOpen(r) {
+    if (r.status !== "collected") return true;
+    if (r.id === selectedRunId) return pendingReview.length > 0;
+    return (runPendingCounts[r.id] || 0) > 0;
+  }
+  const openRunsCount = runs.filter(isRunOpen).length;
+  const visibleRunsList = hideCompletedRuns ? runs.filter(isRunOpen) : runs;
 
   // Matches a row against the current search box -- school name or city,
   // case-insensitive. Same loose substring match as Batch Coach-Info's own
@@ -233,6 +244,17 @@ export default function BatchSocialPage() {
     setLoadingRuns(true);
     const { data } = await supabase.from("social_batch_runs").select("*").order("created_at", { ascending: false }).limit(30);
     setRuns(data || []);
+    const ids = (data || []).map((r) => r.id);
+    if (ids.length) {
+      const { data: pendingRows } = await supabase.from("social_batch_run_pending").select("batch_run_id,pending_count").in("batch_run_id", ids);
+      const counts = {};
+      (pendingRows || []).forEach((row) => {
+        counts[row.batch_run_id] = row.pending_count;
+      });
+      setRunPendingCounts(counts);
+    } else {
+      setRunPendingCounts({});
+    }
     setLoadingRuns(false);
   }, [supabase]);
 
@@ -547,6 +569,53 @@ export default function BatchSocialPage() {
     }
   }
 
+  function exportRunCsv() {
+    if (!selectedRun || !visibleRows.length) return;
+    const csv = Papa.unparse({
+      fields: [
+        "school_id",
+        "school_name",
+        "city",
+        "state",
+        "coach",
+        "current_twitter",
+        "suggested_twitter",
+        "current_facebook",
+        "suggested_facebook",
+        "confidence",
+        "reasoning",
+        "status",
+      ],
+      data: visibleRows.map((item) => {
+        const s = item.school || {};
+        const sug = item.suggestion || {};
+        return [
+          s.id,
+          s.name,
+          s.city,
+          s.state,
+          [s.hc_first_name, s.hc_last_name].filter(Boolean).join(" "),
+          s.hc_twitter || "",
+          sug.twitter_url || "",
+          s.hc_facebook || "",
+          sug.facebook_url || "",
+          sug.confidence || "",
+          sug.reasoning || "",
+          item.review_status === "pending" ? "Pending" : item.review_status === "applied" ? "Applied" : "Skipped",
+        ];
+      }),
+    });
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `csd-social-run-${selectedRun.id}-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
   if (!canReview) {
     return (
       <div className="view">
@@ -615,36 +684,55 @@ export default function BatchSocialPage() {
       </div>
 
       <div className="card" style={{ marginBottom: 14 }}>
-        <h3 style={{ margin: 0, marginBottom: 8 }}>Batch Runs</h3>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 8 }}>
+          <h3 style={{ margin: 0 }}>Batch Runs</h3>
+          <label style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}>
+            <input type="checkbox" checked={hideCompletedRuns} onChange={(e) => setHideCompletedRuns(e.target.checked)} />
+            Hide finished runs
+          </label>
+        </div>
         {loadingRuns ? (
           <div className="empty-state">Loading…</div>
         ) : runs.length === 0 ? (
           <div className="empty-state">No batch runs yet -- start one above.</div>
+        ) : visibleRunsList.length === 0 ? (
+          <div className="empty-state">
+            All {runs.length} run{runs.length === 1 ? "" : "s"} are finished -- nothing left to review. Uncheck "Hide finished runs" above to see them.
+          </div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            {runs.map((r) => (
-              <div
-                key={r.id}
-                onClick={() => openRun(r.id)}
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                  flexWrap: "wrap",
-                  gap: 8,
-                  padding: "8px 10px",
-                  border: r.id === selectedRunId ? "1px solid #2f5fa8" : "1px solid #e3e6ea",
-                  borderRadius: 8,
-                  cursor: "pointer",
-                }}
-              >
-                <div style={{ fontSize: 12.5 }}>
-                  <strong>Run #{r.id}</strong> — {new Date(r.created_at).toLocaleString()} — {r.state_filter ? r.state_filter.join(", ") : "all states"} — {r.requested_count} school
-                  {r.requested_count === 1 ? "" : "s"}
-                </div>
-                <StatusBadge status={r.status} />
+            {hideCompletedRuns && openRunsCount < runs.length && (
+              <div style={{ fontSize: 11.5, color: "#9aa1ab" }}>
+                {runs.length - openRunsCount} finished run{runs.length - openRunsCount === 1 ? "" : "s"} hidden.
               </div>
-            ))}
+            )}
+            {visibleRunsList.map((r) => {
+              const pendingCount = r.id === selectedRunId ? pendingReview.length : runPendingCounts[r.id] || 0;
+              return (
+                <div
+                  key={r.id}
+                  onClick={() => openRun(r.id)}
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                    gap: 8,
+                    padding: "8px 10px",
+                    border: r.id === selectedRunId ? "1px solid #2f5fa8" : "1px solid #e3e6ea",
+                    borderRadius: 8,
+                    cursor: "pointer",
+                  }}
+                >
+                  <div style={{ fontSize: 12.5 }}>
+                    <strong>Run #{r.id}</strong> — {new Date(r.created_at).toLocaleString()} — {r.state_filter ? r.state_filter.join(", ") : "all states"} — {r.requested_count} school
+                    {r.requested_count === 1 ? "" : "s"}
+                    {r.status === "collected" && pendingCount > 0 ? ` — ${pendingCount} to review` : ""}
+                  </div>
+                  <StatusBadge status={r.status} />
+                </div>
+              );
+            })}
           </div>
         )}
       </div>
@@ -716,10 +804,15 @@ export default function BatchSocialPage() {
                   {pendingReview.length} suggestion{pendingReview.length === 1 ? "" : "s"} to review, {reviewedItems.length} already reviewed, {noMatchItems.length} where the AI found no
                   confident match on either platform, {failedItems.length} the AI couldn't produce a suggestion for.
                 </p>
-                <label style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}>
-                  <input type="checkbox" checked={showReviewed} onChange={(e) => setShowReviewed(e.target.checked)} />
-                  Show already-reviewed
-                </label>
+                <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+                  <label style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}>
+                    <input type="checkbox" checked={showReviewed} onChange={(e) => setShowReviewed(e.target.checked)} />
+                    Show already-reviewed
+                  </label>
+                  <button className="btn btn-sm" onClick={exportRunCsv} disabled={visibleRows.length === 0}>
+                    Export to CSV ({visibleRows.length})
+                  </button>
+                </div>
               </div>
 
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 10 }}>
