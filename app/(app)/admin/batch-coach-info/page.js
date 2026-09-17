@@ -27,6 +27,15 @@ import { useAuth } from "@/lib/auth-context";
 const PRIORITY_STATES = ["TX", "FL", "GA", "CA", "OH", "IN"];
 const TARGET_COUNTS = [100, 300, 500, 1000];
 const DEFAULT_TARGET_COUNT = 300;
+// Staleness choices for "re_verify" mode -- "never reviewed" schools are
+// always included regardless of this number; this only controls how old a
+// PAST review has to be before a school is eligible to be re-included. See
+// startRun's re_verify branch and school_review_status (the same Postgres
+// view the Needs-Review dashboard reads) for what "reviewed" means here:
+// hc_first_name/hc_last_name/hc_email/hc_cell/hc_office specifically
+// touched via school_change_log, not just "has a value on file."
+const STALE_DAY_OPTIONS = [90, 180, 365];
+const DEFAULT_STALE_DAYS = 180;
 const FETCH_CONCURRENCY = 8; // matches the weekly automated cron's own concurrency (app/api/cron/weekly-coach-info-batch) -- this manual page used to run at 3, well under what the same fetch/search calls handle fine unattended, which just meant a longer wait staring at this tab for a same-size run
 // Applying a suggestion is just two small DB writes (no web fetch, no AI
 // call) -- can safely run more of these in parallel than the page-fetching
@@ -103,10 +112,22 @@ export default function BatchCoachInfoPage() {
   // to actually surface an email. Every other mode -- and the single-
   // school button -- gets the open query by default, precisely so a wrong
   // or stale on-file name can still be caught rather than re-confirmed.
-  const [candidateMode, setCandidateMode] = useState("no_name"); // "no_name" | "missing_email"
+  // "re_verify": the odd one out -- every other mode excludes any school
+  // this tool has EVER touched before (see startRun's excludedIds below).
+  // re_verify is specifically FOR re-including those schools once their
+  // info is old enough to be worth a fresh look, using the exact same
+  // school_review_status view (and "reviewed" definition) the Needs-Review
+  // dashboard uses, scoped by staleDays below. Gets the same open query as
+  // "no_name" (not contactOnly) since the whole point is to catch a name
+  // that's since gone stale or wrong, not just confirm what's on file.
+  const [candidateMode, setCandidateMode] = useState("no_name"); // "no_name" | "missing_email" | "re_verify"
   const [scopeMode, setScopeMode] = useState("priority"); // "priority" | "all"
   const [customStates, setCustomStates] = useState(PRIORITY_STATES.join(", "));
   const [targetCount, setTargetCount] = useState(DEFAULT_TARGET_COUNT);
+  // Only used by "re_verify" mode -- a school last reviewed more than this
+  // many days ago is eligible to be re-included; never-reviewed schools are
+  // always eligible regardless of this number.
+  const [staleDays, setStaleDays] = useState(DEFAULT_STALE_DAYS);
   // Off by default so this tool keeps pulling from its full existing pool
   // (athletics URL OR just a general website) unless asked not to. On, it
   // narrows to schools that already have an Athletics URL specifically --
@@ -337,72 +358,133 @@ export default function BatchCoachInfoPage() {
     try {
       const states = scopeMode === "priority" ? PRIORITY_STATES : customStates.split(",").map((s) => s.trim().toUpperCase()).filter(Boolean);
 
-      // Excludes every school that's EVER gone through this tool before --
-      // applied, skipped, or a suggestion that errored out -- not just ones
-      // sitting in a still-open run. Without this, clicking Apply or Skip
-      // didn't stop a school from coming right back the next time someone
-      // clicked "Start Run": nothing marked it as already looked at, so the
-      // same "no email/social found anywhere" schools kept resurfacing.
-      // Over-fetches 3x and filters client-side (same approach the weekly
-      // cron uses) rather than a giant SQL "not in" list, which Supabase
-      // struggles with once this table has thousands of rows across many
-      // runs. The single-school "Suggest Coach Info (AI)" button on a
-      // school's own profile page is unaffected -- that's still there any
-      // time someone wants to force a fresh look at one specific school.
-      const { data: touchedRows, error: touchedErr } = await supabase.from("coach_info_batch_items").select("school_id");
-      if (touchedErr) throw touchedErr;
-      const excludedIds = new Set((touchedRows || []).map((r) => r.school_id));
+      let schoolsData;
 
-      let query = supabase
-        .from("schools")
-        .select("id,name,city,state")
-        // Closed/discontinued schools will never have a real coach to
-        // find -- see lib/dataQuality.js.
-        .eq("is_closed", false)
-        .order("id", { ascending: true })
-        .limit(targetCount * 3);
+      if (candidateMode === "re_verify") {
+        // The odd one out: every other mode below excludes any school this
+        // tool has ever touched (see the excludedIds block in the else
+        // branch) -- re_verify's whole purpose is to go back and re-include
+        // exactly those schools once enough time has passed that their info
+        // is worth a fresh look, so it does NOT apply that exclusion.
+        //
+        // Reads school_review_status -- the same Postgres view the
+        // Needs-Review dashboard (/admin/needs-review) reads -- so both
+        // tools agree on one definition of "reviewed": hc_first_name/
+        // hc_last_name/hc_email/hc_cell/hc_office specifically touched via
+        // school_change_log, not just "has a value on file" (99%+ of
+        // schools already have SOMETHING from the original import that was
+        // never actually re-checked). never_reviewed schools are always
+        // eligible; previously-reviewed ones need days_since_review >=
+        // staleDays. Oldest/never-checked first, same ordering the
+        // dashboard uses.
+        let viewQuery = supabase
+          .from("school_review_status")
+          .select("id,name,city,state")
+          .or(`never_reviewed.eq.true,days_since_review.gte.${staleDays}`)
+          .order("never_reviewed", { ascending: false })
+          .order("days_since_review", { ascending: false, nullsFirst: true })
+          .limit(targetCount * 3);
+        if (scopeMode !== "all" || states.length) {
+          viewQuery = viewQuery.in("state", states);
+        }
+        const { data: rawReviewRows, error: viewErr } = await viewQuery;
+        if (viewErr) throw viewErr;
+        schoolsData = rawReviewRows || [];
 
-      if (candidateMode === "missing_email") {
-        // Coach's name is already on file -- just the email is missing.
-        // The opposite condition from "no_name" below (De Morgan's on the
-        // same blank checks): both name fields present, email blank.
-        query = query
-          .not("hc_first_name", "is", null)
-          .neq("hc_first_name", "")
-          .not("hc_last_name", "is", null)
-          .neq("hc_last_name", "")
-          .or("hc_email.is.null,hc_email.eq.");
+        // school_review_status doesn't carry athletics_url/website (it's
+        // scoped to the coach-contact fields), so requireAthletics needs a
+        // second, narrower lookup against the real schools table -- same
+        // "athletics URL specifically" check the other modes use -- rather
+        // than duplicating those columns into the view.
+        if (requireAthletics && schoolsData.length) {
+          const { data: withAthletics, error: athErr } = await supabase
+            .from("schools")
+            .select("id")
+            .in("id", schoolsData.map((s) => s.id))
+            .not("athletics_url", "is", null)
+            .neq("athletics_url", "");
+          if (athErr) throw athErr;
+          const athleticsIds = new Set((withAthletics || []).map((r) => r.id));
+          schoolsData = schoolsData.filter((s) => athleticsIds.has(s.id));
+        }
+
+        schoolsData = schoolsData.slice(0, targetCount);
+        if (!schoolsData || schoolsData.length === 0) {
+          setCreateError(
+            `No schools matched -- everyone in this scope was reviewed within the last ${staleDays} days (or requireAthletics narrowed the pool to nothing). Try a shorter staleness window, a wider state scope, or turning off "Require an Athletics URL."`
+          );
+          return;
+        }
       } else {
-        query = query.or("hc_first_name.is.null,hc_first_name.eq.").or("hc_last_name.is.null,hc_last_name.eq.");
-      }
+        // Excludes every school that's EVER gone through this tool before --
+        // applied, skipped, or a suggestion that errored out -- not just ones
+        // sitting in a still-open run. Without this, clicking Apply or Skip
+        // didn't stop a school from coming right back the next time someone
+        // clicked "Start Run": nothing marked it as already looked at, so the
+        // same "no email/social found anywhere" schools kept resurfacing.
+        // Over-fetches 3x and filters client-side (same approach the weekly
+        // cron uses) rather than a giant SQL "not in" list, which Supabase
+        // struggles with once this table has thousands of rows across many
+        // runs. The single-school "Suggest Coach Info (AI)" button on a
+        // school's own profile page is unaffected -- that's still there any
+        // time someone wants to force a fresh look at one specific school.
+        // (re_verify above is the other, run-level way to force another
+        // look -- at a whole stale slice of schools at once.)
+        const { data: touchedRows, error: touchedErr } = await supabase.from("coach_info_batch_items").select("school_id");
+        if (touchedErr) throw touchedErr;
+        const excludedIds = new Set((touchedRows || []).map((r) => r.school_id));
 
-      // requireAthletics narrows the source pool to just Athletics URL.
-      // Outside that, "no_name" mode keeps the looser "athletics OR general
-      // website" check this tool has always used (a page to search from is
-      // essential when the coach isn't known yet); "missing_email" mode
-      // doesn't require a URL at all by default -- the name-targeted search
-      // alone is usually enough to find an email, and requiring a URL here
-      // would needlessly shrink an already-small candidate pool.
-      if (requireAthletics) {
-        query = query.not("athletics_url", "is", null).neq("athletics_url", "");
-      } else if (candidateMode !== "missing_email") {
-        query = query.or("athletics_url.not.is.null,website.not.is.null");
-      }
+        let query = supabase
+          .from("schools")
+          .select("id,name,city,state")
+          // Closed/discontinued schools will never have a real coach to
+          // find -- see lib/dataQuality.js.
+          .eq("is_closed", false)
+          .order("id", { ascending: true })
+          .limit(targetCount * 3);
 
-      if (scopeMode !== "all" || states.length) {
-        query = query.in("state", states);
-      }
+        if (candidateMode === "missing_email") {
+          // Coach's name is already on file -- just the email is missing.
+          // The opposite condition from "no_name" below (De Morgan's on the
+          // same blank checks): both name fields present, email blank.
+          query = query
+            .not("hc_first_name", "is", null)
+            .neq("hc_first_name", "")
+            .not("hc_last_name", "is", null)
+            .neq("hc_last_name", "")
+            .or("hc_email.is.null,hc_email.eq.");
+        } else {
+          query = query.or("hc_first_name.is.null,hc_first_name.eq.").or("hc_last_name.is.null,hc_last_name.eq.");
+        }
 
-      const { data: rawSchoolsData, error: schoolsErr } = await query;
-      if (schoolsErr) throw schoolsErr;
-      const schoolsData = (rawSchoolsData || []).filter((s) => !excludedIds.has(s.id)).slice(0, targetCount);
-      if (!schoolsData || schoolsData.length === 0) {
-        setCreateError(
-          candidateMode === "missing_email"
-            ? "No schools matched -- everyone with a coach name on file in this scope already has an email, or has already been through this tool before."
-            : "No schools matched -- everyone missing coach info in this scope has already been through this tool before, or has no website/athletics URL on file to search from."
-        );
-        return;
+        // requireAthletics narrows the source pool to just Athletics URL.
+        // Outside that, "no_name" mode keeps the looser "athletics OR general
+        // website" check this tool has always used (a page to search from is
+        // essential when the coach isn't known yet); "missing_email" mode
+        // doesn't require a URL at all by default -- the name-targeted search
+        // alone is usually enough to find an email, and requiring a URL here
+        // would needlessly shrink an already-small candidate pool.
+        if (requireAthletics) {
+          query = query.not("athletics_url", "is", null).neq("athletics_url", "");
+        } else if (candidateMode !== "missing_email") {
+          query = query.or("athletics_url.not.is.null,website.not.is.null");
+        }
+
+        if (scopeMode !== "all" || states.length) {
+          query = query.in("state", states);
+        }
+
+        const { data: rawSchoolsData, error: schoolsErr } = await query;
+        if (schoolsErr) throw schoolsErr;
+        schoolsData = (rawSchoolsData || []).filter((s) => !excludedIds.has(s.id)).slice(0, targetCount);
+        if (!schoolsData || schoolsData.length === 0) {
+          setCreateError(
+            candidateMode === "missing_email"
+              ? "No schools matched -- everyone with a coach name on file in this scope already has an email, or has already been through this tool before."
+              : "No schools matched -- everyone missing coach info in this scope has already been through this tool before, or has no website/athletics URL on file to search from."
+          );
+          return;
+        }
       }
 
       const { data: runRow, error: runErr } = await supabase
@@ -719,8 +801,13 @@ export default function BatchCoachInfoPage() {
         <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
           {candidateMode === "missing_email"
             ? "Pulls schools that already have a head coach name on file but are missing an email -- searches for that specific coach by name instead of the generic \"who is the coach\" search."
+            : candidateMode === "re_verify"
+            ? "Pulls schools this tool has already touched before, but not recently -- a fresh open search per school (not name-anchored), so a coach who's since changed gets caught instead of re-confirmed."
             : "Pulls schools missing a head coach name that have an athletics or general website on file to search from -- schools with neither can't be helped by this tool."}
-          {" "}Any school already applied, skipped, or attempted here before is automatically left out of every future run.
+          {" "}
+          {candidateMode === "re_verify"
+            ? "This is the one mode that intentionally re-includes schools already applied, skipped, or attempted here before -- every other mode leaves those out of every future run."
+            : "Any school already applied, skipped, or attempted here before is automatically left out of every future run."}
         </p>
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
           <div style={{ display: "flex", flexDirection: "column", gap: 6, paddingBottom: 4, borderBottom: "1px solid #e3e6ea", marginBottom: 2 }}>
@@ -732,6 +819,23 @@ export default function BatchCoachInfoPage() {
               <input type="radio" checked={candidateMode === "missing_email"} onChange={() => setCandidateMode("missing_email")} />
               Has a coach name, but missing an email
             </label>
+            <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
+              <input type="radio" checked={candidateMode === "re_verify"} onChange={() => setCandidateMode("re_verify")} />
+              Re-verify: schools not (re-)checked recently, including ones already run before
+            </label>
+            {candidateMode === "re_verify" && (
+              <label style={{ fontSize: 13, marginLeft: 22 }}>
+                Only include schools last reviewed more than{" "}
+                <select value={staleDays} onChange={(e) => setStaleDays(Number(e.target.value))}>
+                  {STALE_DAY_OPTIONS.map((n) => (
+                    <option key={n} value={n}>
+                      {n}
+                    </option>
+                  ))}
+                </select>{" "}
+                days ago (never-checked schools are always included)
+              </label>
+            )}
           </div>
           <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
             <input type="radio" checked={scopeMode === "priority"} onChange={() => setScopeMode("priority")} />
@@ -803,7 +907,7 @@ export default function BatchCoachInfoPage() {
                 <div style={{ fontSize: 12.5 }}>
                   <strong>Run #{r.id}</strong> — {new Date(r.created_at).toLocaleString()} — {r.state_filter ? r.state_filter.join(", ") : "all states"} — {r.requested_count} school
                   {r.requested_count === 1 ? "" : "s"}
-                  {r.candidate_mode === "missing_email" ? " — missing email" : ""}
+                  {r.candidate_mode === "missing_email" ? " — missing email" : r.candidate_mode === "re_verify" ? " — re-verify" : ""}
                 </div>
                 <StatusBadge status={r.status} />
               </div>
