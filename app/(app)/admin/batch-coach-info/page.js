@@ -1,6 +1,7 @@
 "use client";
 import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
+import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 
@@ -97,6 +98,14 @@ export default function BatchCoachInfoPage() {
 
   const [runs, setRuns] = useState([]);
   const [loadingRuns, setLoadingRuns] = useState(true);
+  // How many still-pending suggestions each run has, from
+  // coach_info_batch_run_pending (see loadRuns) -- drives "Hide finished
+  // runs" below. Keyed by run id; a run with no entry has nothing pending.
+  const [runPendingCounts, setRunPendingCounts] = useState({});
+  // On by default -- once a run has nothing left to review, it stays in
+  // this list forever otherwise, and a reviewer has to scroll past every
+  // finished run to find the ones still needing work.
+  const [hideCompletedRuns, setHideCompletedRuns] = useState(true);
   const [selectedRunId, setSelectedRunId] = useState(null);
   const [items, setItems] = useState([]);
   const [loadingItems, setLoadingItems] = useState(false);
@@ -203,6 +212,21 @@ export default function BatchCoachInfoPage() {
   const reviewedItems = suggestedItems.filter((i) => i.review_status !== "pending");
   const failedItems = suggestedItems.filter((i) => i.suggestion_error);
   const highConfidencePendingCount = pendingReview.filter((i) => i.suggestion?.confidence === "high").length;
+
+  // Whether a run still has something actionable left -- a run that's not
+  // "collected" yet is always still open (nothing to hide, it's mid-flight).
+  // For a "collected" run: the one currently on screen uses the live
+  // pendingReview count above (so it doesn't vanish out from under a
+  // reviewer clearing the last few rows -- runPendingCounts only refreshes
+  // on the next loadRuns), every other run uses the count fetched from
+  // coach_info_batch_run_pending.
+  function isRunOpen(r) {
+    if (r.status !== "collected") return true;
+    if (r.id === selectedRunId) return pendingReview.length > 0;
+    return (runPendingCounts[r.id] || 0) > 0;
+  }
+  const openRunsCount = runs.filter(isRunOpen).length;
+  const visibleRunsList = hideCompletedRuns ? runs.filter(isRunOpen) : runs;
   // Suggestions where every field already matches what's on file -- the
   // coach was confirmed but nothing new turned up (no email, phone, or
   // social found anywhere), regardless of confidence tier. Skip never
@@ -306,6 +330,23 @@ export default function BatchCoachInfoPage() {
     setLoadingRuns(true);
     const { data } = await supabase.from("coach_info_batch_runs").select("*").order("created_at", { ascending: false }).limit(30);
     setRuns(data || []);
+    // How many suggestions each run still has waiting on a decision --
+    // reads coach_info_batch_run_pending, a small Postgres view that
+    // counts pending, actually-has-a-suggestion items per run (same
+    // "reviewed" bar suggestedItems/pendingReview use below), so "Hide
+    // finished runs" doesn't need to pull every item row for every run
+    // client-side just to figure out which ones are done.
+    const ids = (data || []).map((r) => r.id);
+    if (ids.length) {
+      const { data: pendingRows } = await supabase.from("coach_info_batch_run_pending").select("batch_run_id,pending_count").in("batch_run_id", ids);
+      const counts = {};
+      (pendingRows || []).forEach((row) => {
+        counts[row.batch_run_id] = row.pending_count;
+      });
+      setRunPendingCounts(counts);
+    } else {
+      setRunPendingCounts({});
+    }
     setLoadingRuns(false);
   }, [supabase]);
 
@@ -776,6 +817,53 @@ export default function BatchCoachInfoPage() {
     }
   }
 
+  // Downloads exactly what's currently on screen (visibleRows -- same
+  // search box + confidence filter + "Show already-reviewed" the table
+  // itself uses) as a CSV: one current/suggested pair per field so it's
+  // usable as a real working sheet, not just a dump. Purely a read of data
+  // already loaded client-side -- no extra query, same Papa.unparse +
+  // Blob-download pattern the Leads and Bulk Update pages already use.
+  function exportRunCsv() {
+    if (!selectedRun || !visibleRows.length) return;
+    const csv = Papa.unparse({
+      fields: [
+        "school_id",
+        "school_name",
+        "city",
+        "state",
+        ...SUGGESTION_FIELDS.flatMap((f) => [`current_${f}`, `suggested_${f}`]),
+        "confidence",
+        "source",
+        "notes",
+        "status",
+      ],
+      data: visibleRows.map((item) => {
+        const s = item.school || {};
+        const sug = item.suggestion || {};
+        return [
+          s.id,
+          s.name,
+          s.city,
+          s.state,
+          ...SUGGESTION_FIELDS.flatMap((f) => [s[f] || "", sug[f] || ""]),
+          sug.confidence || "",
+          sug.source || "",
+          sug.notes || "",
+          item.review_status === "pending" ? "Pending" : item.review_status === "applied" ? "Applied" : "Skipped",
+        ];
+      }),
+    });
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `csd-coach-info-run-${selectedRun.id}-${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
   if (!canReview) {
     return (
       <div className="view">
@@ -881,37 +969,56 @@ export default function BatchCoachInfoPage() {
       </div>
 
       <div className="card" style={{ marginBottom: 14 }}>
-        <h3 style={{ margin: 0, marginBottom: 8 }}>Batch Runs</h3>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 8 }}>
+          <h3 style={{ margin: 0 }}>Batch Runs</h3>
+          <label style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}>
+            <input type="checkbox" checked={hideCompletedRuns} onChange={(e) => setHideCompletedRuns(e.target.checked)} />
+            Hide finished runs
+          </label>
+        </div>
         {loadingRuns ? (
           <div className="empty-state">Loading…</div>
         ) : runs.length === 0 ? (
           <div className="empty-state">No batch runs yet -- start one above.</div>
+        ) : visibleRunsList.length === 0 ? (
+          <div className="empty-state">
+            All {runs.length} run{runs.length === 1 ? "" : "s"} are finished -- nothing left to review. Uncheck "Hide finished runs" above to see them.
+          </div>
         ) : (
           <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-            {runs.map((r) => (
-              <div
-                key={r.id}
-                onClick={() => openRun(r.id)}
-                style={{
-                  display: "flex",
-                  justifyContent: "space-between",
-                  alignItems: "center",
-                  flexWrap: "wrap",
-                  gap: 8,
-                  padding: "8px 10px",
-                  border: r.id === selectedRunId ? "1px solid #2f5fa8" : "1px solid #e3e6ea",
-                  borderRadius: 8,
-                  cursor: "pointer",
-                }}
-              >
-                <div style={{ fontSize: 12.5 }}>
-                  <strong>Run #{r.id}</strong> — {new Date(r.created_at).toLocaleString()} — {r.state_filter ? r.state_filter.join(", ") : "all states"} — {r.requested_count} school
-                  {r.requested_count === 1 ? "" : "s"}
-                  {r.candidate_mode === "missing_email" ? " — missing email" : r.candidate_mode === "re_verify" ? " — re-verify" : ""}
-                </div>
-                <StatusBadge status={r.status} />
+            {hideCompletedRuns && openRunsCount < runs.length && (
+              <div style={{ fontSize: 11.5, color: "#9aa1ab" }}>
+                {runs.length - openRunsCount} finished run{runs.length - openRunsCount === 1 ? "" : "s"} hidden.
               </div>
-            ))}
+            )}
+            {visibleRunsList.map((r) => {
+              const pendingCount = r.id === selectedRunId ? pendingReview.length : runPendingCounts[r.id] || 0;
+              return (
+                <div
+                  key={r.id}
+                  onClick={() => openRun(r.id)}
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                    gap: 8,
+                    padding: "8px 10px",
+                    border: r.id === selectedRunId ? "1px solid #2f5fa8" : "1px solid #e3e6ea",
+                    borderRadius: 8,
+                    cursor: "pointer",
+                  }}
+                >
+                  <div style={{ fontSize: 12.5 }}>
+                    <strong>Run #{r.id}</strong> — {new Date(r.created_at).toLocaleString()} — {r.state_filter ? r.state_filter.join(", ") : "all states"} — {r.requested_count} school
+                    {r.requested_count === 1 ? "" : "s"}
+                    {r.candidate_mode === "missing_email" ? " — missing email" : r.candidate_mode === "re_verify" ? " — re-verify" : ""}
+                    {r.status === "collected" && pendingCount > 0 ? ` — ${pendingCount} to review` : ""}
+                  </div>
+                  <StatusBadge status={r.status} />
+                </div>
+              );
+            })}
           </div>
         )}
       </div>
@@ -983,10 +1090,15 @@ export default function BatchCoachInfoPage() {
                   {pendingReview.length} suggestion{pendingReview.length === 1 ? "" : "s"} to review, {reviewedItems.length} already reviewed, {failedItems.length} the AI couldn't produce a
                   suggestion for.
                 </p>
-                <label style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}>
-                  <input type="checkbox" checked={showReviewed} onChange={(e) => setShowReviewed(e.target.checked)} />
-                  Show already-reviewed
-                </label>
+                <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+                  <label style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}>
+                    <input type="checkbox" checked={showReviewed} onChange={(e) => setShowReviewed(e.target.checked)} />
+                    Show already-reviewed
+                  </label>
+                  <button className="btn btn-sm" onClick={exportRunCsv} disabled={visibleRows.length === 0}>
+                    Export to CSV ({visibleRows.length})
+                  </button>
+                </div>
               </div>
 
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 10 }}>
