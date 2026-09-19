@@ -1,7 +1,16 @@
 import { NextResponse } from "next/server";
 import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
 import { withProtocol } from "@/lib/schoolRecheck";
-import { fetchPageText, searchWebWithGraph, findDirectoryPage, findRecentGameEvidence, buildSourceBlocks, buildSearchQuery } from "@/lib/coachInfoLookup";
+import {
+  fetchPageText,
+  searchWebWithGraph,
+  findDirectoryPage,
+  findRecentGameEvidence,
+  findDuplicateNameSchools,
+  serperLocationForState,
+  buildSourceBlocks,
+  buildSearchQuery,
+} from "@/lib/coachInfoLookup";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
 // findDirectoryPage and findRecentGameEvidence (lib/coachInfoLookup) below
@@ -89,8 +98,12 @@ export async function POST(req) {
     // above and buildSearchQuery's own comment) -- every other mode gets
     // the open, identity-confirming query.
     const searchQuery = buildSearchQuery(school, { contactOnly });
+    // See the matching comment in app/api/schools/[id]/discover-coach-info's
+    // own route -- biases the primary Serper search itself toward this
+    // school's state, on top of the state already sitting in searchQuery.
+    const location = serperLocationForState(school.state);
 
-    const [athleticsFetch, websiteFetch, primarySearch, directoryResult, recencyResult] = await Promise.all([
+    const [athleticsFetch, websiteFetch, primarySearch, directoryResult, recencyResult, duplicateSchools] = await Promise.all([
       athleticsUrl ? fetchPageText(athleticsUrl) : Promise.resolve(null),
       websiteUrl ? fetchPageText(websiteUrl) : Promise.resolve(null),
       // searchWebWithGraph makes the exact same Serper call searchWeb always
@@ -98,7 +111,7 @@ export async function POST(req) {
       // Serper already returns alongside the organic results, instead of
       // throwing them away. See that function's own comment in
       // lib/coachInfoLookup.js.
-      searchWebWithGraph(searchQuery, serperKey),
+      searchWebWithGraph(searchQuery, serperKey, location),
       // Second, more targeted search for the school's own staff/faculty
       // directory page -- see findDirectoryPage's own comment for why
       // this exists alongside the primary search above.
@@ -110,6 +123,10 @@ export async function POST(req) {
       // the whole point of sharing lib/coachInfoLookup is that these never
       // drift apart.
       findRecentGameEvidence({ school, serperKey }),
+      // Any other school in the database sharing this exact name -- see
+      // findDuplicateNameSchools's own comment. Kept in the batch prep path
+      // too, same reasoning as the recency search above.
+      findDuplicateNameSchools({ supabase, school }),
     ]);
 
     const { hasUsableContent, userMessage, defaultSource } = buildSourceBlocks({
@@ -124,6 +141,7 @@ export async function POST(req) {
       recencySearchResults: recencyResult.results,
       knowledgeGraph: primarySearch.knowledgeGraph,
       answerBox: primarySearch.answerBox,
+      duplicateSchools,
     });
 
     if (!hasUsableContent) {
