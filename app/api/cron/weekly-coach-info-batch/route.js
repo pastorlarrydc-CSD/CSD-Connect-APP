@@ -6,6 +6,7 @@ import {
   searchWebWithGraph,
   findDirectoryPage,
   findRecentGameEvidence,
+  serperLocationForState,
   buildSourceBlocks,
   buildSearchQuery,
   SYSTEM_PROMPT,
@@ -151,6 +152,25 @@ export async function GET(req) {
     if (itemsErr) throw itemsErr;
 
     const schoolById = new Map(candidates.map((s) => [s.id, s]));
+
+    // Same idea as findDuplicateNameSchools in lib/coachInfoLookup.js (used
+    // by the single-school button and the manual batch tool), but done once
+    // up front as a single batched query across every candidate's name
+    // instead of one query per school -- this loop runs up to 300 schools at
+    // FETCH_CONCURRENCY=8, and 300 extra individual DB round trips inside
+    // that loop would eat into TIME_BUDGET_MS for no real benefit over one
+    // query here. Same purpose either way: give the model a concrete,
+    // this-lookup-specific list of other schools sharing this exact name,
+    // rather than leaving it to infer that from the SYSTEM_PROMPT's general
+    // rule alone.
+    const candidateNames = [...new Set(candidates.map((s) => s.name))];
+    const { data: nameMatches } = await supabase.from("schools").select("id,name,city,state").in("name", candidateNames).eq("is_closed", false);
+    const duplicatesByName = new Map();
+    for (const row of nameMatches || []) {
+      if (!duplicatesByName.has(row.name)) duplicatesByName.set(row.name, []);
+      duplicatesByName.get(row.name).push(row);
+    }
+
     let fetchedReady = 0;
     let fetchedNoContent = 0;
     let fetchErrors = 0;
@@ -175,6 +195,12 @@ export async function GET(req) {
           // lib/coachInfoLookup.js for why every other caller defaults to
           // the open query instead.
           const searchQuery = buildSearchQuery(school, { contactOnly: true });
+          // See the matching comment in the single-school route -- biases
+          // the primary Serper search itself toward this school's state.
+          const location = serperLocationForState(school.state);
+          const duplicateSchools = (duplicatesByName.get(school.name) || [])
+            .filter((r) => r.id !== school.id)
+            .map((r) => ({ city: r.city, state: r.state }));
 
           const [athleticsFetch, websiteFetch, primarySearch, directoryResult, recencyResult] = await Promise.all([
             athleticsUrl ? fetchPageText(athleticsUrl) : Promise.resolve(null),
@@ -184,7 +210,7 @@ export async function GET(req) {
             // fields Serper already returns alongside the organic results,
             // instead of throwing them away. See that function's own
             // comment in lib/coachInfoLookup.js.
-            searchWebWithGraph(searchQuery, serperKey),
+            searchWebWithGraph(searchQuery, serperKey, location),
             // Second, more targeted search for the school's own staff/faculty
             // directory page -- see findDirectoryPage's own comment for why
             // this exists alongside the primary search above.
@@ -210,6 +236,7 @@ export async function GET(req) {
             recencySearchResults: recencyResult.results,
             knowledgeGraph: primarySearch.knowledgeGraph,
             answerBox: primarySearch.answerBox,
+            duplicateSchools,
           });
 
           if (!hasUsableContent) {
