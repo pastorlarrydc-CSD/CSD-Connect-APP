@@ -259,6 +259,9 @@ export default function AdminPage() {
               <Link href="/admin/bulk-update" className="btn btn-sm btn-primary" style={{ marginRight: 8 }}>
                 Bulk Update Schools (CSV)
               </Link>
+              <Link href="/admin/import-reconcile" className="btn btn-sm btn-gold" style={{ marginRight: 8 }}>
+                Import &amp; Reconcile (CSV)
+              </Link>
               <Link href="/admin/bulk-maxpreps" className="btn btn-sm btn-primary" style={{ marginRight: 8 }}>
                 Bulk MaxPreps Discovery
               </Link>
