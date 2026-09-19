@@ -13,6 +13,14 @@ import {
   MODEL,
   RESPONSE_MAX_TOKENS,
 } from "@/lib/coachInfoLookup";
+// Reused here so this cron's own up-front duplicate-name detection (below)
+// stays in sync with findDuplicateNameSchools in lib/coachInfoLookup.js --
+// same normalization, just applied to a batched query instead of one
+// query per school. See that function's own comment for why an exact
+// .eq("name", ...) match isn't enough (e.g. "Saint Edward High School" in
+// Lakewood, OH vs "Saint Edwards High School" in Vero Beach, FL -- two
+// real, different schools whose names differ by a single trailing letter).
+import { looseSchoolNameKey } from "@/lib/importReconcile";
 
 export const maxDuration = 60;
 // RESPONSE_MAX_TOKENS now lives in lib/coachInfoLookup, imported above --
@@ -155,20 +163,33 @@ export async function GET(req) {
 
     // Same idea as findDuplicateNameSchools in lib/coachInfoLookup.js (used
     // by the single-school button and the manual batch tool), but done once
-    // up front as a single batched query across every candidate's name
-    // instead of one query per school -- this loop runs up to 300 schools at
+    // up front as a single batched query across every candidate instead of
+    // one query per school -- this loop runs up to 300 schools at
     // FETCH_CONCURRENCY=8, and 300 extra individual DB round trips inside
     // that loop would eat into TIME_BUDGET_MS for no real benefit over one
     // query here. Same purpose either way: give the model a concrete,
-    // this-lookup-specific list of other schools sharing this exact name,
-    // rather than leaving it to infer that from the SYSTEM_PROMPT's general
-    // rule alone.
-    const candidateNames = [...new Set(candidates.map((s) => s.name))];
-    const { data: nameMatches } = await supabase.from("schools").select("id,name,city,state").in("name", candidateNames).eq("is_closed", false);
-    const duplicatesByName = new Map();
-    for (const row of nameMatches || []) {
-      if (!duplicatesByName.has(row.name)) duplicatesByName.set(row.name, []);
-      duplicatesByName.get(row.name).push(row);
+    // this-lookup-specific list of other schools that could be confused
+    // with this one, rather than leaving it to infer that from the
+    // SYSTEM_PROMPT's general rule alone.
+    //
+    // Matched via looseSchoolNameKey rather than an exact .in("name", ...)
+    // lookup -- an exact match missed the real "Saint Edward High School"
+    // (Lakewood, OH) vs "Saint Edwards High School" (Vero Beach, FL)
+    // mix-up Larry caught, since the two names differ by one letter and
+    // never compared equal. Pulling every open school once and grouping by
+    // loose key catches that kind of near-duplicate too. This is the
+    // proactive half of the fix -- the reactive backstop lives in
+    // normalizeSuggestion (lib/coachInfoLookup.js), which forces any
+    // suggestion mentioning a conflicting state down to "low" confidence
+    // regardless of what the model claims, once this run reaches
+    // collect-batch-runs.
+    const { data: allOpenSchools } = await supabase.from("schools").select("id,name,city,state").eq("is_closed", false);
+    const duplicatesByKey = new Map();
+    for (const row of allOpenSchools || []) {
+      const key = looseSchoolNameKey(row.name);
+      if (!key) continue;
+      if (!duplicatesByKey.has(key)) duplicatesByKey.set(key, []);
+      duplicatesByKey.get(key).push(row);
     }
 
     let fetchedReady = 0;
@@ -198,7 +219,7 @@ export async function GET(req) {
           // See the matching comment in the single-school route -- biases
           // the primary Serper search itself toward this school's state.
           const location = serperLocationForState(school.state);
-          const duplicateSchools = (duplicatesByName.get(school.name) || [])
+          const duplicateSchools = (duplicatesByKey.get(looseSchoolNameKey(school.name)) || [])
             .filter((r) => r.id !== school.id)
             .map((r) => ({ city: r.city, state: r.state }));
 
