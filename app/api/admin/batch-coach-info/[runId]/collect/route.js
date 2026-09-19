@@ -86,9 +86,13 @@ export async function POST(req, { params }) {
 
     // Needed to auto-apply below (a result line only carries an item id, not
     // the school it belongs to) -- one query for the whole run instead of
-    // one per item.
-    const { data: itemRows } = await supabase.from("coach_info_batch_items").select("id,school_id").eq("batch_run_id", runId);
+    // one per item. Also embeds each item's school city/state (via the
+    // school_id -> schools FK) so normalizeSuggestion's same-name-school
+    // backstop below has something to check the AI's answer against --
+    // see that function's own comment in lib/coachInfoLookup.js.
+    const { data: itemRows } = await supabase.from("coach_info_batch_items").select("id,school_id,school:schools(city,state)").eq("batch_run_id", runId);
     const schoolIdByItemId = new Map((itemRows || []).map((r) => [r.id, r.school_id]));
+    const schoolLocationByItemId = new Map((itemRows || []).map((r) => [r.id, r.school]));
 
     // Each result line updates an EXISTING item row (created back in the
     // "start run" step, one per school) -- so this is always an update,
@@ -128,7 +132,7 @@ export async function POST(req, { params }) {
         const rawText = entry.result.message?.content?.[0]?.text || "";
         const parsed = parseModelJson(rawText);
         if (parsed) {
-          patch = { suggestion: normalizeSuggestion(parsed, "batch AI lookup"), suggestion_error: null };
+          patch = { suggestion: normalizeSuggestion(parsed, "batch AI lookup", schoolLocationByItemId.get(itemId)), suggestion_error: null };
           succeeded++;
         } else {
           patch = { suggestion: null, suggestion_error: "Could not parse the AI's response for this school." };
