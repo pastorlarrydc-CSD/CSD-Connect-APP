@@ -117,7 +117,12 @@ const TOOLS = [
     key: "coach_info",
     runsTable: "coach_info_batch_runs",
     itemsTable: "coach_info_batch_items",
-    buildSuggestion: (parsed) => normalizeSuggestion(parsed, "batch AI lookup"),
+    // `location` (school city/state) is only ever supplied for coach_info
+    // (see the schoolLocationByItemId fetch below) -- normalizeSuggestion
+    // uses it for the same-name-school confidence backstop; the other three
+    // tools' normalize* functions below simply don't declare a second
+    // parameter, so passing one is harmless.
+    buildSuggestion: (parsed, location) => normalizeSuggestion(parsed, "batch AI lookup", location),
     autoApplyHighConfidence: true,
     label: "Coach-Info",
     criteria: "Coach name on file, missing email",
@@ -233,11 +238,21 @@ export async function GET(req) {
         // Only coach_info auto-applies (see the tool config above) -- and
         // only that lookup needs a school_id per item, since a result line
         // itself only carries the item id. One query for the whole run
-        // instead of one per item.
+        // instead of one per item. Also embeds each item's school city/state
+        // (via the school_id -> schools FK) for coach_info specifically --
+        // normalizeSuggestion's same-name-school confidence backstop needs
+        // it, and this is the one collect path that writes to the schools
+        // table with zero human review, so it's the most important place
+        // for that backstop to actually run.
         let schoolIdByItemId = null;
+        let schoolLocationByItemId = null;
         if (tool.autoApplyHighConfidence) {
-          const { data: itemRows } = await supabase.from(tool.itemsTable).select("id,school_id").eq("batch_run_id", run.id);
+          const selectCols = tool.key === "coach_info" ? "id,school_id,school:schools(city,state)" : "id,school_id";
+          const { data: itemRows } = await supabase.from(tool.itemsTable).select(selectCols).eq("batch_run_id", run.id);
           schoolIdByItemId = new Map((itemRows || []).map((r) => [r.id, r.school_id]));
+          if (tool.key === "coach_info") {
+            schoolLocationByItemId = new Map((itemRows || []).map((r) => [r.id, r.school]));
+          }
         }
 
         // Same update-only approach (never upsert) as every manual collect
@@ -271,7 +286,7 @@ export async function GET(req) {
             const rawText = entry.result.message?.content?.[0]?.text || "";
             const parsed = parseModelJson(rawText);
             if (parsed) {
-              patch = { suggestion: tool.buildSuggestion(parsed), suggestion_error: null };
+              patch = { suggestion: tool.buildSuggestion(parsed, schoolLocationByItemId?.get(itemId)), suggestion_error: null };
               succeeded++;
             } else {
               patch = { suggestion: null, suggestion_error: "Could not parse the AI's response for this school." };
