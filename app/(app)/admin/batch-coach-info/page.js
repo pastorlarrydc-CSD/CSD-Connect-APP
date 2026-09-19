@@ -183,6 +183,18 @@ export default function BatchCoachInfoPage() {
   // Bulk-skip: same idea for suggestions with nothing to apply at all --
   // see bulkSkipNoChanges below.
   const [bulkSkipping, setBulkSkipping] = useState(false);
+  // CSV mass-review round-trip: Export to CSV already dumps every pending
+  // suggestion as one current/suggested pair per field, wide-open for
+  // editing in Excel -- this is the other half, re-uploading that (possibly
+  // hand-corrected) sheet to apply everything at once instead of clicking
+  // Apply on each row on screen. Built for exactly the workflow of scanning
+  // hundreds of AI suggestions in a spreadsheet instead of one at a time --
+  // see applySuggestionFromCsv below for exactly what a re-upload can and
+  // can't change, and why.
+  const [csvImporting, setCsvImporting] = useState(false);
+  const [csvImportError, setCsvImportError] = useState("");
+  const [csvImportProgress, setCsvImportProgress] = useState({ done: 0, total: 0 });
+  const [csvImportResult, setCsvImportResult] = useState(null); // {applied, noChange, unmatched, alreadyReviewed, failures}
   const [focusedIndex, setFocusedIndex] = useState(0);
   // The AI's one-paragraph reasoning/notes for each suggestion is collapsed
   // by default (Larry's own words: reading a full paragraph per row on a
@@ -721,6 +733,149 @@ export default function BatchCoachInfoPage() {
     }
   }
 
+  // Turns one uploaded CSV row's suggested_* columns into { field: value }
+  // -- blank cells mean "leave unchanged", same convention Bulk Update's
+  // CSV round-trip already uses, so a reviewer only has to touch the cells
+  // they actually want to correct or approve.
+  function effectiveFieldsFromCsvRow(row) {
+    const out = {};
+    SUGGESTION_FIELDS.forEach((f) => {
+      const v = (row[`suggested_${f}`] || "").toString().trim();
+      if (v) out[f] = v;
+    });
+    return out;
+  }
+
+  // The CSV-upload counterpart to applySuggestionCore above -- same two
+  // writes (schools + school_change_log), same "mark the item reviewed"
+  // finish, but the values come from a (possibly hand-edited) spreadsheet
+  // row instead of item.suggestion. One safety property carries over
+  // unchanged: hc_email that the AI could only guess at (never actually
+  // found stated anywhere -- see hc_email_estimated) still doesn't get
+  // marked "verified" -- UNLESS the value in the sheet no longer matches
+  // that original guess, because at that point Larry typed in a real
+  // answer himself, which is exactly the kind of human confirmation
+  // "verified" is supposed to mean.
+  async function applySuggestionFromCsv(item, effectiveFields) {
+    const s = item.school;
+    const originalSug = item.suggestion || {};
+    if (!s) return { ok: false, error: "Missing school." };
+    try {
+      const update = {};
+      const changes = [];
+      let sawChange = false;
+      SUGGESTION_FIELDS.forEach((f) => {
+        const newVal = (effectiveFields[f] || "").trim();
+        if (!newVal || newVal === (s[f] || "")) return;
+        sawChange = true;
+        update[f] = newVal;
+        const isUneditedEstimatedEmail = f === "hc_email" && originalSug.hc_email_estimated && newVal === (originalSug.hc_email || "").trim();
+        const source = isUneditedEstimatedEmail ? "Batch AI lookup (pattern-estimated email, reviewed via CSV)" : "Batch AI lookup (CSV review, reviewed)";
+        changes.push({ school_id: s.id, field_name: f, old_value: s[f] || null, new_value: newVal, source, changed_by: user.id });
+      });
+
+      const allChangesAreUnverifiedGuesses =
+        sawChange && changes.every((c) => c.field_name === "hc_email" && originalSug.hc_email_estimated && c.new_value === (originalSug.hc_email || "").trim());
+
+      if (Object.keys(update).length > 0) {
+        if (!allChangesAreUnverifiedGuesses) {
+          update.verification_status = "verified";
+          update.last_verified_at = new Date().toISOString();
+        }
+        const { error: updateErr } = await supabase.from("schools").update(update).eq("id", s.id);
+        if (updateErr) throw updateErr;
+        if (changes.length > 0) {
+          const { error: logErr } = await supabase.from("school_change_log").insert(changes);
+          if (logErr) throw logErr;
+        }
+      }
+      // No changes at all (every suggested_* cell was blank or already
+      // matched what's on file) -- same as clicking "Skip (no changes)"
+      // rather than "Apply", so the item is marked skipped, not applied.
+      const { error: itemErr } = await supabase
+        .from("coach_info_batch_items")
+        .update({ review_status: sawChange ? "applied" : "skipped", reviewed_at: new Date().toISOString(), reviewed_by: user.id })
+        .eq("id", item.id);
+      if (itemErr) throw itemErr;
+      return { ok: true, changed: sawChange };
+    } catch (err) {
+      return { ok: false, error: err.message || "Could not apply this row." };
+    }
+  }
+
+  // Reads an uploaded, reviewed CSV (from exportRunCsv below, edited or
+  // not) and applies every matched row in one pass -- the actual point of
+  // this whole round-trip: instead of clicking through a web UI one
+  // suggestion at a time, Larry can scan/correct/delete rows in Excel and
+  // upload the result to process a whole run in one shot. Matches rows back
+  // to this run's own items by school_id; anything that doesn't match, or
+  // was already reviewed since the sheet was exported (e.g. applied earlier
+  // via the on-screen button), is reported but not touched.
+  async function handleCsvImport(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setCsvImportError("");
+    setCsvImportResult(null);
+    setCsvImporting(true);
+    try {
+      const text = await file.text();
+      const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+      if (parsed.errors?.length) throw new Error(parsed.errors[0].message);
+      const rows = parsed.data || [];
+      if (!rows.length) throw new Error("The file has no data rows.");
+
+      const itemsBySchoolId = new Map(items.map((i) => [String(i.school?.id || ""), i]));
+
+      const targets = [];
+      let unmatched = 0;
+      let alreadyReviewed = 0;
+      rows.forEach((row) => {
+        const schoolId = String(row.school_id || "").trim();
+        const item = schoolId ? itemsBySchoolId.get(schoolId) : null;
+        if (!item) {
+          unmatched++;
+          return;
+        }
+        if (item.review_status !== "pending") {
+          alreadyReviewed++;
+          return;
+        }
+        targets.push({ item, effectiveFields: effectiveFieldsFromCsvRow(row) });
+      });
+
+      if (!targets.length) {
+        setCsvImportResult({ applied: 0, noChange: 0, unmatched, alreadyReviewed, failures: [] });
+        return;
+      }
+
+      setCsvImportProgress({ done: 0, total: targets.length });
+      let done = 0;
+      let applied = 0;
+      let noChange = 0;
+      const failures = [];
+      await runWithConcurrency(targets, APPLY_CONCURRENCY, async ({ item, effectiveFields }) => {
+        const result = await applySuggestionFromCsv(item, effectiveFields);
+        if (result.ok) {
+          setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: result.changed ? "applied" : "skipped" } : i)));
+          if (result.changed) applied++;
+          else noChange++;
+        } else {
+          failures.push(`${item.school?.name || `#${item.id}`}: ${result.error}`);
+        }
+        done++;
+        setCsvImportProgress({ done, total: targets.length });
+      });
+
+      setCsvImportResult({ applied, noChange, unmatched, alreadyReviewed, failures });
+      setFocusedIndex(0);
+    } catch (err) {
+      setCsvImportError(err.message || "Could not read this file.");
+    } finally {
+      setCsvImporting(false);
+      e.target.value = "";
+    }
+  }
+
   async function applyItem(item) {
     setApplyingId(item.id);
     setReviewError("");
@@ -833,6 +988,7 @@ export default function BatchCoachInfoPage() {
         "state",
         ...SUGGESTION_FIELDS.flatMap((f) => [`current_${f}`, `suggested_${f}`]),
         "confidence",
+        "email_estimated",
         "source",
         "notes",
         "status",
@@ -847,6 +1003,13 @@ export default function BatchCoachInfoPage() {
           s.state,
           ...SUGGESTION_FIELDS.flatMap((f) => [s[f] || "", sug[f] || ""]),
           sug.confidence || "",
+          // Flags an hc_email that's a pattern guess (firstname.lastname@
+          // domain) the AI never actually found stated anywhere -- edit or
+          // clear the suggested_hc_email cell for these if you're not
+          // confident in the guess; leaving it as-is on re-upload still
+          // applies it, just without marking the record "verified" (see
+          // applySuggestionFromCsv).
+          sug.hc_email_estimated ? "Yes" : "No",
           sug.source || "",
           sug.notes || "",
           item.review_status === "pending" ? "Pending" : item.review_status === "applied" ? "Applied" : "Skipped",
@@ -1104,8 +1267,30 @@ export default function BatchCoachInfoPage() {
                   <button className="btn btn-sm" onClick={exportRunCsv} disabled={visibleRows.length === 0}>
                     Export to CSV ({visibleRows.length})
                   </button>
+                  <label className="btn btn-sm btn-gold" style={{ cursor: csvImporting ? "default" : "pointer" }}>
+                    {csvImporting ? `Applying ${csvImportProgress.done}/${csvImportProgress.total}…` : "Import reviewed CSV"}
+                    <input type="file" accept=".csv" onChange={handleCsvImport} disabled={csvImporting} style={{ display: "none" }} />
+                  </label>
                 </div>
               </div>
+
+              {csvImportError && (
+                <div className="notice danger" style={{ marginBottom: 10, fontSize: 12.5 }}>
+                  {csvImportError}
+                </div>
+              )}
+              {csvImportResult && (
+                <div className="notice info" style={{ marginBottom: 10, fontSize: 12.5 }}>
+                  Applied {csvImportResult.applied}, {csvImportResult.noChange} had nothing to change, {csvImportResult.alreadyReviewed} were already reviewed since export,{" "}
+                  {csvImportResult.unmatched} didn&apos;t match a row in this run.
+                  {csvImportResult.failures?.length > 0 && (
+                    <div style={{ marginTop: 4 }}>
+                      {csvImportResult.failures.length} failed: {csvImportResult.failures.slice(0, 3).join("; ")}
+                      {csvImportResult.failures.length > 3 ? "…" : ""}
+                    </div>
+                  )}
+                </div>
+              )}
 
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 10 }}>
                 <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
