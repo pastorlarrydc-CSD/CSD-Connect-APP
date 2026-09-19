@@ -6,6 +6,8 @@ import {
   searchWebWithGraph,
   findDirectoryPage,
   findRecentGameEvidence,
+  findDuplicateNameSchools,
+  serperLocationForState,
   SYSTEM_PROMPT,
   parseModelJson,
   normalizeSuggestion,
@@ -131,8 +133,14 @@ export async function POST(req, { params }) {
     // own comment in lib/coachInfoLookup.js for the full reasoning (and the
     // Clyde A. Erwin HS incident that surfaced this).
     const searchQuery = buildSearchQuery(school);
+    // Biases the primary Serper search itself toward this school's state --
+    // see serperSearch's own comment in lib/coachInfoLookup.js for why this
+    // is worth doing on top of the state already sitting in searchQuery's
+    // own text (the Buchanan HS, MI/CA mix-up this was added for happened
+    // despite "MI" already being in the query).
+    const location = serperLocationForState(school.state);
 
-    const [athleticsFetch, websiteFetch, primarySearch, directoryResult, recencyResult] = await Promise.all([
+    const [athleticsFetch, websiteFetch, primarySearch, directoryResult, recencyResult, duplicateSchools] = await Promise.all([
       athleticsUrl ? fetchPageText(athleticsUrl) : Promise.resolve(null),
       websiteUrl ? fetchPageText(websiteUrl) : Promise.resolve(null),
       // searchWebWithGraph makes the exact same Serper call searchWeb always
@@ -140,7 +148,7 @@ export async function POST(req, { params }) {
       // Serper already returns alongside the organic results, instead of
       // throwing them away. See that function's own comment in
       // lib/coachInfoLookup.js.
-      searchWebWithGraph(searchQuery, serperKey),
+      searchWebWithGraph(searchQuery, serperKey, location),
       // Second, more targeted search for the school's own staff/faculty
       // directory page -- see findDirectoryPage's own comment for why
       // this exists alongside the primary search above.
@@ -150,6 +158,10 @@ export async function POST(req, { params }) {
       // is what actually lets the model say "confirmed active by a Week 3
       // score" instead of just "confidently named on an undated page."
       findRecentGameEvidence({ school, serperKey }),
+      // Any other school in the database sharing this exact name -- see
+      // findDuplicateNameSchools's own comment. Run alongside everything
+      // else above rather than after, same as the rest of this Promise.all.
+      findDuplicateNameSchools({ supabase, school }),
     ]);
 
     const { hasUsableContent, userMessage, defaultSource } = buildSourceBlocks({
@@ -164,6 +176,7 @@ export async function POST(req, { params }) {
       recencySearchResults: recencyResult.results,
       knowledgeGraph: primarySearch.knowledgeGraph,
       answerBox: primarySearch.answerBox,
+      duplicateSchools,
     });
 
     if (!hasUsableContent) {
