@@ -1012,7 +1012,13 @@ export default function BatchCoachInfoPage() {
                   <div style={{ fontSize: 12.5 }}>
                     <strong>Run #{r.id}</strong> — {new Date(r.created_at).toLocaleString()} — {r.state_filter ? r.state_filter.join(", ") : "all states"} — {r.requested_count} school
                     {r.requested_count === 1 ? "" : "s"}
-                    {r.candidate_mode === "missing_email" ? " — missing email" : r.candidate_mode === "re_verify" ? " — re-verify" : ""}
+                    {r.candidate_mode === "missing_email"
+                      ? " — missing email"
+                      : r.candidate_mode === "re_verify"
+                      ? " — re-verify"
+                      : r.candidate_mode === "csv_upload"
+                      ? " — from CSV import"
+                      : ""}
                     {r.status === "collected" && pendingCount > 0 ? ` — ${pendingCount} to review` : ""}
                   </div>
                   <StatusBadge status={r.status} />
