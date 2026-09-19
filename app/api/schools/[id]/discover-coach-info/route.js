@@ -229,7 +229,7 @@ export async function POST(req, { params }) {
       return NextResponse.json({ error: "Could not parse the AI response. Please try again." }, { status: 502 });
     }
 
-    return NextResponse.json(normalizeSuggestion(parsed, defaultSource));
+    return NextResponse.json(normalizeSuggestion(parsed, defaultSource, { city: school.city, state: school.state }));
   } catch (err) {
     console.error("discover-coach-info error", err);
     return NextResponse.json({ error: "Could not look up coach info right now. Please try again." }, { status: 500 });
