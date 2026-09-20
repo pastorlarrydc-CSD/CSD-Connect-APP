@@ -336,6 +336,16 @@ export default function BatchAthleticsPage() {
         // lib/dataQuality.js.
         .eq("athletics_not_available", false)
         .eq("is_closed", false)
+        // Skip schools Larry has already marked reviewed/confirmed-accurate
+        // (verification_status = "verified" -- set via the Needs-Review
+        // dashboard's "Confirmed accurate" action, a Quick Fix save, a
+        // coach's own self-update, or Import & Reconcile) even if this
+        // particular field happens to still read blank -- a human already
+        // looked at this record, so it shouldn't come back through an
+        // automated sweep. Doesn't affect the single-school "Find Athletics
+        // Page" button on a school's own profile, which is still there any
+        // time someone wants to force a fresh look at one specific school.
+        .neq("verification_status", "verified")
         .order("id", { ascending: true })
         .limit(targetCount * 3);
       if (scopeMode !== "all" || states.length) {
