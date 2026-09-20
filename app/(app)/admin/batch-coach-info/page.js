@@ -1419,6 +1419,16 @@ export default function BatchCoachInfoPage() {
                           const suggested = (sug[f] || "").trim();
                           return suggested && suggested !== (s[f] || "");
                         });
+                        // A blank name getting filled in for the first time is
+                        // routine. A name that was ALREADY on file getting
+                        // replaced with a different one is the exact shape of
+                        // the Saint Edward/Saint Edwards mix-up Larry caught
+                        // by hand -- the AI found a real coach, just possibly
+                        // at the wrong school. Flag it so a reviewer's eye
+                        // catches it before an Apply click, rather than
+                        // relying on them to notice a quiet text diff.
+                        const hadPriorName = Boolean((s.hc_first_name || "").trim() || (s.hc_last_name || "").trim());
+                        const nameChanged = hadPriorName && (changedFields.includes("hc_first_name") || changedFields.includes("hc_last_name"));
                         return (
                           <tr
                             key={item.id}
@@ -1427,7 +1437,7 @@ export default function BatchCoachInfoPage() {
                               opacity: reviewed ? 0.55 : 1,
                               verticalAlign: "top",
                               background: isFocused ? "#eef4fb" : undefined,
-                              boxShadow: isFocused ? "inset 3px 0 0 #2f5fa8" : undefined,
+                              boxShadow: isFocused ? "inset 3px 0 0 #2f5fa8" : nameChanged ? "inset 3px 0 0 #b3261e" : undefined,
                             }}
                           >
                             <td style={{ padding: "8px", whiteSpace: "nowrap" }}>
@@ -1448,6 +1458,11 @@ export default function BatchCoachInfoPage() {
                               {s.hc_email && <div style={{ color: "#9aa1ab" }}>{s.hc_email}</div>}
                             </td>
                             <td style={{ padding: "8px", minWidth: 260 }}>
+                              {nameChanged && (
+                                <div style={{ color: "#b3261e", fontWeight: 600, marginBottom: 4 }}>
+                                  ⚠ Different coach than on file — confirm this is the same program before applying
+                                </div>
+                              )}
                               {changedFields.length === 0 ? (
                                 <span style={{ color: "#9aa1ab" }}>No changes suggested</span>
                               ) : (
