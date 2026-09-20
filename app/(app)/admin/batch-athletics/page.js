@@ -168,14 +168,18 @@ export default function BatchAthleticsPage() {
   const openRunsCount = runs.filter(isRunOpen).length;
   const visibleRunsList = hideCompletedRuns ? runs.filter(isRunOpen) : runs;
 
-  // Matches a row against the current search box -- school name or city,
-  // case-insensitive. Same loose substring match as Batch Coach-Info's own
-  // matchesSearch.
+  // Matches a row against the current search box -- school name, city, OR
+  // the current/suggested athletics URL, case-insensitive. Same loose
+  // substring match as Batch Coach-Info's own matchesSearch. Matching on
+  // the URL too means a reviewer who already knows a district's domain
+  // (e.g. "leusd.k12.ca.us") can jump straight to every school on it.
   function matchesSearch(item) {
     const q = searchQuery.trim().toLowerCase();
     if (!q) return true;
     const s = item.school;
-    return Boolean(s && (`${s.name || ""}`.toLowerCase().includes(q) || `${s.city || ""}`.toLowerCase().includes(q)));
+    const sug = item.suggestion;
+    const haystack = [s?.name, s?.city, s?.athletics_url, sug?.best_url].filter(Boolean).join(" ").toLowerCase();
+    return haystack.includes(q);
   }
 
   // Base row set the table renders from -- pendingReview, or (with "Show
@@ -817,7 +821,7 @@ export default function BatchAthleticsPage() {
                 <input
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Search school or city…"
+                  placeholder="Search school, city, or URL…"
                   style={{ maxWidth: 220, fontSize: 12.5 }}
                 />
               </div>
