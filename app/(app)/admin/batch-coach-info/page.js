@@ -257,14 +257,34 @@ export default function BatchCoachInfoPage() {
   });
   const noChangesPendingCount = noChangesPendingItems.length;
 
-  // Matches a row against the current search box -- school name or city,
-  // case-insensitive, same loose substring match a reviewer would expect
-  // from a quick filter box.
+  // Matches a row against the current search box -- school name, city, OR
+  // a coach's name/email, case-insensitive, same loose substring match a
+  // reviewer would expect from a quick filter box. Checks both the coach
+  // already on file (s.hc_*) and the AI's suggested coach (sug.hc_*), so
+  // typing a name finds the row whether that name is the old value, the
+  // new value, or (the common case) both -- a reviewer spot-checking
+  // against a source they already have open (a conference site, a text
+  // from a colleague) can jump straight to that coach's row instead of
+  // scrolling to find their school.
   function matchesSearch(item) {
     const q = searchQuery.trim().toLowerCase();
     if (!q) return true;
     const s = item.school;
-    return Boolean(s && (`${s.name || ""}`.toLowerCase().includes(q) || `${s.city || ""}`.toLowerCase().includes(q)));
+    const sug = item.suggestion;
+    const haystack = [
+      s?.name,
+      s?.city,
+      s?.hc_first_name,
+      s?.hc_last_name,
+      s?.hc_email,
+      sug?.hc_first_name,
+      sug?.hc_last_name,
+      sug?.hc_email,
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+    return haystack.includes(q);
   }
 
   // Base row set the table renders from -- everything still pending, or
@@ -1312,8 +1332,8 @@ export default function BatchCoachInfoPage() {
                 <input
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Search school or city…"
-                  style={{ maxWidth: 220, fontSize: 12.5 }}
+                  placeholder="Search school, city, or coach name…"
+                  style={{ maxWidth: 240, fontSize: 12.5 }}
                 />
               </div>
 
@@ -1415,6 +1435,17 @@ export default function BatchCoachInfoPage() {
                               <div style={{ color: "#9aa1ab" }}>
                                 {s.city}, {s.state}
                               </div>
+                              {/* On-file coach, shown for every row (not just
+                                  ones with a diff) so a reviewer can compare
+                                  it against a source they already trust and
+                                  hit Apply without opening the record -- see
+                                  matchesSearch above for why this same
+                                  name/email is also what the search box
+                                  matches against. */}
+                              <div style={{ color: "#697386", marginTop: 2 }}>
+                                {s.hc_first_name || s.hc_last_name ? `${s.hc_first_name || ""} ${s.hc_last_name || ""}`.trim() : "No coach on file"}
+                              </div>
+                              {s.hc_email && <div style={{ color: "#9aa1ab" }}>{s.hc_email}</div>}
                             </td>
                             <td style={{ padding: "8px", minWidth: 260 }}>
                               {changedFields.length === 0 ? (
