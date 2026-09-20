@@ -160,14 +160,21 @@ export default function BatchSocialPage() {
   const openRunsCount = runs.filter(isRunOpen).length;
   const visibleRunsList = hideCompletedRuns ? runs.filter(isRunOpen) : runs;
 
-  // Matches a row against the current search box -- school name or city,
-  // case-insensitive. Same loose substring match as Batch Coach-Info's own
-  // matchesSearch.
+  // Matches a row against the current search box -- school name, city, or
+  // a coach's name/handle, case-insensitive. Same loose substring match as
+  // Batch Coach-Info's own matchesSearch. Checks the coach name already on
+  // file plus both the on-file and suggested Twitter/Facebook handles, so
+  // typing a coach's name or handle jumps straight to their row.
   function matchesSearch(item) {
     const q = searchQuery.trim().toLowerCase();
     if (!q) return true;
     const s = item.school;
-    return Boolean(s && (`${s.name || ""}`.toLowerCase().includes(q) || `${s.city || ""}`.toLowerCase().includes(q)));
+    const sug = item.suggestion;
+    const haystack = [s?.name, s?.city, s?.hc_first_name, s?.hc_last_name, s?.hc_twitter, s?.hc_facebook, sug?.twitter_url, sug?.facebook_url]
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase();
+    return haystack.includes(q);
   }
 
   // Base row set the table renders from -- pendingReview, or (with "Show
@@ -835,7 +842,7 @@ export default function BatchSocialPage() {
                 <input
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Search school or city…"
+                  placeholder="Search school, city, coach, or handle…"
                   style={{ maxWidth: 220, fontSize: 12.5 }}
                 />
               </div>
@@ -914,18 +921,35 @@ export default function BatchSocialPage() {
                             </div>
                           </td>
                           <td style={{ padding: "8px", minWidth: 260 }}>
-                            {sug.twitter_url && (
-                              <div>
-                                <strong>Twitter/X:</strong> {sug.twitter_url}
-                                {s.hc_twitter ? <span style={{ color: "#9aa1ab" }}> (was: {s.hc_twitter})</span> : null}
-                              </div>
-                            )}
-                            {sug.facebook_url && (
-                              <div>
-                                <strong>Facebook:</strong> {sug.facebook_url}
-                                {s.hc_facebook ? <span style={{ color: "#9aa1ab" }}> (was: {s.hc_facebook})</span> : null}
-                              </div>
-                            )}
+                            {/* Both platforms always render now, even when the
+                                AI found nothing new for one of them -- same
+                                "show the current value on every row" treatment
+                                Athletics/MaxPreps already had and Coach-Info
+                                just got, so a reviewer can compare against
+                                something they already trust without opening
+                                the record. */}
+                            <div>
+                              <strong>Twitter/X:</strong>{" "}
+                              {sug.twitter_url ? (
+                                <>
+                                  {sug.twitter_url}
+                                  {s.hc_twitter && s.hc_twitter !== sug.twitter_url ? <span style={{ color: "#9aa1ab" }}> (was: {s.hc_twitter})</span> : null}
+                                </>
+                              ) : (
+                                <span style={{ color: "#9aa1ab" }}>{s.hc_twitter || "(blank)"}</span>
+                              )}
+                            </div>
+                            <div>
+                              <strong>Facebook:</strong>{" "}
+                              {sug.facebook_url ? (
+                                <>
+                                  {sug.facebook_url}
+                                  {s.hc_facebook && s.hc_facebook !== sug.facebook_url ? <span style={{ color: "#9aa1ab" }}> (was: {s.hc_facebook})</span> : null}
+                                </>
+                              ) : (
+                                <span style={{ color: "#9aa1ab" }}>{s.hc_facebook || "(blank)"}</span>
+                              )}
+                            </div>
                             {sug.reasoning && (
                               <div style={{ marginTop: 4 }}>
                                 <button
