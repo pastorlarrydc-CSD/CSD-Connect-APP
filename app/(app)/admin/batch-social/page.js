@@ -1,5 +1,6 @@
 "use client";
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, Suspense } from "react";
+import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
@@ -77,10 +78,28 @@ function confidenceColor(confidence) {
   return "#b3261e"; // low or none
 }
 
-export default function BatchSocialPage() {
+// Reads ?fromCoachInfoRun= off the URL -- see BatchSocialPage's Suspense
+// wrapper at the bottom, same requirement/reasoning as
+// app/(app)/admin/batch-coach-info/page.js's own Inner/Suspense split.
+function BatchSocialPageInner() {
   const supabase = getSupabaseBrowserClient();
   const { user, profile } = useAuth();
   const canReview = profile?.role === "verifier" || profile?.role === "sysadmin";
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
+
+  // Set when this page was opened via the "Start Social Media Discovery for
+  // These Schools" button on a Batch Coach-Info run -- see that page. Drives
+  // a distinct "chained run" card in place of the usual state/count picker,
+  // scoped to just that run's schools instead of a state-based pull.
+  const [chainSourceRunId] = useState(() => {
+    const fromUrl = Number(searchParams.get("fromCoachInfoRun"));
+    return Number.isFinite(fromUrl) && fromUrl > 0 ? fromUrl : null;
+  });
+  const [chainDismissed, setChainDismissed] = useState(false);
+  const [chainCreating, setChainCreating] = useState(false);
+  const [chainError, setChainError] = useState("");
 
   const [runs, setRuns] = useState([]);
   const [runPendingCounts, setRunPendingCounts] = useState({});
@@ -377,6 +396,80 @@ export default function BatchSocialPage() {
     }
   }
 
+  // Chained run: scoped to exactly the schools Batch Coach-Info just found a
+  // coach name for in run #chainSourceRunId, instead of a state/count pull.
+  // Still re-runs Social's own eligibility filter (coach name present,
+  // missing at least one handle, not marked unavailable/closed) and the same
+  // "never re-touch a school this tool has already been through" exclusion
+  // as startRun above -- a school landing in the Coach-Info run doesn't
+  // bypass any of Social's own rules, it just narrows the candidate pool to
+  // schools we know just got a name.
+  async function startChainedRun() {
+    if (!chainSourceRunId) return;
+    setChainCreating(true);
+    setChainError("");
+    try {
+      const { data: sourceItems, error: srcErr } = await supabase
+        .from("coach_info_batch_items")
+        .select("school_id")
+        .eq("batch_run_id", chainSourceRunId);
+      if (srcErr) throw srcErr;
+      const schoolIds = Array.from(new Set((sourceItems || []).map((i) => i.school_id).filter(Boolean)));
+      if (!schoolIds.length) {
+        setChainError(`Coach-Info run #${chainSourceRunId} doesn't have any schools to chain from.`);
+        return;
+      }
+
+      const { data: touchedRows, error: touchedErr } = await supabase.from("social_batch_items").select("school_id");
+      if (touchedErr) throw touchedErr;
+      const excludedIds = new Set((touchedRows || []).map((r) => r.school_id));
+
+      const { data: rawSchoolsData, error: schoolsErr } = await supabase
+        .from("schools")
+        .select("id,name,city,state,hc_first_name,hc_last_name")
+        .in("id", schoolIds)
+        .not("hc_first_name", "is", null)
+        .neq("hc_first_name", "")
+        .not("hc_last_name", "is", null)
+        .neq("hc_last_name", "")
+        .or("hc_twitter.is.null,hc_twitter.eq.,hc_facebook.is.null,hc_facebook.eq.")
+        .eq("social_not_available", false)
+        .eq("is_closed", false)
+        .order("id", { ascending: true });
+      if (schoolsErr) throw schoolsErr;
+      const schoolsData = (rawSchoolsData || []).filter((s) => !excludedIds.has(s.id));
+      if (!schoolsData.length) {
+        setChainError(
+          `None of the schools from Coach-Info run #${chainSourceRunId} currently qualify -- they may already have both handles on file, be marked social-unavailable or closed, or have already been through Social Media Discovery before.`
+        );
+        return;
+      }
+
+      const { data: runRow, error: runErr } = await supabase
+        .from("social_batch_runs")
+        .insert({ status: "collecting", state_filter: null, requested_count: schoolsData.length, created_by: user.id })
+        .select()
+        .single();
+      if (runErr) throw runErr;
+
+      const itemRows = schoolsData.map((s) => ({ batch_run_id: runRow.id, school_id: s.id }));
+      const { error: itemsErr } = await supabase.from("social_batch_items").insert(itemRows);
+      if (itemsErr) throw itemsErr;
+
+      await loadRuns();
+      openRun(runRow.id);
+      // Clears ?fromCoachInfoRun= now that the chained run exists, so
+      // reloading (or the URL-persistence effect on this page, if this page
+      // ever grows one) doesn't keep re-showing the chain-setup card on top
+      // of a run that's already been created.
+      router.replace(pathname, { scroll: false });
+    } catch (err) {
+      setChainError(err.message || "Could not start a chained batch run.");
+    } finally {
+      setChainCreating(false);
+    }
+  }
+
   async function fetchSources() {
     const toFetch = items.filter((i) => i.fetch_status === "pending");
     if (!toFetch.length) return;
@@ -643,52 +736,84 @@ export default function BatchSocialPage() {
         </div>
       </div>
 
-      <div className="card" style={{ marginBottom: 14 }}>
-        <h3>Start a New Batch Run</h3>
-        <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
-          Pulls schools that already have a head coach name on file but are missing a Twitter/X and/or Facebook handle -- a useful search needs a name, so schools with no coach name yet
-          can't be helped by this tool (run Batch Coach-Info Discovery first for those).
-          {" "}Any school already applied, skipped, or attempted here before is automatically left out of every future run.
-        </p>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
-            <input type="radio" checked={scopeMode === "priority"} onChange={() => setScopeMode("priority")} />
-            Priority recruiting states ({PRIORITY_STATES.join(", ")})
-          </label>
-          <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
-            <input type="radio" checked={scopeMode === "all"} onChange={() => setScopeMode("all")} />
-            All states (or type a custom list below)
-          </label>
-          {scopeMode === "all" && (
-            <input
-              value={customStates}
-              onChange={(e) => setCustomStates(e.target.value)}
-              placeholder="Leave blank for every state, or type e.g. TX, OK, AR"
-              style={{ maxWidth: 360 }}
-            />
-          )}
-          <label style={{ fontSize: 13 }}>
-            How many schools:{" "}
-            <select value={targetCount} onChange={(e) => setTargetCount(Number(e.target.value))}>
-              {TARGET_COUNTS.map((n) => (
-                <option key={n} value={n}>
-                  {n}
-                </option>
-              ))}
-            </select>
-          </label>
-          <div>
-            <button className="btn btn-primary btn-sm" onClick={startRun} disabled={creating}>
-              {creating ? "Starting…" : "Start Run"}
+      {chainSourceRunId && !chainDismissed ? (
+        <div className="card" style={{ marginBottom: 14, border: "1px solid #cfe0f2", background: "#f5f9fd" }}>
+          <h3 style={{ marginBottom: 4 }}>Chained from Batch Coach-Info Discovery — Run #{chainSourceRunId}</h3>
+          <p style={{ fontSize: 12.5, color: "#697386" }}>
+            This starts a Social Media Discovery run scoped to just the schools from that Coach-Info run -- not a new state/count pull. Each one still has to actually qualify (a coach
+            name now on file, missing a Twitter/X and/or Facebook handle, not marked social-unavailable or closed, and not already run through this tool before) -- schools that don't
+            qualify are simply left out, same as any other run.
+          </p>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <button className="btn btn-primary btn-sm" onClick={startChainedRun} disabled={chainCreating}>
+              {chainCreating ? "Starting…" : "Start Social Media Discovery for These Schools"}
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm"
+              disabled={chainCreating}
+              onClick={() => {
+                setChainDismissed(true);
+                router.replace(pathname, { scroll: false });
+              }}
+            >
+              Cancel — start a regular run instead
             </button>
           </div>
-          {createError && (
-            <div className="notice danger" style={{ fontSize: 12.5 }}>
-              {createError}
+          {chainError && (
+            <div className="notice danger" style={{ marginTop: 10, fontSize: 12.5 }}>
+              {chainError}
             </div>
           )}
         </div>
-      </div>
+      ) : (
+        <div className="card" style={{ marginBottom: 14 }}>
+          <h3>Start a New Batch Run</h3>
+          <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
+            Pulls schools that already have a head coach name on file but are missing a Twitter/X and/or Facebook handle -- a useful search needs a name, so schools with no coach name yet
+            can't be helped by this tool (run Batch Coach-Info Discovery first for those).
+            {" "}Any school already applied, skipped, or attempted here before is automatically left out of every future run.
+          </p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
+              <input type="radio" checked={scopeMode === "priority"} onChange={() => setScopeMode("priority")} />
+              Priority recruiting states ({PRIORITY_STATES.join(", ")})
+            </label>
+            <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
+              <input type="radio" checked={scopeMode === "all"} onChange={() => setScopeMode("all")} />
+              All states (or type a custom list below)
+            </label>
+            {scopeMode === "all" && (
+              <input
+                value={customStates}
+                onChange={(e) => setCustomStates(e.target.value)}
+                placeholder="Leave blank for every state, or type e.g. TX, OK, AR"
+                style={{ maxWidth: 360 }}
+              />
+            )}
+            <label style={{ fontSize: 13 }}>
+              How many schools:{" "}
+              <select value={targetCount} onChange={(e) => setTargetCount(Number(e.target.value))}>
+                {TARGET_COUNTS.map((n) => (
+                  <option key={n} value={n}>
+                    {n}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div>
+              <button className="btn btn-primary btn-sm" onClick={startRun} disabled={creating}>
+                {creating ? "Starting…" : "Start Run"}
+              </button>
+            </div>
+            {createError && (
+              <div className="notice danger" style={{ fontSize: 12.5 }}>
+                {createError}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       <div className="card" style={{ marginBottom: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 8 }}>
@@ -1007,5 +1132,13 @@ export default function BatchSocialPage() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function BatchSocialPage() {
+  return (
+    <Suspense fallback={<div className="view"><div className="empty-state">Loading…</div></div>}>
+      <BatchSocialPageInner />
+    </Suspense>
   );
 }
