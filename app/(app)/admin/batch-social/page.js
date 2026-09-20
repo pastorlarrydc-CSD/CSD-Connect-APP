@@ -362,6 +362,14 @@ function BatchSocialPageInner() {
         // Closed/discontinued schools will never have real social media to
         // find -- see lib/dataQuality.js.
         .eq("is_closed", false)
+        // Skip schools Larry has already marked reviewed/confirmed-accurate
+        // (verification_status = "verified") even if the handle fields
+        // above still read blank -- a human already looked at this record,
+        // so it shouldn't come back through an automated sweep. Doesn't
+        // affect the single-school "Find Social Media" button on a
+        // school's own profile, which is still there any time someone
+        // wants to force a fresh look at one specific school.
+        .neq("verification_status", "verified")
         .order("id", { ascending: true })
         .limit(targetCount * 3);
       if (scopeMode !== "all" || states.length) {
@@ -435,6 +443,9 @@ function BatchSocialPageInner() {
         .or("hc_twitter.is.null,hc_twitter.eq.,hc_facebook.is.null,hc_facebook.eq.")
         .eq("social_not_available", false)
         .eq("is_closed", false)
+        // Same "already reviewed" exclusion as the regular startRun query
+        // above -- see its comment for the full reasoning.
+        .neq("verification_status", "verified")
         .order("id", { ascending: true });
       if (schoolsErr) throw schoolsErr;
       const schoolsData = (rawSchoolsData || []).filter((s) => !excludedIds.has(s.id));
