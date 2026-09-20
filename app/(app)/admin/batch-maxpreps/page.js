@@ -326,6 +326,14 @@ export default function BatchMaxPrepsPage() {
         // MaxPreps page to find. See lib/dataQuality.js.
         .eq("maxpreps_not_available", false)
         .eq("is_closed", false)
+        // Skip schools Larry has already marked reviewed/confirmed-accurate
+        // (verification_status = "verified") even if this particular field
+        // happens to still read blank -- a human already looked at this
+        // record, so it shouldn't come back through an automated sweep.
+        // Doesn't affect the single-school "Find MaxPreps Page" button on a
+        // school's own profile, which is still there any time someone
+        // wants to force a fresh look at one specific school.
+        .neq("verification_status", "verified")
         .order("id", { ascending: true })
         .limit(targetCount * 3);
       if (scopeMode !== "all" || states.length) {
