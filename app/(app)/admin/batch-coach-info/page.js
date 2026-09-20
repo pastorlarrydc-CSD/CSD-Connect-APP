@@ -1,5 +1,6 @@
 "use client";
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, Suspense } from "react";
+import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
@@ -91,10 +92,27 @@ function StatusBadge({ status }) {
   );
 }
 
-export default function BatchCoachInfoPage() {
+// Which run is open, the confidence tier, the search text, and "show
+// already-reviewed" all used to live in plain useState -- fine for normal
+// in-app clicking around, but a real page reload (the browser discarding a
+// backgrounded tab to free memory, hitting refresh, coming back to a
+// bookmarked/pasted link) wipes plain component state completely, dropping
+// a reviewer right back at an unfiltered, unsearched, first-open-run view
+// with no way to get back to where they were except redoing every click.
+// Mirroring these four into the URL (see the syncing useEffect below) means
+// the URL itself IS the saved view -- a reload re-reads its own address bar
+// on the way back up instead of guessing, and the exact same filtered/
+// searched screen a reviewer was just looking at survives coming back to
+// it. useSearchParams requires a Suspense boundary around the page (see
+// BatchCoachInfoPage at the bottom) -- same pattern already used by
+// app/(app)/prospects/compare/page.js for the same reason.
+function BatchCoachInfoPageInner() {
   const supabase = getSupabaseBrowserClient();
   const { user, profile } = useAuth();
   const canReview = profile?.role === "verifier" || profile?.role === "sysadmin";
+  const router = useRouter();
+  const pathname = usePathname();
+  const searchParams = useSearchParams();
 
   const [runs, setRuns] = useState([]);
   const [loadingRuns, setLoadingRuns] = useState(true);
@@ -106,7 +124,13 @@ export default function BatchCoachInfoPage() {
   // this list forever otherwise, and a reviewer has to scroll past every
   // finished run to find the ones still needing work.
   const [hideCompletedRuns, setHideCompletedRuns] = useState(true);
-  const [selectedRunId, setSelectedRunId] = useState(null);
+  // Seeded from ?run= on first render so a reload reopens the same run
+  // instead of falling back to "auto-select the newest one" -- see the
+  // auto-select effect below, which only fires when this is still null.
+  const [selectedRunId, setSelectedRunId] = useState(() => {
+    const fromUrl = Number(searchParams.get("run"));
+    return Number.isFinite(fromUrl) && fromUrl > 0 ? fromUrl : null;
+  });
   const [items, setItems] = useState([]);
   const [loadingItems, setLoadingItems] = useState(false);
 
@@ -164,17 +188,22 @@ export default function BatchCoachInfoPage() {
 
   const [applyingId, setApplyingId] = useState(null);
   const [reviewError, setReviewError] = useState("");
-  const [showReviewed, setShowReviewed] = useState(false);
+  // These three (plus selectedRunId above) are seeded from the URL and kept
+  // synced back to it -- see the syncing useEffect below.
+  const [showReviewed, setShowReviewed] = useState(() => searchParams.get("reviewed") === "1");
   // Confidence filter -- lets a reviewer work through one tier at a time
   // (e.g. clear every "medium" row after Apply All High-Confidence has
   // taken care of the high ones) instead of scrolling a single mixed list.
   // "all" shows everything, same as before this existed.
-  const [confidenceFilter, setConfidenceFilter] = useState("all"); // "all" | "high" | "medium" | "low"
+  const [confidenceFilter, setConfidenceFilter] = useState(() => {
+    const fromUrl = searchParams.get("confidence");
+    return ["all", "high", "medium", "low"].includes(fromUrl) ? fromUrl : "all";
+  }); // "all" | "high" | "medium" | "low"
   // Free-text filter on school name/city -- useful once a run's list runs
   // into the hundreds and a reviewer wants to jump straight to one school
   // (e.g. checking whether a specific school they were just asked about
   // already has a suggestion queued) instead of scanning the whole table.
-  const [searchQuery, setSearchQuery] = useState("");
+  const [searchQuery, setSearchQuery] = useState(() => searchParams.get("q") || "");
   // Bulk-apply: lets a reviewer clear every high-confidence suggestion in a
   // run with one click instead of clicking Apply on each one individually --
   // see bulkApplyHighConfidence below.
@@ -361,6 +390,26 @@ export default function BatchCoachInfoPage() {
   useEffect(() => {
     setFocusedIndex(0);
   }, [confidenceFilter, searchQuery]);
+
+  // Keeps the URL's query string in lockstep with the four pieces of state
+  // that define "what this reviewer is currently looking at" -- which run,
+  // which confidence tier, the search text, and whether reviewed rows are
+  // showing. router.replace (not push) so scrolling through search
+  // keystrokes or clicking between confidence tabs doesn't spam the
+  // browser's back-button history with a new entry per change -- it just
+  // keeps the CURRENT url accurate. scroll:false stops Next.js from
+  // jumping the page back to top on every sync. This is what makes the
+  // reload-survival above actually work: the URL only helps if it's always
+  // current, not just set once on load.
+  useEffect(() => {
+    const params = new URLSearchParams();
+    if (selectedRunId) params.set("run", String(selectedRunId));
+    if (confidenceFilter !== "all") params.set("confidence", confidenceFilter);
+    if (searchQuery.trim()) params.set("q", searchQuery);
+    if (showReviewed) params.set("reviewed", "1");
+    const qs = params.toString();
+    router.replace(qs ? `${pathname}?${qs}` : pathname, { scroll: false });
+  }, [selectedRunId, confidenceFilter, searchQuery, showReviewed, pathname, router]);
 
   const loadRuns = useCallback(async () => {
     setLoadingRuns(true);
@@ -1283,7 +1332,7 @@ export default function BatchCoachInfoPage() {
                   {pendingReview.length} suggestion{pendingReview.length === 1 ? "" : "s"} to review, {reviewedItems.length} already reviewed, {failedItems.length} the AI couldn't produce a
                   suggestion for.
                 </p>
-                <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+                <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
                   <label style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}>
                     <input type="checkbox" checked={showReviewed} onChange={(e) => setShowReviewed(e.target.checked)} />
                     Show already-reviewed
@@ -1295,6 +1344,18 @@ export default function BatchCoachInfoPage() {
                     {csvImporting ? `Applying ${csvImportProgress.done}/${csvImportProgress.total}…` : "Import reviewed CSV"}
                     <input type="file" accept=".csv" onChange={handleCsvImport} disabled={csvImporting} style={{ display: "none" }} />
                   </label>
+                  {/* Chains straight into Batch Social Media Discovery,
+                      scoped to this same run's schools -- closes the gap
+                      where Coach-Info finds a coach's name but (per its own
+                      SYSTEM_PROMPT) only turns up a social handle
+                      opportunistically, not via a dedicated search. Social's
+                      own page reads ?fromCoachInfoRun= and re-runs its usual
+                      eligibility filter against just these schools, so
+                      nothing here is queued unless Social would also have
+                      picked it up on its own. */}
+                  <Link href={`/admin/batch-social?fromCoachInfoRun=${selectedRun.id}`} className="btn btn-sm">
+                    Start Social Media Discovery for These Schools →
+                  </Link>
                 </div>
               </div>
 
@@ -1566,5 +1627,13 @@ export default function BatchCoachInfoPage() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function BatchCoachInfoPage() {
+  return (
+    <Suspense fallback={<div className="view"><div className="empty-state">Loading…</div></div>}>
+      <BatchCoachInfoPageInner />
+    </Suspense>
   );
 }
