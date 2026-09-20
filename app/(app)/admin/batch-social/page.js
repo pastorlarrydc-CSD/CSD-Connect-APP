@@ -160,6 +160,14 @@ function BatchSocialPageInner() {
 
   const selectedRun = runs.find((r) => r.id === selectedRunId) || null;
 
+  // school_id -> that school's review_status ("applied"/"skipped"/"pending")
+  // in the Coach-Info run this Social run was chained from, if any -- see
+  // the loading effect below. Lets each row show whether its coach name was
+  // already reviewed and Applied on the Coach-Info side, so a row can be
+  // trusted and Applied here without opening the school's own profile to
+  // cross-check the coach. Empty object for a normal (non-chained) run.
+  const [coachInfoReviewMap, setCoachInfoReviewMap] = useState({});
+
   const readyCount = items.filter((i) => i.fetch_status === "ready").length;
   const pendingFetchCount = items.filter((i) => i.fetch_status === "pending").length;
   const noContentCount = items.filter((i) => i.fetch_status === "no_content").length;
@@ -170,6 +178,14 @@ function BatchSocialPageInner() {
   const pendingReview = matchedItems.filter((i) => i.review_status === "pending");
   const reviewedItems = matchedItems.filter((i) => i.review_status !== "pending");
   const highConfidencePendingCount = pendingReview.filter((i) => i.suggestion?.confidence === "high").length;
+  // Pending rows whose Coach-Info suggestion was already Applied -- the
+  // "safe to trust, apply without opening the record" set. Any confidence
+  // tier counts (not just high) because the trust signal here is about the
+  // coach's IDENTITY being confirmed, not the AI's confidence in the
+  // handle pick -- a medium-confidence handle for a confirmed-real coach is
+  // still worth a quick look, but no longer worth second-guessing who the
+  // coach even is.
+  const coachInfoConfirmedPending = pendingReview.filter((i) => coachInfoReviewMap[i.school_id] === "applied");
 
   function isRunOpen(r) {
     if (r.status !== "collected") return true;
@@ -317,6 +333,26 @@ function BatchSocialPageInner() {
     if (selectedRunId) loadItems(selectedRunId);
   }, [selectedRunId, loadItems]);
 
+  // Loads coachInfoReviewMap for the currently-open run -- only meaningful
+  // when this run has a source_coach_info_run_id (i.e. it was started via
+  // the Coach-Info chain button), so a plain state/count run just clears it
+  // back to empty and no badges/bulk-apply banner show up.
+  useEffect(() => {
+    const sourceRunId = selectedRun?.source_coach_info_run_id;
+    if (!sourceRunId) {
+      setCoachInfoReviewMap({});
+      return;
+    }
+    (async () => {
+      const { data } = await supabase.from("coach_info_batch_items").select("school_id,review_status").eq("batch_run_id", sourceRunId);
+      const map = {};
+      (data || []).forEach((row) => {
+        map[row.school_id] = row.review_status;
+      });
+      setCoachInfoReviewMap(map);
+    })();
+  }, [selectedRun?.source_coach_info_run_id, supabase]);
+
   function openRun(runId) {
     setSelectedRunId(runId);
     setCreateError("");
@@ -458,7 +494,10 @@ function BatchSocialPageInner() {
 
       const { data: runRow, error: runErr } = await supabase
         .from("social_batch_runs")
-        .insert({ status: "collecting", state_filter: null, requested_count: schoolsData.length, created_by: user.id })
+        // source_coach_info_run_id records where this run was chained from --
+        // read back below (see the coachInfoReviewMap effect) to show each
+        // row whether its coach name was already Applied in that run.
+        .insert({ status: "collecting", state_filter: null, requested_count: schoolsData.length, created_by: user.id, source_coach_info_run_id: chainSourceRunId })
         .select()
         .single();
       if (runErr) throw runErr;
@@ -657,6 +696,40 @@ function BatchSocialPageInner() {
     if (failures.length > 0) {
       setReviewError(
         `Applied ${targets.length - failures.length} of ${targets.length} high-confidence suggestions. ${failures.length} failed: ${failures.slice(0, 3).join("; ")}${
+          failures.length > 3 ? "…" : ""
+        }`
+      );
+    }
+  }
+
+  // Applies every PENDING suggestion whose coach name was already reviewed
+  // and Applied back on the Coach-Info side (coachInfoConfirmedPending) --
+  // only relevant for a run chained from Coach-Info (see the button/banner
+  // this backs, which only renders when selectedRun.source_coach_info_run_id
+  // is set). Same batching pattern as bulkApplyHighConfidence just above.
+  async function bulkApplyCoachInfoConfirmed() {
+    const targets = coachInfoConfirmedPending;
+    if (!targets.length) return;
+    setBulkApplying(true);
+    setReviewError("");
+    setBulkProgress({ done: 0, total: targets.length });
+    let done = 0;
+    const failures = [];
+    await runWithConcurrency(targets, APPLY_CONCURRENCY, async (item) => {
+      const result = await applySuggestionCore(item);
+      if (result.ok) {
+        setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: "applied" } : i)));
+      } else {
+        failures.push(`${item.school?.name || `#${item.id}`}: ${result.error}`);
+      }
+      done++;
+      setBulkProgress({ done, total: targets.length });
+    });
+    setBulkApplying(false);
+    setFocusedIndex(0);
+    if (failures.length > 0) {
+      setReviewError(
+        `Applied ${targets.length - failures.length} of ${targets.length} Coach-Info-confirmed suggestions. ${failures.length} failed: ${failures.slice(0, 3).join("; ")}${
           failures.length > 3 ? "…" : ""
         }`
       );
@@ -1008,6 +1081,37 @@ function BatchSocialPageInner() {
                 </div>
               )}
 
+              {/* Only shows on a run chained from Coach-Info (see the
+                  "Start Social Media Discovery for These Schools" button on
+                  that page) -- coachInfoConfirmedPending is always empty
+                  otherwise. Any confidence tier counts here, not just high,
+                  since the trust signal is "this coach is confirmed real,"
+                  not "the AI liked this specific handle." */}
+              {coachInfoConfirmedPending.length > 0 && (
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                    gap: 10,
+                    marginBottom: 10,
+                    padding: "10px 12px",
+                    background: "#eefaf1",
+                    border: "1px solid #cdead9",
+                    borderRadius: 8,
+                  }}
+                >
+                  <span style={{ fontSize: 12.5 }}>
+                    <strong>{coachInfoConfirmedPending.length}</strong> of those have a coach name that's already <strong>reviewed and Applied</strong> from Coach-Info run #
+                    {selectedRun.source_coach_info_run_id} -- you already confirmed who the coach is, so these are safe to apply without opening the school's profile first.
+                  </span>
+                  <button className="btn btn-gold btn-sm" onClick={bulkApplyCoachInfoConfirmed} disabled={bulkApplying}>
+                    {bulkApplying ? `Applying ${bulkProgress.done} of ${bulkProgress.total}…` : `Apply All Coach-Info-Confirmed (${coachInfoConfirmedPending.length})`}
+                  </button>
+                </div>
+              )}
+
               {reviewError && (
                 <div className="notice danger" style={{ marginBottom: 10, fontSize: 12.5 }}>
                   {reviewError}
@@ -1055,6 +1159,24 @@ function BatchSocialPageInner() {
                             <div style={{ color: "#9aa1ab" }}>
                               {[s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ") || "(no coach name)"}
                             </div>
+                            {/* Only present on a run chained from Coach-Info
+                                -- see coachInfoReviewMap's loading effect and
+                                the bulk-apply banner above. Tells you at a
+                                glance whether THIS coach name was already
+                                reviewed there, without opening the school. */}
+                            {coachInfoReviewMap[item.school_id] && (
+                              <div style={{ marginTop: 3 }}>
+                                {coachInfoReviewMap[item.school_id] === "applied" ? (
+                                  <span className="badge" style={{ fontSize: 10.5, color: "#1e7145", background: "#1e71451a", fontWeight: 600 }}>
+                                    ✓ Coach-Info Applied
+                                  </span>
+                                ) : (
+                                  <span className="badge" style={{ fontSize: 10.5, color: "#697386", background: "#6973861a" }}>
+                                    Coach-Info: {coachInfoReviewMap[item.school_id] === "skipped" ? "Skipped" : "Pending"}
+                                  </span>
+                                )}
+                              </div>
+                            )}
                           </td>
                           <td style={{ padding: "8px", minWidth: 260 }}>
                             {/* Both platforms always render now, even when the
