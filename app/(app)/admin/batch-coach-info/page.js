@@ -566,6 +566,17 @@ function BatchCoachInfoPageInner() {
           // Closed/discontinued schools will never have a real coach to
           // find -- see lib/dataQuality.js.
           .eq("is_closed", false)
+          // Skip schools Larry has already marked reviewed/confirmed-accurate
+          // (verification_status = "verified") even if a name/email field
+          // above still reads blank -- a human already looked at this
+          // record, so it shouldn't come back through an automated sweep.
+          // Deliberately NOT applied to the re_verify branch above -- that
+          // mode's whole point is going back and re-checking schools that
+          // WERE reviewed but have gone stale (see its own comment), so
+          // filtering out verified schools there would defeat it. Also
+          // doesn't affect the single-school "Suggest Coach Info (AI)"
+          // button on a school's own profile.
+          .neq("verification_status", "verified")
           .order("id", { ascending: true })
           .limit(targetCount * 3);
 
