@@ -277,9 +277,13 @@ export default function BatchCoachInfoPage() {
       s?.hc_first_name,
       s?.hc_last_name,
       s?.hc_email,
+      s?.hc_twitter,
+      s?.hc_facebook,
       sug?.hc_first_name,
       sug?.hc_last_name,
       sug?.hc_email,
+      sug?.hc_twitter,
+      sug?.hc_facebook,
     ]
       .filter(Boolean)
       .join(" ")
@@ -1332,7 +1336,7 @@ export default function BatchCoachInfoPage() {
                 <input
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Search school, city, or coach name…"
+                  placeholder="Search school, city, coach, or handle…"
                   style={{ maxWidth: 240, fontSize: 12.5 }}
                 />
               </div>
@@ -1456,6 +1460,33 @@ export default function BatchCoachInfoPage() {
                                 {s.hc_first_name || s.hc_last_name ? `${s.hc_first_name || ""} ${s.hc_last_name || ""}`.trim() : "No coach on file"}
                               </div>
                               {s.hc_email && <div style={{ color: "#9aa1ab" }}>{s.hc_email}</div>}
+                              {/* On-file social handles, same always-visible
+                                  treatment -- Coach-Info's own AI lookup CAN
+                                  suggest hc_twitter/hc_facebook (see
+                                  SUGGESTION_FIELDS/FIELD_LABELS above), but
+                                  only turns one up occasionally since finding
+                                  social accounts isn't this tool's main
+                                  focus -- Batch Social Media Discovery is the
+                                  dedicated tool for that. Showing what's
+                                  already on file here means a reviewer
+                                  clearing Coach-Info doesn't also have to
+                                  open every school's profile just to see
+                                  whether social is covered. wordBreak
+                                  because a saved Facebook URL can run long;
+                                  the parent cell's own nowrap only applies to
+                                  the school name/city/coach lines above. */}
+                              <div style={{ marginTop: 4, whiteSpace: "normal", maxWidth: 200, wordBreak: "break-all" }}>
+                                {s.hc_twitter ? (
+                                  <div style={{ color: "#5b7fb5" }}>Twitter/X: {s.hc_twitter}</div>
+                                ) : (
+                                  <div style={{ color: "#9aa1ab", fontStyle: "italic" }}>No Twitter/X on file</div>
+                                )}
+                                {s.hc_facebook ? (
+                                  <div style={{ color: "#5b7fb5" }}>Facebook: {s.hc_facebook}</div>
+                                ) : (
+                                  <div style={{ color: "#9aa1ab", fontStyle: "italic" }}>No Facebook on file</div>
+                                )}
+                              </div>
                             </td>
                             <td style={{ padding: "8px", minWidth: 260 }}>
                               {nameChanged && (
