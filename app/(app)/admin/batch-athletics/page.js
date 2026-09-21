@@ -1,5 +1,6 @@
 "use client";
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, Suspense } from "react";
+import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
@@ -74,10 +75,21 @@ function confidenceColor(confidence) {
   return "#b3261e"; // low or none
 }
 
-export default function BatchAthleticsPage() {
+// Reads ?state= off the URL -- see BatchAthleticsPage's Suspense wrapper at
+// the bottom, same requirement as batch-coach-info/batch-social's own
+// Inner/Suspense split.
+function BatchAthleticsPageInner() {
   const supabase = getSupabaseBrowserClient();
   const { user, profile } = useAuth();
   const canReview = profile?.role === "verifier" || profile?.role === "sysadmin";
+  const searchParams = useSearchParams();
+  // Set when this page was opened via a "Focus →" link from State Progress
+  // (/admin/state-progress?state=XX -> here as ?state=XX) -- seeds the
+  // scope picker below to that one state instead of the usual "priority
+  // states" default, so the run this starts targets exactly the gap Larry
+  // just looked at. Read once on mount; doesn't fight with anything else,
+  // since scopeMode/customStates aren't otherwise persisted to the URL here.
+  const stateFromUrl = searchParams.get("state");
 
   const [runs, setRuns] = useState([]);
   // How many still-pending, actually-matched suggestions each run has --
@@ -89,9 +101,13 @@ export default function BatchAthleticsPage() {
   const [items, setItems] = useState([]);
   const [loadingItems, setLoadingItems] = useState(false);
 
-  const [scopeMode, setScopeMode] = useState("priority"); // "priority" | "all"
-  const [customStates, setCustomStates] = useState(PRIORITY_STATES.join(", "));
-  const [targetCount, setTargetCount] = useState(DEFAULT_TARGET_COUNT);
+  const [scopeMode, setScopeMode] = useState(stateFromUrl ? "all" : "priority"); // "priority" | "all"
+  const [customStates, setCustomStates] = useState(stateFromUrl || PRIORITY_STATES.join(", "));
+  // A state deep-link means "clear this whole state" -- 1000 (the largest
+  // option) comfortably covers any single state's real gap today (the
+  // biggest, TX, sits at under 900 missing social handles -- see the
+  // state_data_coverage view). A plain visit keeps the usual smaller default.
+  const [targetCount, setTargetCount] = useState(stateFromUrl ? 1000 : DEFAULT_TARGET_COUNT);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState("");
 
@@ -966,5 +982,13 @@ export default function BatchAthleticsPage() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function BatchAthleticsPage() {
+  return (
+    <Suspense fallback={<div className="view"><div className="empty-state">Loading…</div></div>}>
+      <BatchAthleticsPageInner />
+    </Suspense>
   );
 }
