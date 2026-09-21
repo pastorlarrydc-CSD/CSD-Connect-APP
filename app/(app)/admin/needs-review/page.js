@@ -1,8 +1,9 @@
 // app/(app)/admin/needs-review/page.js
 "use client";
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, Suspense } from "react";
 import Link from "next/link";
+import { useSearchParams } from "next/navigation";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 
@@ -31,10 +32,15 @@ function CoverageBar({ pct }) {
   );
 }
 
-export default function NeedsReviewPage() {
+function NeedsReviewPageInner() {
   const supabase = getSupabaseBrowserClient();
   const { profile } = useAuth();
   const canReview = profile?.role === "verifier" || profile?.role === "sysadmin";
+  const searchParams = useSearchParams();
+  // Lets State Progress's "Review →" link (on the new Marked Reviewed
+  // column) jump straight into this state's queue instead of landing on
+  // the state-picker list.
+  const stateFromUrl = searchParams.get("state");
 
   const [states, setStates] = useState([]);
   const [loadingStates, setLoadingStates] = useState(true);
@@ -98,6 +104,11 @@ export default function NeedsReviewPage() {
     },
     [authedFetch]
   );
+
+  useEffect(() => {
+    if (canReview && stateFromUrl) loadState(stateFromUrl.toUpperCase());
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canReview, stateFromUrl]);
 
   const confirmAccurate = async (schoolId) => {
     setConfirmingId(schoolId);
@@ -284,5 +295,13 @@ export default function NeedsReviewPage() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function NeedsReviewPage() {
+  return (
+    <Suspense fallback={<div className="view"><div className="empty-state">Loading…</div></div>}>
+      <NeedsReviewPageInner />
+    </Suspense>
   );
 }
