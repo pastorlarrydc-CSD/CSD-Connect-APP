@@ -109,9 +109,18 @@ function BatchSocialPageInner() {
   const [items, setItems] = useState([]);
   const [loadingItems, setLoadingItems] = useState(false);
 
-  const [scopeMode, setScopeMode] = useState("priority"); // "priority" | "all"
-  const [customStates, setCustomStates] = useState(PRIORITY_STATES.join(", "));
-  const [targetCount, setTargetCount] = useState(DEFAULT_TARGET_COUNT);
+  // Set when this page was opened via a "Focus →" link from State Progress
+  // (?state=XX, distinct from the ?fromCoachInfoRun= chain param above --
+  // the two are mutually exclusive entry points and never both set). Seeds
+  // the scope picker so the run this starts targets exactly the gap Larry
+  // just looked at.
+  const stateFromUrl = searchParams.get("state");
+  const [scopeMode, setScopeMode] = useState(stateFromUrl ? "all" : "priority"); // "priority" | "all"
+  const [customStates, setCustomStates] = useState(stateFromUrl || PRIORITY_STATES.join(", "));
+  // A state deep-link means "clear this whole state" -- 1000 (the largest
+  // option) comfortably covers any single state's real gap today. See
+  // state_data_coverage.
+  const [targetCount, setTargetCount] = useState(stateFromUrl ? 1000 : DEFAULT_TARGET_COUNT);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState("");
 
