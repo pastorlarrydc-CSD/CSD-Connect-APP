@@ -16,6 +16,16 @@
 // gaps, not run history, so a school a tool searched and came up empty on
 // still counts here as still-needed (see the view's own comment in the
 // migration for the full reasoning).
+//
+// The Marked Reviewed column is a separate, second read of the same view:
+// how many open schools per state have verification_status = 'verified' --
+// the flag every apply/confirm action across the whole app stamps (batch
+// tool applies, Needs-Review confirms, Quick Fix saves, Data Quality
+// resolves, Import & Reconcile, Bulk Update). It's a "has this record been
+// touched at all" signal, separate from the five field-level gap columns,
+// plus a 7-day momentum count so an actively-worked state is visible at a
+// glance. "Review →" on that column and in the quick-glance strips below
+// jumps into Needs-Review pre-scoped to that state.
 import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
@@ -52,6 +62,34 @@ function MetricCell({ count, total, state, metric }) {
           Focus →
         </Link>
       )}
+    </td>
+  );
+}
+
+// Marked Reviewed reads the opposite way from the gap columns -- here a
+// HIGH percentage is the good outcome, so the color thresholds flip (green
+// at 50%+, same bands Needs-Review's own coverage bar already uses, so the
+// two dashboards read the same color the same way).
+function reviewedColor(pct) {
+  if (pct >= 50) return "#1e7145";
+  if (pct >= 20) return "#b8860b";
+  return "#b3261e";
+}
+
+function ReviewedCell({ count, total, recent, state }) {
+  const pct = total ? Math.round((100 * count) / total) : 0;
+  return (
+    <td style={{ padding: "8px 10px", textAlign: "center", borderLeft: "1px solid #eef0f3" }}>
+      <div style={{ fontWeight: 700, color: reviewedColor(pct), fontSize: 14 }}>{pct}%</div>
+      <div style={{ fontSize: 10.5, color: "#9aa1ab" }}>
+        {count}/{total} marked
+      </div>
+      {recent > 0 && (
+        <div style={{ fontSize: 10, color: "#0b5fff", marginTop: 2, fontWeight: 600 }}>+{recent} this week</div>
+      )}
+      <Link href={`/admin/needs-review?state=${state}`} className="btn btn-sm" style={{ marginTop: 4, fontSize: 11, padding: "2px 8px" }}>
+        Review →
+      </Link>
     </td>
   );
 }
@@ -122,6 +160,23 @@ export default function StateProgressPage() {
     return acc;
   }, {});
   const totalOpen = states.reduce((sum, s) => sum + (s.total_open || 0), 0);
+  const totalReviewed = states.reduce((sum, s) => sum + (s.reviewed_count || 0), 0);
+  const totalReviewedRecent = states.reduce((sum, s) => sum + (s.reviewed_last_7d || 0), 0);
+
+  // Quick-glance strip: who's actively being worked right now, and who's
+  // furthest behind on being marked reviewed at all. Only states with a
+  // meaningful number of open schools count for "furthest behind" so a
+  // 3-school state at 0% doesn't crowd out TX/CA-sized gaps.
+  const mostActive = states
+    .filter((s) => (s.reviewed_last_7d || 0) > 0)
+    .slice()
+    .sort((a, b) => (b.reviewed_last_7d || 0) - (a.reviewed_last_7d || 0))
+    .slice(0, 3);
+  const furthestBehind = states
+    .filter((s) => (s.total_open || 0) >= 25)
+    .slice()
+    .sort((a, b) => (a.reviewed_count || 0) / (a.total_open || 1) - (b.reviewed_count || 0) / (b.total_open || 1))
+    .slice(0, 3);
 
   return (
     <div className="view">
@@ -133,7 +188,7 @@ export default function StateProgressPage() {
           <h1>State Progress</h1>
           <p>
             What's still genuinely missing, state by state, across coach name, email, athletics URL, MaxPreps URL, and social media -- pick a state, see the real gap, and jump straight
-            into the right batch tool sized to clear it in one run.
+            into the right batch tool sized to clear it in one run. The Marked Reviewed column shows how much of each state has actually been touched and confirmed.
           </p>
         </div>
       </div>
@@ -141,6 +196,43 @@ export default function StateProgressPage() {
       {error && (
         <div className="notice danger" style={{ marginBottom: 14 }}>
           {error}
+        </div>
+      )}
+
+      {!loading && (mostActive.length > 0 || furthestBehind.length > 0) && (
+        <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 14 }}>
+          {mostActive.length > 0 && (
+            <div className="card" style={{ flex: "1 1 260px", padding: "10px 14px" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: "#0b5fff", marginBottom: 6 }}>🔥 Most active this week</div>
+              {mostActive.map((s) => (
+                <div key={s.state} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, padding: "2px 0" }}>
+                  <span>
+                    <strong>{s.state}</strong>
+                  </span>
+                  <span style={{ color: "#697386" }}>+{s.reviewed_last_7d} marked</span>
+                </div>
+              ))}
+            </div>
+          )}
+          {furthestBehind.length > 0 && (
+            <div className="card" style={{ flex: "1 1 260px", padding: "10px 14px" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: "#b3261e", marginBottom: 6 }}>⚠️ Furthest behind on review</div>
+              {furthestBehind.map((s) => {
+                const pct = s.total_open ? Math.round((100 * (s.reviewed_count || 0)) / s.total_open) : 0;
+                return (
+                  <div key={s.state} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, padding: "2px 0" }}>
+                    <span>
+                      <strong>{s.state}</strong>{" "}
+                      <Link href={`/admin/needs-review?state=${s.state}`} style={{ fontSize: 11 }}>
+                        Review →
+                      </Link>
+                    </span>
+                    <span style={{ color: "#697386" }}>{pct}% marked</span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
         </div>
       )}
 
@@ -157,7 +249,8 @@ export default function StateProgressPage() {
           <div style={{ fontSize: 12, color: "#697386", marginBottom: 10 }}>
             Across {states.length} states / {totalOpen.toLocaleString()} open schools: <strong>{totals.needs_coach_name}</strong> missing a coach name,{" "}
             <strong>{totals.needs_email}</strong> missing an email, <strong>{totals.needs_athletics_url}</strong> missing an athletics URL, <strong>{totals.needs_maxpreps_url}</strong>{" "}
-            missing a MaxPreps URL, and <strong>{totals.needs_social}</strong> missing a social handle.
+            missing a MaxPreps URL, and <strong>{totals.needs_social}</strong> missing a social handle. <strong>{totalReviewed.toLocaleString()}</strong> schools (
+            {totalOpen ? Math.round((100 * totalReviewed) / totalOpen) : 0}%) are marked reviewed so far, <strong>{totalReviewedRecent}</strong> of those in the last 7 days.
           </div>
         )}
 
@@ -183,6 +276,14 @@ export default function StateProgressPage() {
                       {sortKey === m.key ? " ▾" : ""}
                     </th>
                   ))}
+                  <th
+                    onClick={() => setSortKey("reviewed_count")}
+                    style={{ padding: "6px 10px", textAlign: "center", borderLeft: "1px solid #eef0f3", cursor: "pointer", color: sortKey === "reviewed_count" ? "#0b5fff" : undefined }}
+                    title="Click to sort by this column -- schools with verification_status marked verified"
+                  >
+                    Marked Reviewed
+                    {sortKey === "reviewed_count" ? " ▾" : ""}
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -200,6 +301,7 @@ export default function StateProgressPage() {
                     {METRICS.map((m) => (
                       <MetricCell key={m.key} count={s[m.key] || 0} total={s.total_open} state={s.state} metric={m} />
                     ))}
+                    <ReviewedCell count={s.reviewed_count || 0} total={s.total_open} recent={s.reviewed_last_7d || 0} state={s.state} />
                   </tr>
                 ))}
               </tbody>
