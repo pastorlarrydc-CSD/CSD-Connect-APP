@@ -1,5 +1,6 @@
 "use client";
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, Suspense } from "react";
+import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
@@ -75,10 +76,18 @@ function confidenceColor(confidence) {
   return "#b3261e"; // low or none
 }
 
-export default function BatchMaxPrepsPage() {
+// Reads ?state= off the URL -- see BatchMaxPrepsPage's Suspense wrapper at
+// the bottom, same requirement as batch-coach-info/batch-social's own
+// Inner/Suspense split.
+function BatchMaxPrepsPageInner() {
   const supabase = getSupabaseBrowserClient();
   const { user, profile } = useAuth();
   const canReview = profile?.role === "verifier" || profile?.role === "sysadmin";
+  const searchParams = useSearchParams();
+  // Set when this page was opened via a "Focus →" link from State Progress
+  // -- see batch-athletics's own stateFromUrl comment for the full
+  // reasoning, identical here.
+  const stateFromUrl = searchParams.get("state");
 
   const [runs, setRuns] = useState([]);
   const [runPendingCounts, setRunPendingCounts] = useState({});
@@ -88,9 +97,9 @@ export default function BatchMaxPrepsPage() {
   const [items, setItems] = useState([]);
   const [loadingItems, setLoadingItems] = useState(false);
 
-  const [scopeMode, setScopeMode] = useState("priority"); // "priority" | "all"
-  const [customStates, setCustomStates] = useState(PRIORITY_STATES.join(", "));
-  const [targetCount, setTargetCount] = useState(DEFAULT_TARGET_COUNT);
+  const [scopeMode, setScopeMode] = useState(stateFromUrl ? "all" : "priority"); // "priority" | "all"
+  const [customStates, setCustomStates] = useState(stateFromUrl || PRIORITY_STATES.join(", "));
+  const [targetCount, setTargetCount] = useState(stateFromUrl ? 1000 : DEFAULT_TARGET_COUNT);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState("");
 
@@ -949,5 +958,13 @@ export default function BatchMaxPrepsPage() {
         </div>
       )}
     </div>
+  );
+}
+
+export default function BatchMaxPrepsPage() {
+  return (
+    <Suspense fallback={<div className="view"><div className="empty-state">Loading…</div></div>}>
+      <BatchMaxPrepsPageInner />
+    </Suspense>
   );
 }
