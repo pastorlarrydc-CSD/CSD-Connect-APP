@@ -153,10 +153,24 @@ function BatchCoachInfoPageInner() {
   // dashboard uses, scoped by staleDays below. Gets the same open query as
   // "no_name" (not contactOnly) since the whole point is to catch a name
   // that's since gone stale or wrong, not just confirm what's on file.
-  const [candidateMode, setCandidateMode] = useState("no_name"); // "no_name" | "missing_email" | "re_verify"
-  const [scopeMode, setScopeMode] = useState("priority"); // "priority" | "all"
-  const [customStates, setCustomStates] = useState(PRIORITY_STATES.join(", "));
-  const [targetCount, setTargetCount] = useState(DEFAULT_TARGET_COUNT);
+  // candidateMode and the scope picker below can seed from ?state=&mode= --
+  // set when this page is opened via a "Focus →" link from State Progress
+  // (/admin/state-progress), so the run this starts targets exactly the
+  // gap Larry just looked at instead of the usual "priority states, no
+  // coach name" default. Read once on mount; doesn't fight with the
+  // run/confidence/q/reviewed persistence above, since these three aren't
+  // part of that URL-sync effect.
+  const stateFromUrl = searchParams.get("state");
+  const modeFromUrl = searchParams.get("mode");
+  const [candidateMode, setCandidateMode] = useState(
+    ["no_name", "missing_email"].includes(modeFromUrl) ? modeFromUrl : "no_name"
+  ); // "no_name" | "missing_email" | "re_verify"
+  const [scopeMode, setScopeMode] = useState(stateFromUrl ? "all" : "priority"); // "priority" | "all"
+  const [customStates, setCustomStates] = useState(stateFromUrl || PRIORITY_STATES.join(", "));
+  // A state deep-link means "clear this whole state" -- 1000 (the largest
+  // option) comfortably covers any single state's real gap today. See
+  // state_data_coverage.
+  const [targetCount, setTargetCount] = useState(stateFromUrl ? 1000 : DEFAULT_TARGET_COUNT);
   // Only used by "re_verify" mode -- a school last reviewed more than this
   // many days ago is eligible to be re-included; never-reviewed schools are
   // always eligible regardless of this number.
