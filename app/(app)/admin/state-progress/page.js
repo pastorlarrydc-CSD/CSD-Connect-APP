@@ -78,12 +78,18 @@ function reviewedColor(pct) {
 
 function ReviewedCell({ count, total, recent, state }) {
   const pct = total ? Math.round((100 * count) / total) : 0;
+  const remaining = Math.max(total - count, 0);
   return (
     <td style={{ padding: "8px 10px", textAlign: "center", borderLeft: "1px solid #eef0f3" }}>
       <div style={{ fontWeight: 700, color: reviewedColor(pct), fontSize: 14 }}>{pct}%</div>
       <div style={{ fontSize: 10.5, color: "#9aa1ab" }}>
         {count}/{total} marked
       </div>
+      {remaining > 0 ? (
+        <div style={{ fontSize: 10.5, color: "#b3261e", fontWeight: 700, marginTop: 2 }}>{remaining.toLocaleString()} left to verify</div>
+      ) : (
+        <div style={{ fontSize: 10.5, color: "#1e7145", fontWeight: 700, marginTop: 2 }}>all verified</div>
+      )}
       {recent > 0 && (
         <div style={{ fontSize: 10, color: "#0b5fff", marginTop: 2, fontWeight: 600 }}>+{recent} this week</div>
       )}
@@ -219,6 +225,7 @@ export default function StateProgressPage() {
               <div style={{ fontSize: 12, fontWeight: 700, color: "#b3261e", marginBottom: 6 }}>⚠️ Furthest behind on review</div>
               {furthestBehind.map((s) => {
                 const pct = s.total_open ? Math.round((100 * (s.reviewed_count || 0)) / s.total_open) : 0;
+                const remaining = Math.max((s.total_open || 0) - (s.reviewed_count || 0), 0);
                 return (
                   <div key={s.state} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, padding: "2px 0" }}>
                     <span>
@@ -227,7 +234,9 @@ export default function StateProgressPage() {
                         Review →
                       </Link>
                     </span>
-                    <span style={{ color: "#697386" }}>{pct}% marked</span>
+                    <span style={{ color: "#697386" }}>
+                      {pct}% marked · <strong style={{ color: "#b3261e" }}>{remaining.toLocaleString()}</strong> left
+                    </span>
                   </div>
                 );
               })}
@@ -250,7 +259,8 @@ export default function StateProgressPage() {
             Across {states.length} states / {totalOpen.toLocaleString()} open schools: <strong>{totals.needs_coach_name}</strong> missing a coach name,{" "}
             <strong>{totals.needs_email}</strong> missing an email, <strong>{totals.needs_athletics_url}</strong> missing an athletics URL, <strong>{totals.needs_maxpreps_url}</strong>{" "}
             missing a MaxPreps URL, and <strong>{totals.needs_social}</strong> missing a social handle. <strong>{totalReviewed.toLocaleString()}</strong> schools (
-            {totalOpen ? Math.round((100 * totalReviewed) / totalOpen) : 0}%) are marked reviewed so far, <strong>{totalReviewedRecent}</strong> of those in the last 7 days.
+            {totalOpen ? Math.round((100 * totalReviewed) / totalOpen) : 0}%) are marked reviewed so far, <strong>{totalReviewedRecent}</strong> of those in the last 7 days --{" "}
+            <strong style={{ color: "#b3261e" }}>{(totalOpen - totalReviewed).toLocaleString()}</strong> still left to verify.
           </div>
         )}
 
