@@ -47,6 +47,7 @@ function NeedsReviewPageInner() {
   const [selectedState, setSelectedState] = useState(null);
   const [schools, setSchools] = useState([]);
   const [loadingSchools, setLoadingSchools] = useState(false);
+  const [reviewedToday, setReviewedToday] = useState(0);
   const [confirmingId, setConfirmingId] = useState(null);
   const [priorityOnly, setPriorityOnly] = useState(true);
   const [error, setError] = useState("");
@@ -96,6 +97,7 @@ function NeedsReviewPageInner() {
         const json = await res.json();
         if (!res.ok) throw new Error(json.error || "Could not load this state's queue.");
         setSchools(json.schools || []);
+        setReviewedToday(json.reviewed_today || 0);
       } catch (err) {
         setError(err.message);
       } finally {
@@ -123,6 +125,7 @@ function NeedsReviewPageInner() {
       if (!res.ok) throw new Error(json.error || "Could not save this confirmation.");
 
       setSchools((prev) => prev.filter((s) => s.id !== schoolId));
+      setReviewedToday((prev) => prev + 1);
       setStates((prev) =>
         prev.map((s) =>
           s.state === selectedState
@@ -239,7 +242,7 @@ function NeedsReviewPageInner() {
       {selectedState && (
         <div className="card" style={{ marginBottom: 14 }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, flexWrap: "wrap", gap: 8 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
               <h3 style={{ margin: 0 }}>{selectedState} — review queue</h3>
               {!loadingSchools && (
                 <span
@@ -253,6 +256,11 @@ function NeedsReviewPageInner() {
                   {remainingInSelectedState} left to verify
                 </span>
               )}
+              {!loadingSchools && reviewedToday > 0 && (
+                <span className="badge" style={{ color: "#1e7145", background: "#e9f5ee", fontWeight: 700 }}>
+                  ✓ {reviewedToday} confirmed today
+                </span>
+              )}
             </div>
             <button className="btn btn-sm" onClick={() => setSelectedState(null)}>
               ← All states
@@ -262,7 +270,12 @@ function NeedsReviewPageInner() {
           {loadingSchools ? (
             <div className="empty-state">Loading…</div>
           ) : schools.length === 0 ? (
-            <div className="empty-state">Nothing left to check in {selectedState} — nice.</div>
+            <div className="empty-state">
+              Nothing left to check in {selectedState} — nice.
+              {reviewedToday > 0 && (
+                <div style={{ marginTop: 6, fontSize: 12.5, color: "#1e7145", fontWeight: 600 }}>✓ {reviewedToday} confirmed today.</div>
+              )}
+            </div>
           ) : (
             <table>
               <thead>
@@ -294,15 +307,12 @@ function NeedsReviewPageInner() {
                     <td>{s.hc_cell || <span style={{ color: "#a2a9b6" }}>—</span>}</td>
                     <td>{s.hc_office || <span style={{ color: "#a2a9b6" }}>—</span>}</td>
                     <td>
-                      {s.never_reviewed ? (
-                        <span className="badge" style={{ color: "#b3261e", background: "#fdeeed" }}>
-                          Never checked
-                        </span>
-                      ) : (
-                        <span className="badge" style={{ color: "#b8860b", background: "#fff8e8" }}>
-                          {s.days_since_review}d ago
-                        </span>
-                      )}
+                      {/* Every row here is guaranteed never_reviewed=true -- the API now
+                          filters out anything already confirmed, so this queue only ever
+                          shows what's actually still outstanding. */}
+                      <span className="badge" style={{ color: "#b3261e", background: "#fdeeed" }}>
+                        Never checked
+                      </span>
                     </td>
                     <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
                       <button
@@ -318,6 +328,21 @@ function NeedsReviewPageInner() {
                 ))}
               </tbody>
             </table>
+          )}
+
+          {/* Repeats the counter after the table too, so it's visible without
+              scrolling back up once the list runs longer than one screen. */}
+          {!loadingSchools && schools.length > 0 && (
+            <div style={{ marginTop: 10, fontSize: 12.5, color: "#697386" }}>
+              <strong style={{ color: "#b3261e" }}>{remainingInSelectedState}</strong> left to verify in {selectedState}
+              {reviewedToday > 0 && (
+                <>
+                  {" "}
+                  · <strong style={{ color: "#1e7145" }}>✓ {reviewedToday}</strong> confirmed today
+                </>
+              )}
+              .
+            </div>
           )}
         </div>
       )}
