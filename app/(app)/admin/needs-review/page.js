@@ -151,6 +151,11 @@ function NeedsReviewPageInner() {
   }
 
   const visibleStates = priorityOnly ? states.filter((s) => PRIORITY_STATES.includes(s.state)) : states;
+  // Live "how many are left" counters -- the whole point of a queue is
+  // knowing when you're done with it, not just what % complete it is.
+  const totalRemaining = visibleStates.reduce((sum, s) => sum + (s.never_reviewed || 0), 0);
+  const selectedStateSummary = selectedState ? states.find((s) => s.state === selectedState) : null;
+  const remainingInSelectedState = selectedStateSummary ? selectedStateSummary.never_reviewed : schools.length;
 
   return (
     <div className="view">
@@ -183,6 +188,13 @@ function NeedsReviewPageInner() {
             </label>
           </div>
 
+          {!loadingStates && visibleStates.length > 0 && (
+            <div style={{ fontSize: 12.5, color: "#697386", marginTop: 8 }}>
+              <strong style={{ color: totalRemaining > 0 ? "#b3261e" : "#1e7145" }}>{totalRemaining.toLocaleString()}</strong>{" "}
+              {totalRemaining === 1 ? "school" : "schools"} still left to verify{priorityOnly ? " across the priority states" : ""}.
+            </div>
+          )}
+
           {loadingStates ? (
             <div className="empty-state">Loading…</div>
           ) : (
@@ -202,8 +214,9 @@ function NeedsReviewPageInner() {
                   }}
                 >
                   <span style={{ width: 34, fontWeight: 700 }}>{s.state}</span>
-                  <span style={{ width: 130, fontSize: 12.5, color: "#697386" }}>
+                  <span style={{ width: 150, fontSize: 12.5, color: "#697386" }}>
                     {s.ever_reviewed}/{s.total_schools} checked
+                    {s.never_reviewed > 0 && <span style={{ color: "#b3261e", fontWeight: 600 }}> · {s.never_reviewed} left</span>}
                   </span>
                   <span style={{ flex: 1 }}>
                     <CoverageBar pct={parseFloat(s.pct_reviewed)} />
@@ -225,8 +238,22 @@ function NeedsReviewPageInner() {
 
       {selectedState && (
         <div className="card" style={{ marginBottom: 14 }}>
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-            <h3 style={{ margin: 0 }}>{selectedState} — review queue</h3>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10, flexWrap: "wrap", gap: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <h3 style={{ margin: 0 }}>{selectedState} — review queue</h3>
+              {!loadingSchools && (
+                <span
+                  className="badge"
+                  style={{
+                    color: remainingInSelectedState > 0 ? "#b3261e" : "#1e7145",
+                    background: remainingInSelectedState > 0 ? "#fdeeed" : "#e9f5ee",
+                    fontWeight: 700,
+                  }}
+                >
+                  {remainingInSelectedState} left to verify
+                </span>
+              )}
+            </div>
             <button className="btn btn-sm" onClick={() => setSelectedState(null)}>
               ← All states
             </button>
