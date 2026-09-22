@@ -75,6 +75,35 @@ async function runWithConcurrency(items, limit, worker) {
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runNext));
 }
 
+// Quick Fix drafts survive navigating away from this page and back --
+// Larry's ask: clicking "Open" (or any other link) to check something on a
+// school's own record, or switching to a different admin page entirely,
+// shouldn't blow away an in-progress edit. sessionStorage (not localStorage)
+// on purpose: a draft is a working scratchpad, not something that should
+// follow a reviewer to their next login days later -- it survives
+// navigation within the tab but clears when the tab/browser closes. One key
+// for the whole page (not scoped per run) so it can be read back
+// synchronously the instant this component remounts, before the run list
+// has even loaded -- the alternative (keying by run id) would need
+// selectedRunId resolved first, which only this page's own run happens to
+// be recoverable from the URL that early. The stored runId is carried along
+// anyway so a restored draft can be told apart from one belonging to a run
+// that's no longer open, if that's ever needed; today it's harmless either
+// way since the editor only actually renders once its itemId shows up in
+// whichever run's rows are on screen. See the editingId/editDraft useState
+// initializers and the persistence effect below for how this gets read back
+// on remount and kept in sync.
+const QUICK_FIX_STORAGE_KEY = "csdQuickFix:coachInfo";
+function readStoredQuickFix() {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(QUICK_FIX_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 function StatusBadge({ status }) {
   const labels = {
     collecting: ["Fetching sources", "#697386"],
@@ -305,10 +334,36 @@ function BatchCoachInfoPageInner() {
   // with the suggested value where there is one, falling back to what's
   // already on file, so every field always starts as *something* real
   // rather than blank.
-  const [editingId, setEditingId] = useState(null);
-  const [editDraft, setEditDraft] = useState({});
+  // Seeded synchronously from sessionStorage -- available at first render,
+  // before the run list or items have even loaded, so a draft in progress
+  // is back on screen the instant this page remounts. Only reads on mount,
+  // by design -- the persistence effect below is what keeps it saved as it
+  // changes.
+  const [editingId, setEditingId] = useState(() => readStoredQuickFix()?.itemId ?? null);
+  const [editDraft, setEditDraft] = useState(() => readStoredQuickFix()?.draft || {});
   const [savingEdit, setSavingEdit] = useState(false);
   const [editError, setEditError] = useState("");
+
+  // Keeps sessionStorage in lockstep with the editor -- open/type a field/
+  // cancel/save all flow through editingId/editDraft, so mirroring just
+  // those two into storage (instead of scattering setItem/removeItem calls
+  // across openEdit/updateDraftField/cancelEdit/saveEdit) covers every path
+  // that changes them, including the toggle-closed case in openEdit. The
+  // run id rides along purely as a label for anyone debugging a stale
+  // entry -- restoring never depends on it.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      if (editingId !== null) {
+        window.sessionStorage.setItem(QUICK_FIX_STORAGE_KEY, JSON.stringify({ runId: selectedRunId, itemId: editingId, draft: editDraft }));
+      } else {
+        window.sessionStorage.removeItem(QUICK_FIX_STORAGE_KEY);
+      }
+    } catch (_) {
+      // Storage can throw in a private tab with site data blocked -- a lost
+      // draft on save/cancel isn't worth surfacing an error over.
+    }
+  }, [editingId, editDraft, selectedRunId]);
 
   function draftFromItem(item) {
     const s = item.school || {};
