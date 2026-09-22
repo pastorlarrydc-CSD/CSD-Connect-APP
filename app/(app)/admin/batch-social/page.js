@@ -207,6 +207,88 @@ function BatchSocialPageInner() {
     });
   }
 
+  // Inline "Quick Fix" editor -- same pattern as Batch Coach-Info's own
+  // (see that page for the full reasoning): fix a wrong handle or fill in
+  // one the AI missed without leaving this review queue. Only one row open
+  // at a time; draft seeded from the suggestion where there is one,
+  // otherwise whatever's already on file, so Cancel always has something
+  // real to fall back to.
+  const [editingId, setEditingId] = useState(null);
+  const [editDraft, setEditDraft] = useState({ hc_twitter: "", hc_facebook: "" });
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [editError, setEditError] = useState("");
+
+  function draftFromItem(item) {
+    const s = item.school || {};
+    const sug = item.suggestion || {};
+    return {
+      hc_twitter: sug.twitter_url || s.hc_twitter || "",
+      hc_facebook: sug.facebook_url || s.hc_facebook || "",
+    };
+  }
+
+  function openEdit(item) {
+    if (editingId === item.id) {
+      setEditingId(null);
+      return;
+    }
+    setEditingId(item.id);
+    setEditDraft(draftFromItem(item));
+    setEditError("");
+  }
+
+  function cancelEdit() {
+    setEditingId(null);
+    setEditError("");
+  }
+
+  function updateDraftField(field, value) {
+    setEditDraft((prev) => ({ ...prev, [field]: value }));
+  }
+
+  // Same two writes as applySuggestionCore below, driven from the edited
+  // draft instead of item.suggestion directly -- lets a reviewer correct a
+  // handle (or add the other platform's, even if the AI only found one)
+  // before it's saved, instead of only being able to accept or reject the
+  // AI's exact pick.
+  async function saveEdit(item) {
+    setSavingEdit(true);
+    setEditError("");
+    const s = item.school;
+    try {
+      const update = {};
+      const changes = [];
+      const newTwitter = (editDraft.hc_twitter || "").trim();
+      const newFacebook = (editDraft.hc_facebook || "").trim();
+      if (newTwitter && newTwitter !== (s.hc_twitter || "")) {
+        update.hc_twitter = newTwitter;
+        changes.push({ school_id: s.id, field_name: "hc_twitter", old_value: s.hc_twitter || null, new_value: newTwitter, source: "Batch AI lookup (reviewed, hand-corrected)", changed_by: user.id });
+      }
+      if (newFacebook && newFacebook !== (s.hc_facebook || "")) {
+        update.hc_facebook = newFacebook;
+        changes.push({ school_id: s.id, field_name: "hc_facebook", old_value: s.hc_facebook || null, new_value: newFacebook, source: "Batch AI lookup (reviewed, hand-corrected)", changed_by: user.id });
+      }
+      const sawChange = Object.keys(update).length > 0;
+      if (sawChange) {
+        const { error: updateErr } = await supabase.from("schools").update(update).eq("id", s.id);
+        if (updateErr) throw updateErr;
+        const { error: logErr } = await supabase.from("school_change_log").insert(changes);
+        if (logErr) throw logErr;
+      }
+      const { error: itemErr } = await supabase
+        .from("social_batch_items")
+        .update({ review_status: sawChange ? "applied" : "skipped", reviewed_at: new Date().toISOString(), reviewed_by: user.id })
+        .eq("id", item.id);
+      if (itemErr) throw itemErr;
+      setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: sawChange ? "applied" : "skipped" } : i)));
+      setEditingId(null);
+    } catch (err) {
+      setEditError(err.message || "Could not save this edit.");
+    } finally {
+      setSavingEdit(false);
+    }
+  }
+
   const selectedRun = runs.find((r) => r.id === selectedRunId) || null;
 
   // school_id -> that school's review_status ("applied"/"skipped"/"pending")
@@ -305,6 +387,11 @@ function BatchSocialPageInner() {
     function onKeyDown(e) {
       if (selectedRun?.status !== "collected") return;
       if (bulkApplying || applyingId) return;
+      if (e.key === "Escape" && editingId !== null) {
+        e.preventDefault();
+        cancelEdit();
+        return;
+      }
       const tag = document.activeElement?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
@@ -325,11 +412,16 @@ function BatchSocialPageInner() {
           e.preventDefault();
           skipItem(focusedItem);
         }
+      } else if (e.key === "e" || e.key === "E") {
+        if (focusedItem) {
+          e.preventDefault();
+          openEdit(focusedItem);
+        }
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedRun?.status, bulkApplying, applyingId, focusedItem, keyboardTargets.length]);
+  }, [selectedRun?.status, bulkApplying, applyingId, focusedItem, keyboardTargets.length, editingId]);
 
   const loadRuns = useCallback(async () => {
     setLoadingRuns(true);
@@ -404,6 +496,8 @@ function BatchSocialPageInner() {
 
   function openRun(runId) {
     setSelectedRunId(runId);
+    setEditingId(null);
+    setEditError("");
     setCreateError("");
     setSubmitError("");
     setStatusError("");
@@ -1171,7 +1265,7 @@ function BatchSocialPageInner() {
               )}
 
               <div style={{ fontSize: 11.5, color: "#9aa1ab", marginBottom: 6 }}>
-                Keyboard shortcuts: <strong>↑</strong>/<strong>↓</strong> move focus · <strong>A</strong> apply · <strong>S</strong> skip
+                Keyboard shortcuts: <strong>↑</strong>/<strong>↓</strong> move focus · <strong>A</strong> apply · <strong>S</strong> skip · <strong>E</strong> quick-edit · <strong>Esc</strong> cancel edit
               </div>
 
               <div style={{ overflowX: "auto" }}>
@@ -1192,7 +1286,7 @@ function BatchSocialPageInner() {
                       const applying = applyingId === item.id;
                       const reviewed = item.review_status !== "pending";
                       const isFocused = !reviewed && focusedItem?.id === item.id;
-                      return (
+                      return [
                         <tr
                           key={item.id}
                           style={{
@@ -1293,14 +1387,64 @@ function BatchSocialPageInner() {
                                 <button className="btn btn-sm" disabled={applying || bulkApplying} onClick={() => skipItem(item)}>
                                   Skip
                                 </button>
+                                <button
+                                  className="btn btn-sm"
+                                  disabled={applying || bulkApplying}
+                                  onClick={() => openEdit(item)}
+                                  style={editingId === item.id ? { background: "#0b5fff", borderColor: "#0b5fff", color: "#fff" } : undefined}
+                                  title="Fix a handle before applying, right here, without opening the school's record"
+                                >
+                                  {editingId === item.id ? "Editing…" : "Edit"}
+                                </button>
                                 <Link href={`/schools/${s.id}`} className="btn btn-sm">
                                   Open
                                 </Link>
                               </div>
                             )}
                           </td>
-                        </tr>
-                      );
+                        </tr>,
+                        editingId === item.id && (
+                          <tr key={`edit-${item.id}`} style={{ borderBottom: "1px solid #eef0f3", background: "#f8fafc" }}>
+                            <td colSpan={4} style={{ padding: "10px 8px 14px" }}>
+                              <div style={{ fontSize: 11.5, fontWeight: 600, color: "#697386", marginBottom: 8 }}>Quick Fix — {s.name}</div>
+                              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))", gap: 8 }}>
+                                <label style={{ fontSize: 11.5, color: "#697386" }}>
+                                  Twitter / X
+                                  <input
+                                    value={editDraft.hc_twitter || ""}
+                                    onChange={(e) => updateDraftField("hc_twitter", e.target.value)}
+                                    style={{ width: "100%", marginTop: 2, fontSize: 12.5 }}
+                                    placeholder={s.hc_twitter || ""}
+                                  />
+                                </label>
+                                <label style={{ fontSize: 11.5, color: "#697386" }}>
+                                  Facebook
+                                  <input
+                                    value={editDraft.hc_facebook || ""}
+                                    onChange={(e) => updateDraftField("hc_facebook", e.target.value)}
+                                    style={{ width: "100%", marginTop: 2, fontSize: 12.5 }}
+                                    placeholder={s.hc_facebook || ""}
+                                  />
+                                </label>
+                              </div>
+                              {editError && (
+                                <div className="notice danger" style={{ marginTop: 8, fontSize: 12.5 }}>
+                                  {editError}
+                                </div>
+                              )}
+                              <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
+                                <button className="btn btn-gold btn-sm" disabled={savingEdit} onClick={() => saveEdit(item)}>
+                                  {savingEdit ? "Saving…" : "Save & Next"}
+                                </button>
+                                <button className="btn btn-sm" disabled={savingEdit} onClick={cancelEdit}>
+                                  Cancel
+                                </button>
+                                <span style={{ fontSize: 11, color: "#9aa1ab", alignSelf: "center" }}>Esc to cancel.</span>
+                              </div>
+                            </td>
+                          </tr>
+                        ),
+                      ];
                     })}
                   </tbody>
                 </table>
