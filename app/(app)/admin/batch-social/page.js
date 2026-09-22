@@ -55,6 +55,22 @@ async function runWithConcurrency(items, limit, worker) {
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runNext));
 }
 
+// Quick Fix drafts survive navigating away from this page and back -- see
+// the identical helper on Batch Coach-Info's page for the full reasoning.
+// One sessionStorage key for the whole page (not scoped per run) so it can
+// be read back synchronously the instant this component remounts, before
+// the run list has even loaded.
+const QUICK_FIX_STORAGE_KEY = "csdQuickFix:social";
+function readStoredQuickFix() {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(QUICK_FIX_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 function StatusBadge({ status }) {
   const labels = {
     collecting: ["Searching", "#697386"],
@@ -213,10 +229,23 @@ function BatchSocialPageInner() {
   // at a time; draft seeded from the suggestion where there is one,
   // otherwise whatever's already on file, so Cancel always has something
   // real to fall back to.
-  const [editingId, setEditingId] = useState(null);
-  const [editDraft, setEditDraft] = useState({ hc_twitter: "", hc_facebook: "" });
+  const [editingId, setEditingId] = useState(() => readStoredQuickFix()?.itemId ?? null);
+  const [editDraft, setEditDraft] = useState(() => readStoredQuickFix()?.draft || { hc_twitter: "", hc_facebook: "" });
   const [savingEdit, setSavingEdit] = useState(false);
   const [editError, setEditError] = useState("");
+
+  // Keeps sessionStorage in lockstep with the editor -- see Batch
+  // Coach-Info's identical effect for the full reasoning.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      if (editingId !== null) {
+        window.sessionStorage.setItem(QUICK_FIX_STORAGE_KEY, JSON.stringify({ runId: selectedRunId, itemId: editingId, draft: editDraft }));
+      } else {
+        window.sessionStorage.removeItem(QUICK_FIX_STORAGE_KEY);
+      }
+    } catch (_) {}
+  }, [editingId, editDraft, selectedRunId]);
 
   function draftFromItem(item) {
     const s = item.school || {};
