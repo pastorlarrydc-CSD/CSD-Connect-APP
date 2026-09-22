@@ -53,6 +53,22 @@ async function runWithConcurrency(items, limit, worker) {
   await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runNext));
 }
 
+// Quick Fix drafts survive navigating away from this page and back -- see
+// the identical helper on Batch Coach-Info's page for the full reasoning.
+// One sessionStorage key for the whole page (not scoped per run) so it can
+// be read back synchronously the instant this component remounts, before
+// the run list has even loaded.
+const QUICK_FIX_STORAGE_KEY = "csdQuickFix:maxpreps";
+function readStoredQuickFix() {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.sessionStorage.getItem(QUICK_FIX_STORAGE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    return null;
+  }
+}
+
 function StatusBadge({ status }) {
   const labels = {
     collecting: ["Searching", "#697386"],
@@ -190,10 +206,23 @@ function BatchMaxPrepsPageInner() {
   // Social/Batch Athletics (see Batch Coach-Info for the full reasoning):
   // correct the suggested MaxPreps URL, or type in one the AI missed,
   // without leaving this review queue. Only one row open at a time.
-  const [editingId, setEditingId] = useState(null);
-  const [editDraft, setEditDraft] = useState("");
+  const [editingId, setEditingId] = useState(() => readStoredQuickFix()?.itemId ?? null);
+  const [editDraft, setEditDraft] = useState(() => readStoredQuickFix()?.draft ?? "");
   const [savingEdit, setSavingEdit] = useState(false);
   const [editError, setEditError] = useState("");
+
+  // Keeps sessionStorage in lockstep with the editor -- see Batch
+  // Coach-Info's identical effect for the full reasoning.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      if (editingId !== null) {
+        window.sessionStorage.setItem(QUICK_FIX_STORAGE_KEY, JSON.stringify({ runId: selectedRunId, itemId: editingId, draft: editDraft }));
+      } else {
+        window.sessionStorage.removeItem(QUICK_FIX_STORAGE_KEY);
+      }
+    } catch (_) {}
+  }, [editingId, editDraft, selectedRunId]);
 
   function openEdit(item) {
     if (editingId === item.id) {
