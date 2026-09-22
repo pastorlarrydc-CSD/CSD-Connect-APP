@@ -26,6 +26,19 @@
 // plus a 7-day momentum count so an actively-worked state is visible at a
 // glance. "Review →" on that column and in the quick-glance strips below
 // jumps into Needs-Review pre-scoped to that state.
+//
+// Two later additions, both reading the view's reviewed_prior_7d column
+// (the 8-14-days-ago window, added alongside reviewed_last_7d so there's
+// always something to compare "this week" against):
+//   1. A week-over-week trend arrow on the Marked Reviewed column, and a
+//      "Picking up speed" quick-glance card -- answers "who's gaining
+//      ground faster than last week," not just "who did the most today."
+//   2. The Priority States strip -- one progress bar per ICP state (see
+//      PRIORITY_STATES), framed as "X% clear on <dominant remaining
+//      field>" so a big raw gap count (e.g. TX's ~900 missing social
+//      handles) reads as a finishable percentage instead of an abstract
+//      pile. Computed per state, not hardcoded to Social, so it stays
+//      correct if the dominant gap ever shifts to a different field.
 import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
@@ -76,7 +89,7 @@ function reviewedColor(pct) {
   return "#b3261e";
 }
 
-function ReviewedCell({ count, total, recent, state }) {
+function ReviewedCell({ count, total, recent, prior, state }) {
   const pct = total ? Math.round((100 * count) / total) : 0;
   const remaining = Math.max(total - count, 0);
   return (
@@ -90,13 +103,74 @@ function ReviewedCell({ count, total, recent, state }) {
       ) : (
         <div style={{ fontSize: 10.5, color: "#1e7145", fontWeight: 700, marginTop: 2 }}>all verified</div>
       )}
-      {recent > 0 && (
-        <div style={{ fontSize: 10, color: "#0b5fff", marginTop: 2, fontWeight: 600 }}>+{recent} this week</div>
+      {(recent > 0 || prior > 0) && (
+        <div style={{ fontSize: 10, marginTop: 2, fontWeight: 600 }}>
+          <span style={{ color: "#0b5fff" }}>+{recent} this wk</span>{" "}
+          <span style={{ color: recent > prior ? "#1e7145" : recent < prior ? "#b3261e" : "#9aa1ab" }} title={`${prior} the week before`}>
+            {recent > prior ? "▲" : recent < prior ? "▼" : "–"}
+          </span>
+        </div>
       )}
       <Link href={`/admin/needs-review?state=${state}`} className="btn btn-sm" style={{ marginTop: 4, fontSize: 11, padding: "2px 8px" }}>
         Review →
       </Link>
     </td>
+  );
+}
+
+// Priority-state completion framing -- for each priority state, find
+// whichever of the five tracked fields has the biggest remaining gap there
+// and express progress as "% clear on <that field>". Almost everywhere
+// today that dominant field is Social (coach name/email/athletics/MaxPreps
+// are essentially fully covered database-wide already -- see
+// full-sweep-roadmap.md) but this is computed per state rather than
+// hardcoded to Social, so it stays correct if that balance ever shifts.
+function dominantGap(stateRow) {
+  let worst = null;
+  for (const m of METRICS) {
+    const count = stateRow[m.key] || 0;
+    if (!worst || count > worst.count) worst = { metric: m, count };
+  }
+  return worst;
+}
+
+function PriorityCompletionStrip({ states }) {
+  const rows = PRIORITY_STATES.map((code) => states.find((s) => s.state === code)).filter(Boolean);
+  if (rows.length === 0) return null;
+  return (
+    <div className="card" style={{ marginBottom: 14 }}>
+      <div style={{ fontSize: 12, fontWeight: 700, color: "#1c5fb3", marginBottom: 8 }}>🎯 Priority states -- how close to done</div>
+      <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+        {rows
+          .map((s) => ({ state: s, gap: dominantGap(s) }))
+          .sort((a, b) => b.gap.count - a.gap.count)
+          .map(({ state: s, gap }) => {
+            const pctClear = s.total_open ? Math.round((100 * (s.total_open - gap.count)) / s.total_open) : 100;
+            return (
+              <div key={s.state} style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ width: 30, fontWeight: 700, fontSize: 12.5 }}>{s.state}</div>
+                <div style={{ flex: 1, height: 8, background: "#eef0f3", borderRadius: 5, overflow: "hidden" }}>
+                  <div style={{ width: `${pctClear}%`, height: "100%", background: neededColor(gap.count) }} />
+                </div>
+                <div style={{ fontSize: 11.5, color: "#697386", minWidth: 210, textAlign: "right" }}>
+                  {gap.count === 0 ? (
+                    <span style={{ color: "#1e7145", fontWeight: 700 }}>fully clear</span>
+                  ) : (
+                    <>
+                      <strong>{pctClear}%</strong> clear on {gap.metric.short} -- <strong>{gap.count.toLocaleString()}</strong> to go
+                    </>
+                  )}
+                </div>
+                {gap.count > 0 && (
+                  <Link href={gap.metric.href(s.state)} className="btn btn-sm" style={{ fontSize: 11, padding: "2px 8px" }}>
+                    Focus →
+                  </Link>
+                )}
+              </div>
+            );
+          })}
+      </div>
+    </div>
   );
 }
 
@@ -183,6 +257,17 @@ export default function StateProgressPage() {
     .slice()
     .sort((a, b) => (a.reviewed_count || 0) / (a.total_open || 1) - (b.reviewed_count || 0) / (b.total_open || 1))
     .slice(0, 3);
+  // Week-over-week momentum: this-week count minus the week-before count,
+  // so a state that's speeding up shows even if its raw "this week" number
+  // isn't the biggest -- answers "who's gaining ground fastest," not just
+  // "who did the most today." Requires having had at least some activity in
+  // the prior window too, so a state going from 0 to 1 doesn't read as an
+  // infinite acceleration.
+  const accelerating = states
+    .filter((s) => (s.reviewed_last_7d || 0) > (s.reviewed_prior_7d || 0))
+    .slice()
+    .sort((a, b) => (b.reviewed_last_7d || 0) - (b.reviewed_prior_7d || 0) - ((a.reviewed_last_7d || 0) - (a.reviewed_prior_7d || 0)))
+    .slice(0, 3);
 
   return (
     <div className="view">
@@ -205,8 +290,23 @@ export default function StateProgressPage() {
         </div>
       )}
 
-      {!loading && (mostActive.length > 0 || furthestBehind.length > 0) && (
+      {!loading && (mostActive.length > 0 || furthestBehind.length > 0 || accelerating.length > 0) && (
         <div style={{ display: "flex", gap: 14, flexWrap: "wrap", marginBottom: 14 }}>
+          {accelerating.length > 0 && (
+            <div className="card" style={{ flex: "1 1 260px", padding: "10px 14px" }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: "#1e7145", marginBottom: 6 }}>📈 Picking up speed (vs. last week)</div>
+              {accelerating.map((s) => (
+                <div key={s.state} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, padding: "2px 0" }}>
+                  <span>
+                    <strong>{s.state}</strong>
+                  </span>
+                  <span style={{ color: "#697386" }}>
+                    {s.reviewed_prior_7d || 0} → <strong style={{ color: "#1e7145" }}>{s.reviewed_last_7d || 0}</strong>
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
           {mostActive.length > 0 && (
             <div className="card" style={{ flex: "1 1 260px", padding: "10px 14px" }}>
               <div style={{ fontSize: 12, fontWeight: 700, color: "#0b5fff", marginBottom: 6 }}>🔥 Most active this week</div>
@@ -244,6 +344,8 @@ export default function StateProgressPage() {
           )}
         </div>
       )}
+
+      {!loading && <PriorityCompletionStrip states={states} />}
 
       <div className="card" style={{ marginBottom: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
@@ -311,7 +413,7 @@ export default function StateProgressPage() {
                     {METRICS.map((m) => (
                       <MetricCell key={m.key} count={s[m.key] || 0} total={s.total_open} state={s.state} metric={m} />
                     ))}
-                    <ReviewedCell count={s.reviewed_count || 0} total={s.total_open} recent={s.reviewed_last_7d || 0} state={s.state} />
+                    <ReviewedCell count={s.reviewed_count || 0} total={s.total_open} recent={s.reviewed_last_7d || 0} prior={s.reviewed_prior_7d || 0} state={s.state} />
                   </tr>
                 ))}
               </tbody>
