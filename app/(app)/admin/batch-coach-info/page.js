@@ -297,6 +297,75 @@ function BatchCoachInfoPageInner() {
     });
   }
 
+  // Inline "Quick Fix" editor -- Larry's ask: fix a wrong field on the
+  // suggestion (or fill in one the AI missed) without leaving this page for
+  // the school's own record. Only one row open at a time (editingId), with
+  // its draft values kept separately from item.suggestion so typing doesn't
+  // mutate the AI's original output -- Cancel just drops the draft. Seeded
+  // with the suggested value where there is one, falling back to what's
+  // already on file, so every field always starts as *something* real
+  // rather than blank.
+  const [editingId, setEditingId] = useState(null);
+  const [editDraft, setEditDraft] = useState({});
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [editError, setEditError] = useState("");
+
+  function draftFromItem(item) {
+    const s = item.school || {};
+    const sug = item.suggestion || {};
+    const draft = {};
+    SUGGESTION_FIELDS.forEach((f) => {
+      draft[f] = (sug[f] || s[f] || "").toString();
+    });
+    return draft;
+  }
+
+  function openEdit(item) {
+    if (editingId === item.id) {
+      setEditingId(null);
+      return;
+    }
+    setEditingId(item.id);
+    setEditDraft(draftFromItem(item));
+    setEditError("");
+  }
+
+  function cancelEdit() {
+    setEditingId(null);
+    setEditDraft({});
+    setEditError("");
+  }
+
+  function updateDraftField(field, value) {
+    setEditDraft((prev) => ({ ...prev, [field]: value }));
+  }
+
+  // Reuses applySuggestionFromCsv's write path below -- it already takes a
+  // plain {field: value} object instead of item.suggestion and handles the
+  // same verified/estimated-email nuance a hand-typed correction should get
+  // too (typing a real email over a pattern-estimated guess IS a human
+  // confirming it, so that case still marks the record verified). This is
+  // the same logic a CSV re-upload runs per row, just driven from the
+  // inline inputs instead of a spreadsheet cell.
+  async function saveEdit(item) {
+    setSavingEdit(true);
+    setEditError("");
+    const effectiveFields = {};
+    SUGGESTION_FIELDS.forEach((f) => {
+      const v = (editDraft[f] || "").trim();
+      if (v) effectiveFields[f] = v;
+    });
+    const result = await applySuggestionFromCsv(item, effectiveFields);
+    if (result.ok) {
+      setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: result.changed ? "applied" : "skipped" } : i)));
+      setEditingId(null);
+      setEditDraft({});
+    } else {
+      setEditError(result.error);
+    }
+    setSavingEdit(false);
+  }
+
   const selectedRun = runs.find((r) => r.id === selectedRunId) || null;
 
   const readyCount = items.filter((i) => i.fetch_status === "ready").length;
@@ -402,15 +471,22 @@ function BatchCoachInfoPageInner() {
   const focusedItem = keyboardTargets[clampedFocusedIndex] || null;
 
   // Keyboard shortcuts for the review queue -- Up/Down move focus between
-  // pending rows, A applies the focused row, S skips it. Only active while
-  // this run is at the "collected" review stage, nothing's mid-flight, and
-  // the user isn't typing into a form field (e.g. the custom-states input
-  // above). Lets a reviewer clear a run without reaching for the mouse for
-  // every single Apply/Skip click.
+  // pending rows, A applies the focused row, S skips it, E opens/closes the
+  // inline Quick Fix editor on the focused row, Escape backs out of it.
+  // Escape is checked before the "typing into a field" bail-out below so it
+  // still works while an edit input is focused (that's the whole point --
+  // canceling out of the editor you're typing in); every other shortcut
+  // still requires focus to be off any form field. Only active while this
+  // run is at the "collected" review stage and nothing's mid-flight.
   useEffect(() => {
     function onKeyDown(e) {
       if (selectedRun?.status !== "collected") return;
       if (bulkApplying || bulkSkipping || applyingId) return;
+      if (e.key === "Escape" && editingId !== null) {
+        e.preventDefault();
+        cancelEdit();
+        return;
+      }
       const tag = document.activeElement?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
@@ -431,11 +507,16 @@ function BatchCoachInfoPageInner() {
           e.preventDefault();
           skipItem(focusedItem);
         }
+      } else if (e.key === "e" || e.key === "E") {
+        if (focusedItem) {
+          e.preventDefault();
+          openEdit(focusedItem);
+        }
       }
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedRun?.status, bulkApplying, bulkSkipping, applyingId, focusedItem, keyboardTargets.length]);
+  }, [selectedRun?.status, bulkApplying, bulkSkipping, applyingId, focusedItem, keyboardTargets.length, editingId]);
 
   // Narrowing the confidence filter or typing a search query changes which
   // rows count as keyboard-nav targets -- reset focus to the top of the new
@@ -524,6 +605,8 @@ function BatchCoachInfoPageInner() {
 
   function openRun(runId) {
     setSelectedRunId(runId);
+    setEditingId(null);
+    setEditError("");
     setCreateError("");
     setSubmitError("");
     setStatusError("");
@@ -1527,7 +1610,7 @@ function BatchCoachInfoPageInner() {
               )}
 
               <div style={{ fontSize: 11.5, color: "#9aa1ab", marginBottom: 6 }}>
-                Keyboard shortcuts: <strong>↑</strong>/<strong>↓</strong> move focus · <strong>A</strong> apply · <strong>S</strong> skip
+                Keyboard shortcuts: <strong>↑</strong>/<strong>↓</strong> move focus · <strong>A</strong> apply · <strong>S</strong> skip · <strong>E</strong> quick-edit · <strong>Esc</strong> cancel edit
               </div>
 
               <div style={{ overflowX: "auto" }}>
@@ -1562,7 +1645,7 @@ function BatchCoachInfoPageInner() {
                         // relying on them to notice a quiet text diff.
                         const hadPriorName = Boolean((s.hc_first_name || "").trim() || (s.hc_last_name || "").trim());
                         const nameChanged = hadPriorName && (changedFields.includes("hc_first_name") || changedFields.includes("hc_last_name"));
-                        return (
+                        return [
                           <tr
                             key={item.id}
                             style={{
@@ -1671,14 +1754,71 @@ function BatchCoachInfoPageInner() {
                                   <button className="btn btn-sm" disabled={applying || bulkApplying || bulkSkipping} onClick={() => skipItem(item)}>
                                     Skip
                                   </button>
+                                  <button
+                                    className="btn btn-sm"
+                                    disabled={applying || bulkApplying || bulkSkipping}
+                                    onClick={() => openEdit(item)}
+                                    style={editingId === item.id ? { background: "#0b5fff", borderColor: "#0b5fff", color: "#fff" } : undefined}
+                                    title="Fix a field before applying, right here, without opening the school's record"
+                                  >
+                                    {editingId === item.id ? "Editing…" : "Edit"}
+                                  </button>
                                   <Link href={`/schools/${s.id}`} className="btn btn-sm">
                                     Open
                                   </Link>
                                 </div>
                               )}
                             </td>
-                          </tr>
-                        );
+                          </tr>,
+                          editingId === item.id && (
+                            <tr key={`edit-${item.id}`} style={{ borderBottom: "1px solid #eef0f3", background: "#f8fafc" }}>
+                              <td colSpan={4} style={{ padding: "10px 8px 14px" }}>
+                                {/* Quick Fix -- same idea as the school profile
+                                    page's own inline editor, brought into the
+                                    batch review queue so correcting one field
+                                    on an otherwise-good suggestion (or filling
+                                    in one the AI missed) doesn't require
+                                    leaving this list. Saving here runs through
+                                    applySuggestionFromCsv, the exact same
+                                    write path a reviewed-CSV re-upload uses --
+                                    same audit-log entries, same
+                                    verified/estimated-email handling. */}
+                                <div style={{ fontSize: 11.5, fontWeight: 600, color: "#697386", marginBottom: 8 }}>
+                                  Quick Fix — {s.name}
+                                </div>
+                                <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(190px, 1fr))", gap: 8 }}>
+                                  {SUGGESTION_FIELDS.map((f) => (
+                                    <label key={f} style={{ fontSize: 11.5, color: "#697386" }}>
+                                      {FIELD_LABELS[f]}
+                                      <input
+                                        value={editDraft[f] || ""}
+                                        onChange={(e) => updateDraftField(f, e.target.value)}
+                                        style={{ width: "100%", marginTop: 2, fontSize: 12.5 }}
+                                        placeholder={s[f] || ""}
+                                      />
+                                    </label>
+                                  ))}
+                                </div>
+                                {editError && (
+                                  <div className="notice danger" style={{ marginTop: 8, fontSize: 12.5 }}>
+                                    {editError}
+                                  </div>
+                                )}
+                                <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
+                                  <button className="btn btn-gold btn-sm" disabled={savingEdit} onClick={() => saveEdit(item)}>
+                                    {savingEdit ? "Saving…" : "Save & Next"}
+                                  </button>
+                                  <button className="btn btn-sm" disabled={savingEdit} onClick={cancelEdit}>
+                                    Cancel
+                                  </button>
+                                  <span style={{ fontSize: 11, color: "#9aa1ab", alignSelf: "center" }}>
+                                    Blank clears nothing — leave a field as-is to skip it. Esc to cancel.
+                                  </span>
+                                </div>
+                              </td>
+                            </tr>
+                          ),
+                        ];
                       })}
                   </tbody>
                 </table>
