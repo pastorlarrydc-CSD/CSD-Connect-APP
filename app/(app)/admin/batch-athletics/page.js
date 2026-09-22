@@ -69,6 +69,46 @@ function StatusBadge({ status }) {
   );
 }
 
+// Days between now and a timestamp, floored -- used by WaitingBadge below so
+// a run sitting "ready to collect" (or still processing) for a while doesn't
+// quietly get forgotten under newer runs.
+function daysSince(dateStr) {
+  if (!dateStr) return null;
+  return Math.floor((Date.now() - new Date(dateStr).getTime()) / 86400000);
+}
+
+function WaitingBadge({ run }) {
+  if (run.status === "ready") {
+    const days = daysSince(run.ready_at);
+    if (days === null || days < 1) return null;
+    const stale = days >= 3;
+    const color = stale ? "#b3261e" : "#8a6100";
+    return (
+      <span
+        className="badge"
+        title="Anthropic batch finished and has been waiting to be collected"
+        style={{ color, background: `${color}1a`, fontWeight: 600, marginLeft: 6 }}
+      >
+        ⏳ waiting {days}d
+      </span>
+    );
+  }
+  if (run.status === "submitted" || run.status === "processing") {
+    const days = daysSince(run.submitted_at);
+    if (days === null || days < 2) return null;
+    return (
+      <span
+        className="badge"
+        title="Still processing at Anthropic"
+        style={{ color: "#697386", background: "#69738619", fontWeight: 600, marginLeft: 6 }}
+      >
+        {days}d in progress
+      </span>
+    );
+  }
+  return null;
+}
+
 function confidenceColor(confidence) {
   if (confidence === "high") return "#1e7145";
   if (confidence === "medium") return "#8a6100";
@@ -741,7 +781,10 @@ function BatchAthleticsPageInner() {
                     {r.requested_count === 1 ? "" : "s"}
                     {r.status === "collected" && pendingCount > 0 ? ` — ${pendingCount} to review` : ""}
                   </div>
-                  <StatusBadge status={r.status} />
+                  <span style={{ display: "flex", alignItems: "center" }}>
+                    <StatusBadge status={r.status} />
+                    <WaitingBadge run={r} />
+                  </span>
                 </div>
               );
             })}
