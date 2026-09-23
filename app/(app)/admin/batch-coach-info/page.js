@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useCallback, Suspense } from "react";
+import { useState, useEffect, useCallback, useRef, Suspense } from "react";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import Papa from "papaparse";
@@ -62,7 +62,7 @@ const FIELD_LABELS = {
 };
 
 const ITEM_SELECT =
-  "id,batch_run_id,school_id,fetch_status,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,ad_name,ad_email,athletics_url,website)";
+  "id,batch_run_id,school_id,fetch_status,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,ad_name,ad_email,athletics_url,website,verification_status,last_verified_at)";
 
 async function runWithConcurrency(items, limit, worker) {
   let next = 0;
@@ -159,6 +159,28 @@ function WaitingBadge({ run }) {
     );
   }
   return null;
+}
+
+// True when a school in this run got marked verification_status="verified"
+// AFTER this run was created -- i.e. it was handled through some other
+// channel (Needs-Review, a Quick Fix on a different batch tool, a manual
+// edit) while this run sat open, making its row here redundant work. Most
+// candidate-selection modes already exclude verified schools up front (see
+// startRun's .neq("verification_status", "verified")), so this only ever
+// fires for a school verified DURING the run's lifetime, or for a
+// "re_verify" mode run (which deliberately skips that exclusion since its
+// whole point is re-checking stale-but-verified schools -- comparing against
+// created_at here is what keeps that case from being flagged as if it were
+// new, unexpected overlap instead of the re_verify mode working as designed).
+// Scoped to pending rows only -- an applied/skipped row already has its own
+// outcome, there's nothing left for this badge to add.
+function wasVerifiedElsewhere(item, run) {
+  const s = item?.school;
+  if (!s || !run) return false;
+  if (item.review_status !== "pending") return false;
+  if (s.verification_status !== "verified") return false;
+  if (!s.last_verified_at) return false;
+  return new Date(s.last_verified_at).getTime() > new Date(run.created_at).getTime();
 }
 
 // Which run is open, the confidence tier, the search text, and "show
@@ -344,6 +366,17 @@ function BatchCoachInfoPageInner() {
   const [savingEdit, setSavingEdit] = useState(false);
   const [editError, setEditError] = useState("");
 
+  // Undo toast -- a Quick Fix save is a hand-typed correction with no review
+  // step of its own (unlike Apply, which is at least confirming an AI
+  // suggestion someone already looked at), so a wrong keystroke deserves a
+  // quick way back out without having to find the school's own record.
+  // Single-slot on purpose (one toast at a time, the most recent save) --
+  // auto-clears after 8s via undoTimeoutRef, cleared/reset on every new save
+  // so an old timer can't null out a toast for a save that just happened.
+  const [undoToast, setUndoToast] = useState(null);
+  const undoTimeoutRef = useRef(null);
+  useEffect(() => () => clearTimeout(undoTimeoutRef.current), []);
+
   // Keeps sessionStorage in lockstep with the editor -- open/type a field/
   // cancel/save all flow through editingId/editDraft, so mirroring just
   // those two into storage (instead of scattering setItem/removeItem calls
@@ -405,6 +438,12 @@ function BatchCoachInfoPageInner() {
   async function saveEdit(item) {
     setSavingEdit(true);
     setEditError("");
+    // Snapshot exactly what's on file right now, before this write --
+    // undoQuickFixSave below restores from this, not from item.suggestion,
+    // so Undo always gets back to the real prior state even if the draft
+    // only touched one of the nine fields.
+    const previousSchool = { ...(item.school || {}) };
+    const previousReviewStatus = item.review_status;
     const effectiveFields = {};
     SUGGESTION_FIELDS.forEach((f) => {
       const v = (editDraft[f] || "").trim();
@@ -415,10 +454,63 @@ function BatchCoachInfoPageInner() {
       setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: result.changed ? "applied" : "skipped" } : i)));
       setEditingId(null);
       setEditDraft({});
+      if (result.changed) {
+        clearTimeout(undoTimeoutRef.current);
+        const toastId = Date.now();
+        setUndoToast({ id: toastId, itemId: item.id, schoolName: previousSchool.name, previousSchool, previousReviewStatus });
+        undoTimeoutRef.current = setTimeout(() => {
+          setUndoToast((cur) => (cur && cur.id === toastId ? null : cur));
+        }, 8000);
+      }
     } else {
       setEditError(result.error);
     }
     setSavingEdit(false);
+  }
+
+  // Reverts a Quick Fix save back to exactly what was on file before it --
+  // restores every suggestion field (plus verification_status/
+  // last_verified_at) to the snapshot saveEdit took beforehand, logs one
+  // school_change_log row per field actually reverted (current -> restored,
+  // source "Quick Fix Undo") so the audit trail shows the correction AND the
+  // undo rather than silently erasing the first entry, and puts the batch
+  // item back to review_status="pending" (or whatever it was before, on the
+  // rare chance it wasn't pending) so it's back in the working queue.
+  async function undoQuickFixSave() {
+    if (!undoToast) return;
+    const { itemId, previousSchool, previousReviewStatus } = undoToast;
+    setReviewError("");
+    try {
+      const current = items.find((i) => i.id === itemId)?.school || {};
+      const restore = {};
+      const changes = [];
+      SUGGESTION_FIELDS.forEach((f) => {
+        const priorVal = previousSchool[f] || null;
+        const curVal = current[f] || null;
+        if (priorVal !== curVal) {
+          restore[f] = priorVal;
+          changes.push({ school_id: previousSchool.id, field_name: f, old_value: curVal, new_value: priorVal, source: "Quick Fix Undo -- reverted to pre-save value", changed_by: user.id });
+        }
+      });
+      restore.verification_status = previousSchool.verification_status ?? null;
+      restore.last_verified_at = previousSchool.last_verified_at ?? null;
+      const { error: updateErr } = await supabase.from("schools").update(restore).eq("id", previousSchool.id);
+      if (updateErr) throw updateErr;
+      if (changes.length > 0) {
+        const { error: logErr } = await supabase.from("school_change_log").insert(changes);
+        if (logErr) throw logErr;
+      }
+      const { error: itemErr } = await supabase
+        .from("coach_info_batch_items")
+        .update({ review_status: previousReviewStatus, reviewed_at: null, reviewed_by: null })
+        .eq("id", itemId);
+      if (itemErr) throw itemErr;
+      setItems((prev) => prev.map((i) => (i.id === itemId ? { ...i, review_status: previousReviewStatus, school: { ...i.school, ...restore } } : i)));
+      setUndoToast(null);
+      clearTimeout(undoTimeoutRef.current);
+    } catch (err) {
+      setReviewError(err.message || "Could not undo this save.");
+    }
   }
 
   const selectedRun = runs.find((r) => r.id === selectedRunId) || null;
@@ -429,7 +521,12 @@ function BatchCoachInfoPageInner() {
   const suggestedItems = items.filter((i) => i.suggestion);
   const pendingReview = suggestedItems.filter((i) => i.review_status === "pending");
   const reviewedItems = suggestedItems.filter((i) => i.review_status !== "pending");
-  const failedItems = suggestedItems.filter((i) => i.suggestion_error);
+  // Pending only -- once confirmed via confirmNoDataAvailable, review_status
+  // moves to "confirmed_no_data" (folding into reviewedItems below) even
+  // though suggestion_error is still set on the row, so this must check both
+  // or a confirmed row would keep showing up in the "Confirm no data
+  // available" section forever.
+  const failedItems = suggestedItems.filter((i) => i.suggestion_error && i.review_status === "pending");
   const highConfidencePendingCount = pendingReview.filter((i) => i.suggestion?.confidence === "high").length;
 
   // Whether a run still has something actionable left -- a run that's not
@@ -463,6 +560,9 @@ function BatchCoachInfoPageInner() {
     });
   });
   const noChangesPendingCount = noChangesPendingItems.length;
+  // Pending rows whose school already got verified through some other
+  // channel since this run started -- see wasVerifiedElsewhere above.
+  const verifiedElsewhereItems = pendingReview.filter((i) => wasVerifiedElsewhere(i, selectedRun));
 
   // Matches a row against the current search box -- school name, city, OR
   // a coach's name/email, case-insensitive, same loose substring match a
@@ -1248,6 +1348,108 @@ function BatchCoachInfoPageInner() {
     }
   }
 
+  // Clears every pending row whose school already got verified through some
+  // other channel since this run started (see wasVerifiedElsewhere) -- same
+  // shape as bulkSkipNoChanges, just a different target list and label. Only
+  // ever touches coach_info_batch_items -- the school itself is already
+  // verified, there's nothing to write there.
+  async function bulkSkipVerifiedElsewhere() {
+    const targets = verifiedElsewhereItems;
+    if (!targets.length) return;
+    setBulkSkipping(true);
+    setReviewError("");
+    try {
+      const { error } = await supabase
+        .from("coach_info_batch_items")
+        .update({ review_status: "skipped", reviewed_at: new Date().toISOString(), reviewed_by: user.id })
+        .in("id", targets.map((i) => i.id));
+      if (error) throw error;
+      const skippedIds = new Set(targets.map((i) => i.id));
+      setItems((prev) => prev.map((i) => (skippedIds.has(i.id) ? { ...i, review_status: "skipped" } : i)));
+      setFocusedIndex(0);
+    } catch (err) {
+      setReviewError(err.message || "Could not skip these suggestions.");
+    } finally {
+      setBulkSkipping(false);
+    }
+  }
+
+  // "Confirmed, no data available" -- for a school the AI genuinely couldn't
+  // find anything for (suggestion_error), there was previously no way from
+  // this page to mark it looked-at; Skip only touches the batch item, never
+  // schools.verification_status, so a school with truly no coach info
+  // findable anywhere would keep resurfacing in every future batch run
+  // forever, burning a fresh AI search each time. This writes the same
+  // verification_status="verified" + last_verified_at a Quick Fix save or
+  // Needs-Review confirm would, with an old_value===new_value
+  // school_change_log entry (so it reads as a confirmation, not a phantom
+  // edit) on hc_email specifically -- the one field every other confirm
+  // action in this app already uses for that purpose (see needs-review's
+  // confirm route). Deliberately NOT offered on noChangesPendingItems --
+  // those already have a real value on file the AI simply re-confirmed
+  // matches, a different (and already-handled, via Apply) situation from
+  // "nothing exists to find."
+  async function confirmNoDataAvailableCore(item) {
+    try {
+      const s = item.school;
+      if (!s) return { ok: false, error: "Missing school." };
+      const { error: updateErr } = await supabase
+        .from("schools")
+        .update({ verification_status: "verified", last_verified_at: new Date().toISOString() })
+        .eq("id", s.id);
+      if (updateErr) throw updateErr;
+      const { error: logErr } = await supabase.from("school_change_log").insert({
+        school_id: s.id,
+        field_name: "hc_email",
+        old_value: s.hc_email || null,
+        new_value: s.hc_email || null,
+        source: "Batch Coach-Info review -- confirmed no data available",
+        changed_by: user.id,
+      });
+      if (logErr) throw logErr;
+      const { error: itemErr } = await supabase
+        .from("coach_info_batch_items")
+        .update({ review_status: "confirmed_no_data", reviewed_at: new Date().toISOString(), reviewed_by: user.id })
+        .eq("id", item.id);
+      if (itemErr) throw itemErr;
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message || "Could not confirm this school." };
+    }
+  }
+
+  async function confirmNoDataAvailable(item) {
+    setApplyingId(item.id);
+    setReviewError("");
+    const result = await confirmNoDataAvailableCore(item);
+    if (result.ok) {
+      setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: "confirmed_no_data" } : i)));
+    } else {
+      setReviewError(result.error);
+    }
+    setApplyingId(null);
+  }
+
+  async function bulkConfirmNoDataAvailable() {
+    const targets = failedItems;
+    if (!targets.length) return;
+    setBulkSkipping(true);
+    setReviewError("");
+    const failures = [];
+    await runWithConcurrency(targets, APPLY_CONCURRENCY, async (item) => {
+      const result = await confirmNoDataAvailableCore(item);
+      if (result.ok) {
+        setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: "confirmed_no_data" } : i)));
+      } else {
+        failures.push(`${item.school?.name || `#${item.id}`}: ${result.error}`);
+      }
+    });
+    setBulkSkipping(false);
+    if (failures.length > 0) {
+      setReviewError(`Confirmed ${targets.length - failures.length} of ${targets.length}. ${failures.length} failed: ${failures.slice(0, 3).join("; ")}${failures.length > 3 ? "…" : ""}`);
+    }
+  }
+
   // Downloads exactly what's currently on screen (visibleRows -- same
   // search box + confidence filter + "Show already-reviewed" the table
   // itself uses) as a CSV: one current/suggested pair per field so it's
@@ -1535,8 +1737,9 @@ function BatchCoachInfoPageInner() {
             <div>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
                 <p style={{ fontSize: 12.5, color: "#697386", margin: 0 }}>
-                  {pendingReview.length} suggestion{pendingReview.length === 1 ? "" : "s"} to review, {reviewedItems.length} already reviewed, {failedItems.length} the AI couldn't produce a
-                  suggestion for.
+                  {pendingReview.length} suggestion{pendingReview.length === 1 ? "" : "s"} to review
+                  {verifiedElsewhereItems.length > 0 ? ` (${verifiedElsewhereItems.length} of those already verified elsewhere since this run started)` : ""}, {reviewedItems.length} already
+                  reviewed, {failedItems.length} the AI couldn't produce a suggestion for.
                 </p>
                 <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
                   <label style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}>
@@ -1561,6 +1764,17 @@ function BatchCoachInfoPageInner() {
                       picked it up on its own. */}
                   <Link href={`/admin/batch-social?fromCoachInfoRun=${selectedRun.id}`} className="btn btn-sm">
                     Start Social Media Discovery for These Schools →
+                  </Link>
+                  {/* Same chain pattern, scoped to Athletics/MaxPreps URL
+                      discovery instead of social handles -- each tool's own
+                      page reads ?fromCoachInfoRun= and re-runs its usual
+                      eligibility filter (missing URL, not closed, not
+                      already run before) against just these schools. */}
+                  <Link href={`/admin/batch-athletics?fromCoachInfoRun=${selectedRun.id}`} className="btn btn-sm">
+                    Start Athletics URL Discovery for These Schools →
+                  </Link>
+                  <Link href={`/admin/batch-maxpreps?fromCoachInfoRun=${selectedRun.id}`} className="btn btn-sm">
+                    Start MaxPreps URL Discovery for These Schools →
                   </Link>
                 </div>
               </div>
@@ -1658,9 +1872,69 @@ function BatchCoachInfoPageInner() {
                 </div>
               )}
 
+              {verifiedElsewhereItems.length > 0 && (
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                    gap: 10,
+                    marginBottom: 10,
+                    padding: "10px 12px",
+                    background: "#eefbf3",
+                    border: "1px solid #cdeedd",
+                    borderRadius: 8,
+                  }}
+                >
+                  <span style={{ fontSize: 12.5 }}>
+                    <strong>{verifiedElsewhereItems.length}</strong> of these schools got marked <strong>verified elsewhere</strong> since this run started -- through Needs-Review, a Quick
+                    Fix on another tool, or a manual edit. Reviewing them here would be redundant work.
+                  </span>
+                  <button className="btn btn-sm" onClick={bulkSkipVerifiedElsewhere} disabled={bulkApplying || bulkSkipping}>
+                    {bulkSkipping ? "Skipping…" : `Skip All — Already Verified Elsewhere (${verifiedElsewhereItems.length})`}
+                  </button>
+                </div>
+              )}
+
               {reviewError && (
                 <div className="notice danger" style={{ marginBottom: 10, fontSize: 12.5 }}>
                   {reviewError}
+                </div>
+              )}
+
+              {failedItems.length > 0 && (
+                <div
+                  style={{
+                    marginBottom: 14,
+                    padding: "10px 12px",
+                    background: "#fff8f0",
+                    border: "1px solid #f0dfc2",
+                    borderRadius: 8,
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 8 }}>
+                    <span style={{ fontSize: 12.5 }}>
+                      <strong>{failedItems.length}</strong> school{failedItems.length === 1 ? "" : "s"} the AI couldn't find anything for at all. If there's genuinely no coach info
+                      findable, confirm it below so this school stops resurfacing in every future batch run.
+                    </span>
+                    <button className="btn btn-sm" onClick={bulkConfirmNoDataAvailable} disabled={bulkApplying || bulkSkipping}>
+                      {bulkSkipping ? "Confirming…" : `Confirm All — No Data Available (${failedItems.length})`}
+                    </button>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    {failedItems.map((item) => (
+                      <div key={item.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, fontSize: 12, padding: "3px 0" }}>
+                        <span>
+                          {item.school?.name} — {item.school?.city}, {item.school?.state}
+                          <span style={{ color: "#9aa1ab" }}> ({item.suggestion_error})</span>
+                        </span>
+                        <button className="btn btn-sm" onClick={() => confirmNoDataAvailable(item)} disabled={applyingId === item.id || bulkSkipping}>
+                          {applyingId === item.id ? "Confirming…" : "Confirm — No Data Available"}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
 
@@ -1716,6 +1990,11 @@ function BatchCoachInfoPageInner() {
                               <div style={{ color: "#9aa1ab" }}>
                                 {s.city}, {s.state}
                               </div>
+                              {wasVerifiedElsewhere(item, selectedRun) && (
+                                <span className="badge" style={{ color: "#1e7145", background: "#1e714519", fontWeight: 600, marginTop: 2, display: "inline-block" }}>
+                                  ✓ Verified elsewhere since this run started
+                                </span>
+                              )}
                               {/* On-file coach, shown for every row (not just
                                   ones with a diff) so a reviewer can compare
                                   it against a source they already trust and
@@ -1887,6 +2166,45 @@ function BatchCoachInfoPageInner() {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {undoToast && (
+        <div
+          style={{
+            position: "fixed",
+            bottom: 20,
+            right: 20,
+            zIndex: 50,
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+            padding: "10px 14px",
+            background: "#1c1f24",
+            color: "#fff",
+            borderRadius: 10,
+            boxShadow: "0 4px 16px rgba(0,0,0,0.25)",
+            fontSize: 12.5,
+          }}
+        >
+          <span>Saved {undoToast.schoolName}.</span>
+          <button
+            className="btn btn-sm btn-gold"
+            onClick={undoQuickFixSave}
+            style={{ whiteSpace: "nowrap" }}
+          >
+            Undo
+          </button>
+          <button
+            onClick={() => {
+              clearTimeout(undoTimeoutRef.current);
+              setUndoToast(null);
+            }}
+            style={{ background: "none", border: "none", color: "#9aa1ab", cursor: "pointer", fontSize: 14, padding: 0 }}
+            aria-label="Dismiss"
+          >
+            ×
+          </button>
         </div>
       )}
     </div>
