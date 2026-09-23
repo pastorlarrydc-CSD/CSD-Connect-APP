@@ -3,6 +3,7 @@ import { useEffect, useState, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
+import { resolveCoachNameAt } from "@/lib/coachHistory";
 
 function fmtPhone(v) {
   if (!v) return "";
@@ -72,6 +73,27 @@ const SCHOOL_INFO_FIELD_LABELS = {
   zip: "Zip",
   classification: "Classification",
   phone: "Main phone",
+};
+
+// Contact History -- every recorded change to this ONE school's head-coach
+// contact fields, oldest write paths included (Quick Fix, Mark Coach
+// Change, bulk upload/update, an approved coach-submitted correction).
+// Same field set and labels as Coach Change History on the Data Quality
+// page (app/(app)/admin/data-quality/page.js), just scoped to a single
+// school and loaded on demand (see showContactHistory below) instead of
+// database-wide. Answers Larry's "what coach did this cell belong to"
+// right where you're already looking at the number, via
+// resolveCoachNameAt (lib/coachHistory.js) -- reconstructed from this same
+// history, not a separate stored snapshot.
+const CONTACT_HISTORY_FIELDS = ["hc_first_name", "hc_last_name", "hc_email", "hc_cell", "hc_office", "hc_twitter", "hc_facebook"];
+const CONTACT_HISTORY_LABELS = {
+  hc_first_name: "First name",
+  hc_last_name: "Last name",
+  hc_email: "Email",
+  hc_cell: "Cell",
+  hc_office: "Office",
+  hc_twitter: "Twitter / X",
+  hc_facebook: "Facebook",
 };
 
 // Verification staff/sysadmin write directly to schools (schools_write RLS
@@ -232,6 +254,15 @@ export default function SchoolProfilePage() {
   const isStaff = profile?.role === "verifier" || profile?.role === "sysadmin";
   const [editingSchoolInfo, setEditingSchoolInfo] = useState(false);
   const [schoolInfoDraft, setSchoolInfoDraft] = useState({});
+
+  // Contact History -- collapsed by default (this is an audit trail, not
+  // something every visit needs), loaded once on first expand rather than
+  // alongside the main school fetch above, so viewing a school's profile
+  // never pays for a query nobody asked to see.
+  const [showContactHistory, setShowContactHistory] = useState(false);
+  const [contactHistory, setContactHistory] = useState([]);
+  const [contactHistoryLoaded, setContactHistoryLoaded] = useState(false);
+  const [loadingContactHistory, setLoadingContactHistory] = useState(false);
   const [schoolInfoSaving, setSchoolInfoSaving] = useState(false);
   const [schoolInfoError, setSchoolInfoError] = useState("");
   const [editingWebsite, setEditingWebsite] = useState(false);
@@ -432,6 +463,37 @@ export default function SchoolProfilePage() {
   useEffect(() => {
     load();
   }, [load]);
+
+  // Loads on first expand of the Contact History panel (see
+  // showContactHistory above) -- grouped into one entry per save exactly
+  // like Coach Change History on Data Quality does, since a single save
+  // can touch several fields (name + cell together) sharing one
+  // changed_at.
+  const loadContactHistory = useCallback(async () => {
+    if (!school?.id) return;
+    setLoadingContactHistory(true);
+    const { data } = await supabase
+      .from("school_change_log")
+      .select("id, field_name, old_value, new_value, source, changed_at")
+      .eq("school_id", school.id)
+      .in("field_name", CONTACT_HISTORY_FIELDS)
+      .order("changed_at", { ascending: false })
+      .limit(200);
+    const groups = new Map();
+    (data || []).forEach((row) => {
+      if (!groups.has(row.changed_at)) groups.set(row.changed_at, { changed_at: row.changed_at, source: row.source, fields: [] });
+      groups.get(row.changed_at).fields.push(row);
+    });
+    setContactHistory(Array.from(groups.values()).sort((a, b) => new Date(b.changed_at) - new Date(a.changed_at)));
+    setContactHistoryLoaded(true);
+    setLoadingContactHistory(false);
+  }, [supabase, school?.id]);
+
+  function toggleContactHistory() {
+    const next = !showContactHistory;
+    setShowContactHistory(next);
+    if (next && !contactHistoryLoaded) loadContactHistory();
+  }
 
   async function toggleWatchlist() {
     if (!college?.id) return;
@@ -1740,6 +1802,50 @@ export default function SchoolProfilePage() {
               <div className="k">AD email</div>
               <div className="v">{school.ad_email || <span className="empty-state">not on file</span>}</div>
             </div>
+
+            {isStaff && (
+              <div style={{ marginTop: 10, borderTop: "1px solid #eef0f3", paddingTop: 8 }}>
+                <button type="button" className="btn btn-sm" onClick={toggleContactHistory}>
+                  {showContactHistory ? "Hide Contact History" : "Contact History"}
+                </button>
+                {showContactHistory && (
+                  <div style={{ marginTop: 8 }}>
+                    {loadingContactHistory ? (
+                      <div className="empty-state" style={{ fontSize: 12.5 }}>Loading…</div>
+                    ) : contactHistory.length === 0 ? (
+                      <div className="empty-state" style={{ fontSize: 12.5 }}>No recorded changes to name, email, cell, office, or social yet.</div>
+                    ) : (
+                      <div style={{ maxHeight: 260, overflow: "auto" }}>
+                        {(() => {
+                          // Every raw row across every save, flattened once
+                          // -- resolveCoachNameAt needs this school's full
+                          // name-change history, not just one save's rows.
+                          const allRows = contactHistory.flatMap((gg) => gg.fields);
+                          return contactHistory.map((g) => (
+                            <div className="log-item" key={g.changed_at} style={{ paddingBottom: 8, fontSize: 12.5 }}>
+                              <div style={{ color: "#9aa2b1", fontSize: 11 }}>
+                                {new Date(g.changed_at).toLocaleString()} — {g.source || "Unknown source"}
+                              </div>
+                              {g.fields.map((f) => {
+                                const coachAtTime = f.field_name === "hc_cell" ? resolveCoachNameAt(allRows, f.changed_at, school) : null;
+                                return (
+                                  <div key={f.id}>
+                                    {CONTACT_HISTORY_LABELS[f.field_name] || f.field_name}:{" "}
+                                    <span style={{ color: "#697386" }}>{(f.field_name === "hc_cell" ? fmtPhone(f.old_value) : f.old_value) || "—"}</span> →{" "}
+                                    <strong>{(f.field_name === "hc_cell" ? fmtPhone(f.new_value) : f.new_value) || "—"}</strong>
+                                    {coachAtTime && <span style={{ color: "#9aa2b1" }}> — coach at the time: {coachAtTime}</span>}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          ));
+                        })()}
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
 
             {isStaff && staffEditing && staffCoachChangeFrom && (
               <div className="notice" style={{ marginTop: 10, fontSize: 12.5 }}>
