@@ -96,6 +96,34 @@ function daysSince(dateStr) {
   return Math.floor((Date.now() - new Date(dateStr).getTime()) / 86400000);
 }
 
+// Short, scannable "when" label for a reviewed_at timestamp -- Larry's ask
+// was specifically to be able to look at an already-reviewed row and tell
+// he already completed it. Relative for anything in the last week (today/
+// yesterday/Nd ago, reusing daysSince above), falling back to a short
+// absolute date beyond that so it doesn't turn into "47d ago" clutter for
+// an old run someone's re-opened.
+function fmtReviewedRelative(dateStr) {
+  if (!dateStr) return "";
+  const days = daysSince(dateStr);
+  if (days <= 0) return "today";
+  if (days === 1) return "yesterday";
+  if (days < 7) return `${days}d ago`;
+  return new Date(dateStr).toLocaleDateString("en-US", { month: "short", day: "numeric" });
+}
+
+// Label + color for the reviewed-status badge. confirmed_no_data reads as
+// a positive outcome (green, same as Applied) -- it means someone looked
+// and confirmed there's genuinely nothing there, not that the row got
+// passed over the way an actual Skip does. Previously this fell through
+// to the plain "Skipped" label/color for every non-"applied" status,
+// which mislabeled a confirmed-no-data row -- fixed here alongside adding
+// the date.
+function reviewedBadgeInfo(status) {
+  if (status === "applied") return { label: "✓ Applied", color: "#1e7145" };
+  if (status === "confirmed_no_data") return { label: "✓ No data available", color: "#1e7145" };
+  return { label: "Skipped", color: "#697386" };
+}
+
 function WaitingBadge({ run }) {
   if (run.status === "ready") {
     const days = daysSince(run.ready_at);
@@ -173,6 +201,10 @@ function BatchSocialPageInner() {
 
   const [runs, setRuns] = useState([]);
   const [runPendingCounts, setRunPendingCounts] = useState({});
+  // Latest reviewed_at across a run's items, keyed by run id -- shown as
+  // "last worked" on each run row (see loadRuns) so Larry can tell which
+  // run he was most recently in without opening each one.
+  const [runLastWorked, setRunLastWorked] = useState({});
   const [hideCompletedRuns, setHideCompletedRuns] = useState(true);
   const [loadingRuns, setLoadingRuns] = useState(true);
   const [selectedRunId, setSelectedRunId] = useState(null);
@@ -411,6 +443,10 @@ function BatchSocialPageInner() {
   const failedItems = suggestedItems.filter((i) => i.suggestion_error && i.review_status === "pending");
   const pendingReview = matchedItems.filter((i) => i.review_status === "pending");
   const reviewedItems = matchedItems.filter((i) => i.review_status !== "pending");
+  // Quick same-day progress count for the summary line below -- "today"
+  // uses the same daysSince semantics as WaitingBadge elsewhere on this
+  // page (within the last 24 hours, not strictly the same calendar day).
+  const reviewedTodayCount = reviewedItems.filter((i) => i.reviewed_at && daysSince(i.reviewed_at) === 0).length;
   const verifiedElsewhereItems = pendingReview.filter((i) => wasVerifiedElsewhere(i, selectedRun));
   // Everything with nothing usable to apply -- an outright AI failure
   // (failedItems) or a search that ran fine but found no confident match on
@@ -476,7 +512,14 @@ function BatchSocialPageInner() {
   // tier and search box both applied on top. Computed once here so the
   // on-screen counts next to each confidence button, the rendered rows, and
   // the keyboard-nav targets below can never disagree about what's visible.
-  const reviewBaseRows = showReviewed ? matchedItems : pendingReview;
+  // With "Show already-reviewed" on, the still-pending rows stay up front
+  // (they're the ones actually needing a decision) and the reviewed ones
+  // sort newest-first by reviewed_at -- whatever was just finished surfaces
+  // at the top instead of sitting wherever it landed in the original fetch
+  // order.
+  const reviewBaseRows = showReviewed
+    ? [...pendingReview, ...matchedItems.filter((i) => i.review_status !== "pending").sort((a, b) => new Date(b.reviewed_at || 0) - new Date(a.reviewed_at || 0))]
+    : pendingReview;
   const confidenceCounts = {
     all: reviewBaseRows.length,
     high: reviewBaseRows.filter((i) => i.suggestion?.confidence === "high").length,
@@ -557,14 +600,28 @@ function BatchSocialPageInner() {
     setRuns(data || []);
     const ids = (data || []).map((r) => r.id);
     if (ids.length) {
-      const { data: pendingRows } = await supabase.from("social_batch_run_pending").select("batch_run_id,pending_count").in("batch_run_id", ids);
+      const [{ data: pendingRows }, { data: reviewedRows }] = await Promise.all([
+        supabase.from("social_batch_run_pending").select("batch_run_id,pending_count").in("batch_run_id", ids),
+        // Last-worked date per run -- just the two columns needed to find
+        // the max reviewed_at client-side, cheap even for a run with a
+        // thousand items, and avoids needing a dedicated view the way the
+        // pending-count query above does.
+        supabase.from("social_batch_items").select("batch_run_id,reviewed_at").in("batch_run_id", ids).not("reviewed_at", "is", null),
+      ]);
       const counts = {};
       (pendingRows || []).forEach((row) => {
         counts[row.batch_run_id] = row.pending_count;
       });
       setRunPendingCounts(counts);
+      const lastWorked = {};
+      (reviewedRows || []).forEach((row) => {
+        const cur = lastWorked[row.batch_run_id];
+        if (!cur || new Date(row.reviewed_at) > new Date(cur)) lastWorked[row.batch_run_id] = row.reviewed_at;
+      });
+      setRunLastWorked(lastWorked);
     } else {
       setRunPendingCounts({});
+      setRunLastWorked({});
     }
     setLoadingRuns(false);
   }, [supabase]);
@@ -1169,7 +1226,13 @@ function BatchSocialPageInner() {
           sug.facebook_url || "",
           sug.confidence || "",
           sug.reasoning || "",
-          item.review_status === "pending" ? "Pending" : item.review_status === "applied" ? "Applied" : "Skipped",
+          item.review_status === "pending"
+            ? "Pending"
+            : item.review_status === "applied"
+            ? "Applied"
+            : item.review_status === "confirmed_no_data"
+            ? "No data available"
+            : "Skipped",
         ];
       }),
     });
@@ -1328,6 +1391,7 @@ function BatchSocialPageInner() {
                     <strong>Run #{r.id}</strong> — {new Date(r.created_at).toLocaleString()} — {r.state_filter ? r.state_filter.join(", ") : "all states"} — {r.requested_count} school
                     {r.requested_count === 1 ? "" : "s"}
                     {r.status === "collected" && pendingCount > 0 ? ` — ${pendingCount} to review` : ""}
+                    {runLastWorked[r.id] ? ` — last worked ${fmtReviewedRelative(runLastWorked[r.id])}` : ""}
                   </div>
                   <span style={{ display: "flex", alignItems: "center" }}>
                     <StatusBadge status={r.status} />
@@ -1406,7 +1470,8 @@ function BatchSocialPageInner() {
                 <p style={{ fontSize: 12.5, color: "#697386", margin: 0 }}>
                   {pendingReview.length} suggestion{pendingReview.length === 1 ? "" : "s"} to review
                   {verifiedElsewhereItems.length > 0 ? ` (${verifiedElsewhereItems.length} of those already verified elsewhere since this run started)` : ""}, {reviewedItems.length} already
-                  reviewed, {noMatchItems.length} where the AI found no confident match on either platform, {failedItems.length} the AI couldn't produce a suggestion for.
+                  reviewed{reviewedTodayCount > 0 ? ` (${reviewedTodayCount} today)` : ""}, {noMatchItems.length} where the AI found no confident match on either platform,{" "}
+                  {failedItems.length} the AI couldn't produce a suggestion for.
                 </p>
                 <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
                   <label style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}>
@@ -1721,9 +1786,14 @@ function BatchSocialPageInner() {
                           </td>
                           <td style={{ padding: "8px", whiteSpace: "nowrap" }}>
                             {reviewed ? (
-                              <span style={{ fontWeight: 600, color: item.review_status === "applied" ? "#1e7145" : "#697386" }}>
-                                {item.review_status === "applied" ? "✓ Applied" : "Skipped"}
-                              </span>
+                              <div>
+                                <span style={{ fontWeight: 600, color: reviewedBadgeInfo(item.review_status).color }}>{reviewedBadgeInfo(item.review_status).label}</span>
+                                {item.reviewed_at && (
+                                  <div style={{ fontSize: 10.5, color: "#9aa1ab" }} title={new Date(item.reviewed_at).toLocaleString()}>
+                                    {fmtReviewedRelative(item.reviewed_at)}
+                                  </div>
+                                )}
+                              </div>
                             ) : (
                               <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
                                 <button className="btn btn-gold btn-sm" disabled={applying || bulkApplying} onClick={() => applyItem(item)}>
