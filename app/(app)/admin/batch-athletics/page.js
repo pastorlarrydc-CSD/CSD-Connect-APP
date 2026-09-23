@@ -616,10 +616,32 @@ function BatchAthleticsPageInner() {
       if (!runId) return;
       setLoadingItems(true);
       const { data } = await supabase.from("athletics_batch_items").select(ITEM_SELECT).eq("batch_run_id", runId).order("id");
+      // A school can get verified through a completely different channel --
+      // Needs-Review, a Quick Fix on another batch tool, a manual profile
+      // edit, even this same tool's Apply on a DIFFERENT run -- any time
+      // after this run was created. wasVerifiedElsewhere() below already
+      // flags that with a badge, but a reviewer still had to notice it and
+      // click Skip (or Skip All) by hand in every run it happened to be
+      // sitting in, including ones they might never reopen. Auto-skip those
+      // rows the moment a run's items load instead, so a school verified
+      // once stops asking for review anywhere else it's still pending.
+      const run = runs.find((r) => r.id === runId);
+      const staleIds = run ? (data || []).filter((i) => wasVerifiedElsewhere(i, run)).map((i) => i.id) : [];
+      if (staleIds.length > 0) {
+        const now = new Date().toISOString();
+        await supabase.from("athletics_batch_items").update({ review_status: "skipped", reviewed_at: now, reviewed_by: user.id }).in("id", staleIds);
+        (data || []).forEach((i) => {
+          if (staleIds.includes(i.id)) {
+            i.review_status = "skipped";
+            i.reviewed_at = now;
+            i.reviewed_by = user.id;
+          }
+        });
+      }
       setItems(data || []);
       setLoadingItems(false);
     },
-    [supabase]
+    [supabase, runs, user]
   );
 
   useEffect(() => {
