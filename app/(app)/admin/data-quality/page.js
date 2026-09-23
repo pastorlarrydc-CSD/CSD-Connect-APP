@@ -5,6 +5,7 @@ import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 import { classifySchools, classifySchool, isBlank, hasFullCoachRecord } from "@/lib/dataQuality";
+import { phoneDigits, resolveCoachNameAt } from "@/lib/coachHistory";
 
 const PAGE_SIZE = 1000;
 const DISPLAY_CAP = 200;
@@ -230,6 +231,20 @@ const COACH_CHANGE_FIELD_LABELS = {
   hc_twitter: "Twitter / X",
   hc_facebook: "Facebook",
 };
+
+// Quick-filter chips for Coach Change History -- Larry's specific ask was
+// "just cell," but the same one-field-at-a-time need applies to any of the
+// tracked fields, so this covers all of them rather than hardcoding only
+// Cell. "name" and "social" group two related fields each (first/last,
+// twitter/facebook) since either one changing is the same kind of event.
+const COACH_CHANGE_QUICK_FILTERS = [
+  { key: "all", label: "All" },
+  { key: "hc_cell", label: "Cell", fields: ["hc_cell"] },
+  { key: "hc_email", label: "Email", fields: ["hc_email"] },
+  { key: "name", label: "Name", fields: ["hc_first_name", "hc_last_name"] },
+  { key: "hc_office", label: "Office", fields: ["hc_office"] },
+  { key: "social", label: "Social", fields: ["hc_twitter", "hc_facebook"] },
+];
 
 function fmtPhone(v) {
   if (!v) return "";
@@ -588,6 +603,38 @@ export default function DataQualityPage() {
   const [coachChangeExporting, setCoachChangeExporting] = useState(false);
   const [coachChangeExportError, setCoachChangeExportError] = useState("");
   const [coachChangeSort, setCoachChangeSort] = useState("newest");
+  // Quick-filter (see COACH_CHANGE_QUICK_FILTERS) -- "all" by default,
+  // narrows the list below to just saves that touched one field/field-pair
+  // (e.g. "Cell" -- Larry's original ask was specifically to be able to
+  // pull just cell-number history and work through it on its own).
+  const [coachChangeFieldFilter, setCoachChangeFieldFilter] = useState("all");
+  // Every raw (ungrouped) school_change_log row this load pulled back,
+  // keyed by school_id -- includes hc_first_name/hc_last_name rows since
+  // COACH_CHANGE_TRACKED_FIELDS already covers them. Used by
+  // resolveCoachNameAt (lib/coachHistory.js) to answer "who was the coach
+  // when this cell/email/etc. entry happened," without a second query.
+  const [coachChangeRawBySchool, setCoachChangeRawBySchool] = useState(new Map());
+
+  // Cell Number Lookup -- reverse search: type in a phone number, see
+  // every school (current or past) it's ever been recorded as the head
+  // coach's cell for, with who that coach was at the time. Answers "who
+  // does/did this number belong to" directly, which grouped-by-save
+  // history above doesn't do on its own since a cell can outlive the save
+  // that first recorded it by years, at a school you'd have no other
+  // reason to pull up.
+  const [cellLookupQuery, setCellLookupQuery] = useState("");
+  const [cellLookupResults, setCellLookupResults] = useState(null); // null = no search run yet
+  const [cellLookupLoading, setCellLookupLoading] = useState(false);
+  const [cellLookupError, setCellLookupError] = useState("");
+
+  // Duplicate Cell Numbers -- passive integrity check: the same number
+  // currently listed as the LIVE cell at two or more different schools
+  // right now. Usually means a coach moved schools and the old record
+  // never got updated, or (less often) a shared department/office line
+  // saved into the cell field by mistake. Loads automatically like every
+  // other card here rather than waiting to be searched for.
+  const [duplicateCells, setDuplicateCells] = useState([]);
+  const [loadingDuplicateCells, setLoadingDuplicateCells] = useState(true);
 
   // My Recent Updates -- every field I've personally changed on a school,
   // from ANY source (Quick Fix, Mark Coach Change, a batch-review Apply
@@ -675,6 +722,7 @@ export default function DataQualityPage() {
     !loadingRadar &&
     !loadingReviewMarked &&
     !loadingCoachChanges &&
+    !loadingDuplicateCells &&
     !loadingNeedsRecheck &&
     !loadingUpcoming &&
     !loadingCoverage &&
@@ -790,7 +838,7 @@ export default function DataQualityPage() {
     setLoadingCoachChanges(true);
     const { data } = await supabase
       .from("school_change_log")
-      .select("id, school_id, field_name, old_value, new_value, source, changed_at, schools(name,city,state)")
+      .select("id, school_id, field_name, old_value, new_value, source, changed_at, schools(name,city,state,hc_first_name,hc_last_name)")
       .in("field_name", COACH_CHANGE_TRACKED_FIELDS)
       .order("changed_at", { ascending: false })
       .limit(2000);
@@ -799,13 +847,22 @@ export default function DataQualityPage() {
     // as its own row sharing the same changed_at (one insert statement, one
     // transaction timestamp) -- group them back into one entry per save.
     const groups = new Map();
+    // Every row seen, per school -- see coachChangeRawBySchool above. Built
+    // alongside the grouping loop rather than re-deriving it from groups
+    // later, since this needs the raw ungrouped rows (resolveCoachNameAt
+    // filters by field_name itself) and the query already has them all in
+    // hand.
+    const rawBySchool = new Map();
     (data || []).forEach((row) => {
       const key = `${row.school_id}|${row.changed_at}`;
       if (!groups.has(key)) {
         groups.set(key, { school_id: row.school_id, schools: row.schools, changed_at: row.changed_at, source: row.source, fields: [] });
       }
       groups.get(key).fields.push(row);
+      if (!rawBySchool.has(row.school_id)) rawBySchool.set(row.school_id, []);
+      rawBySchool.get(row.school_id).push(row);
     });
+    setCoachChangeRawBySchool(rawBySchool);
     setCoachChanges(Array.from(groups.values()).sort((a, b) => new Date(b.changed_at) - new Date(a.changed_at)));
     setLoadingCoachChanges(false);
   }, [supabase, canReview]);
@@ -814,10 +871,152 @@ export default function DataQualityPage() {
     loadCoachChanges();
   }, [loadCoachChanges]);
 
+  // Duplicate Cell Numbers -- see its state declaration above. Pulls every
+  // open school with a live cell number on file and groups by
+  // digits-only value; anything shared by 2+ schools surfaces as a card.
+  // Client-side grouping rather than a SQL query, since matching needs the
+  // same digit-normalization phoneDigits() uses everywhere else here, and
+  // this table is small enough (a few thousand schools with a cell on
+  // file) that pulling it whole and grouping in JS is simpler than a
+  // normalized generated column just for this.
+  const loadDuplicateCells = useCallback(async () => {
+    if (!canReview) {
+      setLoadingDuplicateCells(false);
+      return;
+    }
+    setLoadingDuplicateCells(true);
+    const { data } = await supabase
+      .from("schools")
+      .select("id,name,city,state,hc_first_name,hc_last_name,hc_cell")
+      .not("hc_cell", "is", null)
+      .neq("hc_cell", "")
+      .eq("is_closed", false);
+    const groups = new Map();
+    (data || []).forEach((s) => {
+      const digits = phoneDigits(s.hc_cell);
+      if (digits.length < 7) return; // too short to trust as a real match
+      if (!groups.has(digits)) groups.set(digits, []);
+      groups.get(digits).push(s);
+    });
+    const dupes = Array.from(groups.entries())
+      .filter(([, schools]) => new Set(schools.map((s) => s.id)).size >= 2)
+      .map(([digits, schools]) => ({ digits, schools }));
+    setDuplicateCells(dupes);
+    setLoadingDuplicateCells(false);
+  }, [supabase, canReview]);
+
+  useEffect(() => {
+    loadDuplicateCells();
+  }, [loadDuplicateCells]);
+
+  // Cell Number Lookup -- reverse search. Given a typed phone number,
+  // finds every school whose CURRENT hc_cell matches (a plain query, since
+  // "current" only needs today's schools rows) plus every historical
+  // school_change_log entry (old or new value) that matches, then resolves
+  // "who was the coach at the time" for each historical hit via
+  // resolveCoachNameAt -- which needs that school's own full name-change
+  // history, fetched as a second, narrower query scoped to just the
+  // schools that actually matched (cheaper than pulling every school's
+  // name history up front the way loadCoachChanges does for its own,
+  // differently-scoped purpose).
+  async function runCellLookup() {
+    const digits = phoneDigits(cellLookupQuery);
+    if (digits.length < 7) {
+      setCellLookupError("Enter at least 7 digits of a phone number to search.");
+      setCellLookupResults(null);
+      return;
+    }
+    setCellLookupError("");
+    setCellLookupLoading(true);
+    try {
+      const [{ data: liveMatches, error: liveErr }, { data: logMatches, error: logErr }] = await Promise.all([
+        supabase.from("schools").select("id,name,city,state,hc_first_name,hc_last_name,hc_cell").not("hc_cell", "is", null).neq("hc_cell", ""),
+        supabase
+          .from("school_change_log")
+          .select("id,school_id,old_value,new_value,changed_at,source,schools(name,city,state,hc_first_name,hc_last_name)")
+          .eq("field_name", "hc_cell")
+          .order("changed_at", { ascending: false })
+          .limit(5000),
+      ]);
+      if (liveErr) throw liveErr;
+      if (logErr) throw logErr;
+
+      const liveHits = (liveMatches || [])
+        .filter((s) => phoneDigits(s.hc_cell).includes(digits))
+        .map((s) => ({
+          key: `live-${s.id}`,
+          school_id: s.id,
+          schoolName: s.name,
+          city: s.city,
+          state: s.state,
+          current: true,
+          coachName: [s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ").trim() || null,
+          value: s.hc_cell,
+          changed_at: null,
+          source: null,
+        }));
+      const liveIds = new Set(liveHits.map((h) => h.school_id));
+
+      const historyRawRows = (logMatches || []).filter((r) => phoneDigits(r.old_value).includes(digits) || phoneDigits(r.new_value).includes(digits));
+
+      // Full name-change history for just the schools that actually
+      // matched above, so resolveCoachNameAt can answer for a date well in
+      // the past, not just "whoever the coach is today."
+      const matchedSchoolIds = Array.from(new Set(historyRawRows.map((r) => r.school_id)));
+      let nameLogBySchool = new Map();
+      if (matchedSchoolIds.length > 0) {
+        const { data: nameRows } = await supabase
+          .from("school_change_log")
+          .select("school_id,field_name,old_value,new_value,changed_at")
+          .in("school_id", matchedSchoolIds)
+          .in("field_name", ["hc_first_name", "hc_last_name"]);
+        (nameRows || []).forEach((r) => {
+          if (!nameLogBySchool.has(r.school_id)) nameLogBySchool.set(r.school_id, []);
+          nameLogBySchool.get(r.school_id).push(r);
+        });
+      }
+
+      const historyHits = historyRawRows
+        // Skip a historical row that's really just describing the school's
+        // CURRENT live number -- already covered by liveHits above, so
+        // this avoids showing the same number twice for that school.
+        .filter((r) => !(liveIds.has(r.school_id) && phoneDigits(r.new_value).includes(digits)))
+        .map((r) => ({
+          key: `hist-${r.id}`,
+          school_id: r.school_id,
+          schoolName: r.schools?.name,
+          city: r.schools?.city,
+          state: r.schools?.state,
+          current: false,
+          coachName: resolveCoachNameAt(nameLogBySchool.get(r.school_id) || [], r.changed_at, r.schools),
+          value: phoneDigits(r.old_value).includes(digits) ? r.old_value : r.new_value,
+          changed_at: r.changed_at,
+          source: r.source,
+        }));
+
+      setCellLookupResults([...liveHits, ...historyHits].sort((a, b) => new Date(b.changed_at || Date.now()) - new Date(a.changed_at || Date.now())));
+    } catch (err) {
+      setCellLookupError(err.message || "Could not search cell numbers.");
+      setCellLookupResults(null);
+    } finally {
+      setCellLookupLoading(false);
+    }
+  }
+
   // Newest-first is the order coachChanges already comes in (see
   // loadCoachChanges above) -- oldest-first is just that list reversed,
   // recomputed on every render so flipping the dropdown needs no re-fetch.
   const sortedCoachChanges = coachChangeSort === "oldest" ? [...coachChanges].reverse() : coachChanges;
+
+  // Applies the quick-filter chip (see COACH_CHANGE_QUICK_FILTERS) on top
+  // of the sort above -- a save that touched several fields still shows if
+  // ANY of them match, so e.g. filtering to "Cell" doesn't hide the email
+  // that happened to change in that same save.
+  const activeCoachChangeFilter = COACH_CHANGE_QUICK_FILTERS.find((f) => f.key === coachChangeFieldFilter) || COACH_CHANGE_QUICK_FILTERS[0];
+  const filteredCoachChanges =
+    activeCoachChangeFilter.key === "all"
+      ? sortedCoachChanges
+      : sortedCoachChanges.filter((g) => g.fields.some((f) => activeCoachChangeFilter.fields.includes(f.field_name)));
 
   // Quick lookup of the most recent coach-field change per school, built
   // from the same coachChanges log the Coach Change History card below
@@ -1482,7 +1681,7 @@ export default function DataQualityPage() {
     try {
       const csv = Papa.unparse({
         fields: ["school_name", "city", "state", "field", "old_value", "new_value", "source", "changed_at"],
-        data: sortedCoachChanges.flatMap((g) =>
+        data: filteredCoachChanges.flatMap((g) =>
           g.fields.map((f) => [
             g.schools?.name || "",
             g.schools?.city || "",
@@ -3665,19 +3864,33 @@ export default function DataQualityPage() {
                 <option value="oldest">Oldest first</option>
               </select>
             </label>
-            <button className="btn btn-sm" onClick={exportCoachChanges} disabled={coachChangeExporting || coachChanges.length === 0}>
+            <button className="btn btn-sm" onClick={exportCoachChanges} disabled={coachChangeExporting || filteredCoachChanges.length === 0}>
               {coachChangeExporting ? "Exporting…" : "Download CSV"}
             </button>
           </div>
         </div>
         {coachChangeExportError && <div className="notice danger" style={{ marginTop: 10 }}>{coachChangeExportError}</div>}
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 10 }}>
+          {COACH_CHANGE_QUICK_FILTERS.map((f) => (
+            <button
+              key={f.key}
+              className={coachChangeFieldFilter === f.key ? "btn btn-sm btn-gold" : "btn btn-sm"}
+              onClick={() => setCoachChangeFieldFilter(f.key)}
+              style={{ fontSize: 11.5, padding: "3px 10px" }}
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
         {loadingCoachChanges ? (
           <div className="empty-state" style={{ marginTop: 10 }}>Loading…</div>
-        ) : sortedCoachChanges.length === 0 ? (
-          <div className="empty-state" style={{ marginTop: 10 }}>No coach changes recorded yet.</div>
+        ) : filteredCoachChanges.length === 0 ? (
+          <div className="empty-state" style={{ marginTop: 10 }}>
+            {coachChangeFieldFilter === "all" ? "No coach changes recorded yet." : `No "${activeCoachChangeFilter.label}" changes recorded yet.`}
+          </div>
         ) : (
           <div ref={coachHistoryScrollRef} style={{ maxHeight: 360, overflow: "auto", marginTop: 10 }}>
-            {sortedCoachChanges.slice(0, 100).map((g) => {
+            {filteredCoachChanges.slice(0, 100).map((g) => {
               const meta = COACH_CHANGE_SOURCE_META[g.source] || { label: g.source || "Unknown source", color: "#697386", bg: "#f0f1f4" };
               return (
                 <div className="log-item" key={`${g.school_id}|${g.changed_at}`} style={{ paddingBottom: 10 }}>
@@ -3686,11 +3899,23 @@ export default function DataQualityPage() {
                       <strong>{g.schools?.name}</strong> — {g.schools?.city}, {g.schools?.state}
                       <span className="badge" style={{ marginLeft: 8, color: meta.color, background: meta.bg }}>{meta.label}</span>
                       <div style={{ marginTop: 4, fontSize: 12.5 }}>
-                        {g.fields.map((f) => (
-                          <div key={f.id}>
-                            {COACH_CHANGE_FIELD_LABELS[f.field_name] || f.field_name}: <span style={{ color: "#697386" }}>{f.old_value || "—"}</span> → <strong>{f.new_value || "—"}</strong>
-                          </div>
-                        ))}
+                        {g.fields.map((f) => {
+                          // "Coach at the time" hint -- only for cell, since
+                          // that's specifically what Larry asked for ("what
+                          // coach that cell belonged to"). Reconstructed
+                          // from this school's own name-change history via
+                          // resolveCoachNameAt (lib/coachHistory.js) rather
+                          // than a stored snapshot -- see that file's
+                          // comment for why.
+                          const coachAtTime = f.field_name === "hc_cell" ? resolveCoachNameAt(coachChangeRawBySchool.get(g.school_id) || [], f.changed_at, g.schools) : null;
+                          return (
+                            <div key={f.id}>
+                              {COACH_CHANGE_FIELD_LABELS[f.field_name] || f.field_name}: <span style={{ color: "#697386" }}>{fmtPhone(f.old_value) || "—"}</span> →{" "}
+                              <strong>{fmtPhone(f.new_value) || "—"}</strong>
+                              {coachAtTime && <span style={{ color: "#9aa2b1" }}> — coach at the time: {coachAtTime}</span>}
+                            </div>
+                          );
+                        })}
                       </div>
                     </div>
                     <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
@@ -3703,12 +3928,91 @@ export default function DataQualityPage() {
                 </div>
               );
             })}
-            {coachChanges.length > 100 && (
+            {filteredCoachChanges.length > 100 && (
               <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
-                Showing the first 100 of {coachChanges.length.toLocaleString()} — download the CSV for the full list.
+                Showing the first 100 of {filteredCoachChanges.length.toLocaleString()} — download the CSV for the full list.
               </div>
             )}
           </div>
+        )}
+      </div>
+
+      <div className="card" style={{ marginBottom: 14 }}>
+        <h3 style={{ marginBottom: 4 }}>Cell Number Lookup</h3>
+        <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
+          Type in a phone number to see every school it's ever been recorded as the head coach's cell for — current or past — and who that coach was at the time. A number showing up at
+          two schools years apart usually means a coach moved and the old record was never updated.
+        </p>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <input
+            value={cellLookupQuery}
+            onChange={(e) => setCellLookupQuery(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && runCellLookup()}
+            placeholder="e.g. (615) 555-1234"
+            style={{ maxWidth: 240 }}
+          />
+          <button className="btn btn-sm btn-gold" onClick={runCellLookup} disabled={cellLookupLoading}>
+            {cellLookupLoading ? "Searching…" : "Search"}
+          </button>
+        </div>
+        {cellLookupError && <div className="notice danger" style={{ marginTop: 10 }}>{cellLookupError}</div>}
+        {cellLookupResults && (
+          <div style={{ marginTop: 10 }}>
+            {cellLookupResults.length === 0 ? (
+              <div className="empty-state">No school has ever had that number on file, current or past.</div>
+            ) : (
+              cellLookupResults.map((r) => (
+                <div className="log-item" key={r.key} style={{ paddingBottom: 8 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+                    <div style={{ fontSize: 12.5 }}>
+                      <strong>{r.schoolName}</strong> — {r.city}, {r.state}
+                      {r.current ? (
+                        <span className="badge" style={{ marginLeft: 8, color: "#1e7145", background: "#e6f4ea" }}>Current cell</span>
+                      ) : (
+                        <span className="badge" style={{ marginLeft: 8, color: "#697386", background: "#f0f1f4" }}>Past cell</span>
+                      )}
+                      <div style={{ color: "#697386", marginTop: 2 }}>
+                        {fmtPhone(r.value)}
+                        {r.coachName ? ` — ${r.coachName}` : ""}
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                      <Link href={`/schools/${r.school_id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
+                      {r.changed_at && <span style={{ fontSize: 11, color: "#9aa2b1", whiteSpace: "nowrap" }}>{new Date(r.changed_at).toLocaleDateString()}</span>}
+                    </div>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="card" style={{ marginBottom: 14 }}>
+        <h3 style={{ marginBottom: 4 }}>Duplicate Cell Numbers ({duplicateCells.length})</h3>
+        <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
+          The same number currently listed as the live cell at two or more schools right now — usually a coach who moved and the old school's record was never updated, occasionally a
+          shared department line saved into the cell field by mistake.
+        </p>
+        {loadingDuplicateCells ? (
+          <div className="empty-state">Loading…</div>
+        ) : duplicateCells.length === 0 ? (
+          <div className="empty-state">No live cell number is currently shared by more than one school.</div>
+        ) : (
+          duplicateCells.map((d) => (
+            <div className="log-item" key={d.digits} style={{ paddingBottom: 8 }}>
+              <div style={{ fontSize: 12.5, fontWeight: 700, marginBottom: 4 }}>{fmtPhone(d.schools[0].hc_cell)}</div>
+              {d.schools.map((s) => (
+                <div key={s.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 12.5, padding: "2px 0" }}>
+                  <span>
+                    <strong>{s.name}</strong> — {s.city}, {s.state}
+                    {(s.hc_first_name || s.hc_last_name) && <span style={{ color: "#697386" }}> · {[s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ")}</span>}
+                  </span>
+                  <Link href={`/schools/${s.id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
+                </div>
+              ))}
+            </div>
+          ))
         )}
       </div>
 
