@@ -5,7 +5,7 @@ import { buildSocialSourceText, SYSTEM_PROMPT, MODEL, MAX_TOKENS } from "@/lib/s
 
 export const maxDuration = 60;
 
-// Weekly automated kickoff for Batch Social Media Discovery -- the social
+// Automated kickoff for Batch Social Media Discovery -- the social
 // counterpart to app/api/cron/weekly-athletics-batch (see that route for
 // the pattern this mirrors). Social handle coverage is the single
 // worst-covered field in the whole database -- well under 1% of schools
@@ -14,19 +14,23 @@ export const maxDuration = 60;
 // Submit -- three separate steps that are easy to let slide on a busy
 // week, same as Athletics before this automation existed for it.
 //
-// This does exactly those first three stages on its own, every Monday
-// morning (see vercel.json, scheduled an hour after weekly-athletics-batch
-// so the two don't compete for the same minute): pick a batch of schools
-// that already have a coach name on file but are missing a Twitter/X
-// and/or Facebook handle, run the same two site:-restricted searches the
+// This does exactly those first three stages on its own, once a day (see
+// vercel.json -- bumped from weekly to daily once collect-batch-runs
+// started auto-confirming "no data available" results for this tool
+// itself, which keeps the unreviewed backlog from growing daily submits
+// would otherwise pile up faster than a human could review; scheduled an
+// hour after weekly-athletics-batch so the two don't compete for the same
+// minute -- the route/folder name is left as "weekly" to keep this diff
+// small, but the schedule itself is daily): pick a batch of schools that
+// already have a coach name on file but are missing a Twitter/X and/or
+// Facebook handle, run the same two site:-restricted searches the
 // single-school "Find Social Media" button uses, and submit whatever comes
-// back usable to Anthropic's Batch API. By the time anyone opens
-// /admin/batch-social later in the week, the run is already sitting at
-// "submitted" or "ready to collect" -- all that's left is the part that
-// should stay a human's call: clicking Collect Results and
-// reviewing/applying suggestions. Nothing here ever writes to the schools
-// table itself -- same non-authoritative contract as every other discovery
-// tool in this app.
+// back usable to Anthropic's Batch API. By the next day, the run is
+// already sitting at "collected" with its handful of real (non-"no data")
+// suggestions waiting in the review queue -- the part that stays a
+// human's call: clicking Apply/Skip on an actual proposed handle. Nothing
+// here ever writes to the schools table itself -- same non-authoritative
+// contract as every other discovery tool in this app.
 //
 // Same CRON_SECRET Bearer-header auth (plus ?secret= for a browser smoke
 // test) as every other cron route in this app, and the same
