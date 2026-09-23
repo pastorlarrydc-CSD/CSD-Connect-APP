@@ -413,7 +413,14 @@ function BatchAthleticsPageInner() {
   // shape doesn't change, so without this check a confirmed row would keep
   // showing up in the "Confirm no data available" section forever.
   const noMatchItems = suggestedItems.filter((i) => !i.suggestion.best_url && !i.suggestion_error && i.review_status === "pending");
-  const failedItems = suggestedItems.filter((i) => i.suggestion_error && i.review_status === "pending");
+  // Was `suggestedItems.filter(...)` -- required a suggestion object to
+  // exist at all, which meant an outright API-level failure (suggestion:
+  // null alongside suggestion_error -- see collect-batch-runs' and this
+  // tool's own collect route's `else` branch) could never show up here,
+  // leaving that item stuck at review_status "pending" forever with no
+  // button that could resolve it. Keyed on suggestion_error alone now so
+  // both failure shapes land in the same bucket.
+  const failedItems = items.filter((i) => i.suggestion_error && i.review_status === "pending");
   const pendingReview = matchedItems.filter((i) => i.review_status === "pending");
   const reviewedItems = matchedItems.filter((i) => i.review_status !== "pending");
   // Quick same-day progress count for the summary line below -- "today"
@@ -422,10 +429,19 @@ function BatchAthleticsPageInner() {
   const reviewedTodayCount = reviewedItems.filter((i) => i.reviewed_at && daysSince(i.reviewed_at) === 0).length;
   const highConfidencePendingCount = pendingReview.filter((i) => i.suggestion?.confidence === "high").length;
   const verifiedElsewhereItems = pendingReview.filter((i) => wasVerifiedElsewhere(i, selectedRun));
-  // Everything with nothing usable to apply -- an outright AI failure
-  // (failedItems) or a search that ran fine but found no confident match
-  // (noMatchItems). Both get the same "Confirm no data available" treatment.
-  const noDataItems = [...noMatchItems, ...failedItems];
+  // A fetch that actually ran but produced neither a suggestion nor a
+  // logged error -- almost always fetch_status "no_content" (the search
+  // turned up zero results, so nothing was ever sent to the AI). Same blind
+  // spot as failedItems above -- deliberately excludes fetch_status
+  // "pending" (never searched at all) so this never confirms "no data"
+  // about a school nobody actually checked.
+  const noContentItems = items.filter((i) => !i.suggestion && !i.suggestion_error && i.fetch_status !== "pending" && i.review_status === "pending");
+  // Everything with nothing usable to apply -- an outright AI/API failure
+  // (failedItems), a search that ran fine but found no confident match
+  // (noMatchItems), or a search that found no results at all to even send
+  // to the AI (noContentItems). All three get the same "Confirm no data
+  // available" treatment.
+  const noDataItems = [...noMatchItems, ...failedItems, ...noContentItems];
   // Duplicate-suggestion groups -- e.g. a whole district sharing one
   // athletics department domain across several of its schools. Only groups
   // with 2+ members are worth a bulk button; a single match is just a
