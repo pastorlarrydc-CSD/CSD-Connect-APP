@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
-import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion, runWithConcurrency } from "@/lib/coachInfoLookup";
+import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion, autoConfirmNoDataAvailable, runWithConcurrency } from "@/lib/coachInfoLookup";
 import { normalizeAthleticsSuggestion } from "@/lib/athleticsLookup";
 import { normalizeMaxPrepsSuggestion } from "@/lib/maxPrepsLookup";
 import { normalizeSocialSuggestion } from "@/lib/socialLookup";
@@ -103,12 +103,23 @@ const poolAlertSettingKey = (toolKey) => `batch_pool_alert_sent__${toolKey}`;
 // tool's own [runId]/check-status + [runId]/collect routes exactly.
 // label/criteria/href are only used by the pool-depletion alert email
 // below (the collect loop above never touches them).
+// notAvailableField/confirmFields/autoConfirmSource are only set on the
+// three tools that HAVE a *_not_available escape hatch in
+// hasFullCoachRecord() (lib/dataQuality.js) -- Coach-Info doesn't, so it's
+// left off autoConfirmNoDataAvailable entirely (see that function's own
+// comment in lib/coachInfoLookup.js for why). confirmFields matches each
+// tool's own confirmNoDataAvailableCore exactly, so the school_change_log
+// trail this leaves behind reads the same whether a human clicked the
+// button or this cron did.
 const TOOLS = [
   {
     key: "athletics",
     runsTable: "athletics_batch_runs",
     itemsTable: "athletics_batch_items",
     buildSuggestion: (parsed) => normalizeAthleticsSuggestion(parsed),
+    notAvailableField: "athletics_not_available",
+    confirmFields: ["athletics_url"],
+    autoConfirmSource: "Batch Athletics auto-collect -- confirmed no data available (unattended)",
     label: "Athletics-URL",
     criteria: "Missing an athletics-site URL",
     href: "/admin/batch-athletics",
@@ -133,6 +144,9 @@ const TOOLS = [
     runsTable: "maxpreps_batch_runs",
     itemsTable: "maxpreps_batch_items",
     buildSuggestion: (parsed) => normalizeMaxPrepsSuggestion(parsed),
+    notAvailableField: "maxpreps_not_available",
+    confirmFields: ["maxpreps_url"],
+    autoConfirmSource: "Batch MaxPreps auto-collect -- confirmed no data available (unattended)",
     label: "MaxPreps",
     criteria: "Missing a MaxPreps page URL",
     href: "/admin/batch-maxpreps",
@@ -142,6 +156,9 @@ const TOOLS = [
     runsTable: "social_batch_runs",
     itemsTable: "social_batch_items",
     buildSuggestion: (parsed) => normalizeSocialSuggestion(parsed),
+    notAvailableField: "social_not_available",
+    confirmFields: ["hc_twitter", "hc_facebook"],
+    autoConfirmSource: "Batch Social auto-collect -- confirmed no data available (unattended)",
     label: "Social Media",
     criteria: "Coach name on file, missing Twitter/X or Facebook",
     href: "/admin/batch-social",
@@ -235,18 +252,18 @@ export async function GET(req) {
         }
         const resultsText = await resultsRes.text();
 
-        // Only coach_info auto-applies (see the tool config above) -- and
-        // only that lookup needs a school_id per item, since a result line
+        // coach_info auto-applies, athletics/maxpreps/social auto-confirm
+        // "no data" -- both need a school_id per item, since a result line
         // itself only carries the item id. One query for the whole run
         // instead of one per item. Also embeds each item's school city/state
         // (via the school_id -> schools FK) for coach_info specifically --
         // normalizeSuggestion's same-name-school confidence backstop needs
-        // it, and this is the one collect path that writes to the schools
-        // table with zero human review, so it's the most important place
-        // for that backstop to actually run.
+        // it, and coach_info's is the one collect path that writes a
+        // specific value to the schools table with zero human review, so
+        // it's the most important place for that backstop to actually run.
         let schoolIdByItemId = null;
         let schoolLocationByItemId = null;
-        if (tool.autoApplyHighConfidence) {
+        if (tool.autoApplyHighConfidence || tool.notAvailableField) {
           const selectCols = tool.key === "coach_info" ? "id,school_id,school:schools(city,state)" : "id,school_id";
           const { data: itemRows } = await supabase.from(tool.itemsTable).select(selectCols).eq("batch_run_id", run.id);
           schoolIdByItemId = new Map((itemRows || []).map((r) => [r.id, r.school_id]));
@@ -264,6 +281,8 @@ export async function GET(req) {
         let failed = 0;
         let autoApplied = 0;
         let autoApplyErrors = 0;
+        let autoConfirmed = 0;
+        let autoConfirmErrors = 0;
 
         // Processed COLLECT_CONCURRENCY-at-a-time rather than one line at a
         // time -- see COLLECT_CONCURRENCY's comment above. The counters
@@ -319,12 +338,54 @@ export async function GET(req) {
               }
             }
           }
+
+          // "Nothing usable" -- either the AI explicitly said confidence
+          // "none", or this item never got a suggestion at all (a parse
+          // failure or an outright API-level error on this request, both of
+          // which land here with suggestion: null). Same bucket each
+          // tool's own noDataItems covers on the review page (see that
+          // page's own comment on noMatchItems/failedItems). Only ever
+          // records an absence, never a specific value, so unlike the
+          // auto-apply branch above this is safe to do without a human
+          // reviewing each one -- see autoConfirmNoDataAvailable's own
+          // comment in lib/coachInfoLookup.js.
+          if (!itemErr && tool.notAvailableField && (patch.suggestion === null || patch.suggestion?.confidence === "none")) {
+            const schoolId = schoolIdByItemId?.get(itemId);
+            if (schoolId) {
+              const confirmResult = await autoConfirmNoDataAvailable({
+                supabase,
+                itemId,
+                itemsTable: tool.itemsTable,
+                schoolId,
+                notAvailableField: tool.notAvailableField,
+                confirmFields: tool.confirmFields,
+                source: tool.autoConfirmSource,
+                actorUserId: SYSTEM_USER_ID,
+              });
+              if (confirmResult.applied) autoConfirmed++;
+              else {
+                autoConfirmErrors++;
+                console.error(`cron collect-batch-runs: auto-confirm error for ${tool.key} run ${run.id} item ${itemId}`, confirmResult.error);
+              }
+            }
+          }
         });
 
         await supabase.from(tool.runsTable).update({ status: "collected", collected_at: new Date().toISOString(), anthropic_batch_status: processingStatus }).eq("id", run.id);
-        summary.push({ tool: tool.key, run_id: run.id, collected: true, succeeded, failed, auto_applied: autoApplied, auto_apply_errors: autoApplyErrors });
+        summary.push({
+          tool: tool.key,
+          run_id: run.id,
+          collected: true,
+          succeeded,
+          failed,
+          auto_applied: autoApplied,
+          auto_apply_errors: autoApplyErrors,
+          auto_confirmed_no_data: autoConfirmed,
+          auto_confirm_errors: autoConfirmErrors,
+        });
         console.log(
           `cron collect-batch-runs: collected ${tool.key} run ${run.id} -- ${succeeded} succeeded, ${failed} failed` +
+            (tool.notAvailableField ? `, ${autoConfirmed} auto-confirmed no-data, ${autoConfirmErrors} auto-confirm errors` : "") +
             (tool.autoApplyHighConfidence ? `, ${autoApplied} auto-applied, ${autoApplyErrors} auto-apply errors` : "")
         );
       }
