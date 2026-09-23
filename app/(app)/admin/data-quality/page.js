@@ -5,7 +5,7 @@ import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 import { classifySchools, classifySchool, isBlank, hasFullCoachRecord } from "@/lib/dataQuality";
-import { phoneDigits, resolveCoachNameAt } from "@/lib/coachHistory";
+import { phoneDigits, socialHandleKey, resolveCoachNameAt } from "@/lib/coachHistory";
 
 const PAGE_SIZE = 1000;
 const DISPLAY_CAP = 200;
@@ -636,6 +636,22 @@ export default function DataQualityPage() {
   const [duplicateCells, setDuplicateCells] = useState([]);
   const [loadingDuplicateCells, setLoadingDuplicateCells] = useState(true);
 
+  // Social Handle Lookup -- same reverse search as Cell Number Lookup
+  // above, for a Twitter/X or Facebook handle/URL instead of a phone
+  // number. Searches both hc_twitter and hc_facebook at once (a typed
+  // handle doesn't say which platform it's for) via socialHandleKey().
+  const [socialLookupQuery, setSocialLookupQuery] = useState("");
+  const [socialLookupResults, setSocialLookupResults] = useState(null); // null = no search run yet
+  const [socialLookupLoading, setSocialLookupLoading] = useState(false);
+  const [socialLookupError, setSocialLookupError] = useState("");
+
+  // Duplicate Social Handles -- same passive integrity check as Duplicate
+  // Cell Numbers above, for hc_twitter/hc_facebook. Twitter and Facebook
+  // are tracked as separate groups (a Twitter handle and a Facebook URL
+  // never collide with each other), each entry tagged with which platform.
+  const [duplicateSocials, setDuplicateSocials] = useState([]);
+  const [loadingDuplicateSocials, setLoadingDuplicateSocials] = useState(true);
+
   // My Recent Updates -- every field I've personally changed on a school,
   // from ANY source (Quick Fix, Mark Coach Change, a batch-review Apply
   // click, a bulk upload, editing a school profile directly, etc.), not
@@ -1000,6 +1016,135 @@ export default function DataQualityPage() {
       setCellLookupResults(null);
     } finally {
       setCellLookupLoading(false);
+    }
+  }
+
+  // Duplicate Social Handles -- same idea as loadDuplicateCells above, run
+  // once per platform since a Twitter handle and a Facebook URL are never
+  // the same value. Pulls every open school (small enough, same as the
+  // cell version, to grab whole and group client-side with
+  // socialHandleKey()) and groups matches per field so the two platforms
+  // never collide with each other.
+  const loadDuplicateSocials = useCallback(async () => {
+    if (!canReview) {
+      setLoadingDuplicateSocials(false);
+      return;
+    }
+    setLoadingDuplicateSocials(true);
+    const { data } = await supabase
+      .from("schools")
+      .select("id,name,city,state,hc_first_name,hc_last_name,hc_twitter,hc_facebook")
+      .eq("is_closed", false);
+    const dupes = [];
+    [["hc_twitter", "Twitter/X"], ["hc_facebook", "Facebook"]].forEach(([field, label]) => {
+      const groups = new Map();
+      (data || []).forEach((s) => {
+        const key = socialHandleKey(s[field]);
+        if (key.length < 3) return; // too short to trust as a real match
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key).push(s);
+      });
+      Array.from(groups.entries())
+        .filter(([, schools]) => new Set(schools.map((s) => s.id)).size >= 2)
+        .forEach(([key, schools]) => dupes.push({ key: `${field}-${key}`, field, platform: label, value: schools[0][field], schools }));
+    });
+    setDuplicateSocials(dupes);
+    setLoadingDuplicateSocials(false);
+  }, [supabase, canReview]);
+
+  useEffect(() => {
+    loadDuplicateSocials();
+  }, [loadDuplicateSocials]);
+
+  // Social Handle Lookup -- reverse search, same shape as runCellLookup
+  // above but checking both hc_twitter and hc_facebook (a typed handle
+  // doesn't say which platform it's for, so both are searched and each
+  // hit is tagged with which one matched).
+  async function runSocialLookup() {
+    const key = socialHandleKey(socialLookupQuery);
+    if (key.length < 3) {
+      setSocialLookupError("Enter at least 3 characters of a handle or URL to search.");
+      setSocialLookupResults(null);
+      return;
+    }
+    setSocialLookupError("");
+    setSocialLookupLoading(true);
+    try {
+      const [{ data: liveMatches, error: liveErr }, { data: logMatches, error: logErr }] = await Promise.all([
+        supabase.from("schools").select("id,name,city,state,hc_first_name,hc_last_name,hc_twitter,hc_facebook"),
+        supabase
+          .from("school_change_log")
+          .select("id,school_id,field_name,old_value,new_value,changed_at,source,schools(name,city,state,hc_first_name,hc_last_name)")
+          .in("field_name", ["hc_twitter", "hc_facebook"])
+          .order("changed_at", { ascending: false })
+          .limit(5000),
+      ]);
+      if (liveErr) throw liveErr;
+      if (logErr) throw logErr;
+
+      const liveHits = [];
+      (liveMatches || []).forEach((s) => {
+        [["hc_twitter", "Twitter/X"], ["hc_facebook", "Facebook"]].forEach(([field, label]) => {
+          if (s[field] && socialHandleKey(s[field]).includes(key)) {
+            liveHits.push({
+              key: `live-${field}-${s.id}`,
+              school_id: s.id,
+              schoolName: s.name,
+              city: s.city,
+              state: s.state,
+              current: true,
+              platform: label,
+              coachName: [s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ").trim() || null,
+              value: s[field],
+              changed_at: null,
+              source: null,
+            });
+          }
+        });
+      });
+      // Same field on the same school, so a historical row describing the
+      // school's CURRENT value isn't shown twice (once as the live hit,
+      // once again as its own most-recent history entry).
+      const liveFieldKeys = new Set(liveHits.map((h) => `${h.school_id}:${h.platform === "Twitter/X" ? "hc_twitter" : "hc_facebook"}`));
+
+      const historyRawRows = (logMatches || []).filter((r) => socialHandleKey(r.old_value).includes(key) || socialHandleKey(r.new_value).includes(key));
+
+      const matchedSchoolIds = Array.from(new Set(historyRawRows.map((r) => r.school_id)));
+      let nameLogBySchool = new Map();
+      if (matchedSchoolIds.length > 0) {
+        const { data: nameRows } = await supabase
+          .from("school_change_log")
+          .select("school_id,field_name,old_value,new_value,changed_at")
+          .in("school_id", matchedSchoolIds)
+          .in("field_name", ["hc_first_name", "hc_last_name"]);
+        (nameRows || []).forEach((r) => {
+          if (!nameLogBySchool.has(r.school_id)) nameLogBySchool.set(r.school_id, []);
+          nameLogBySchool.get(r.school_id).push(r);
+        });
+      }
+
+      const historyHits = historyRawRows
+        .filter((r) => !liveFieldKeys.has(`${r.school_id}:${r.field_name}`))
+        .map((r) => ({
+          key: `hist-${r.id}`,
+          school_id: r.school_id,
+          schoolName: r.schools?.name,
+          city: r.schools?.city,
+          state: r.schools?.state,
+          current: false,
+          platform: r.field_name === "hc_twitter" ? "Twitter/X" : "Facebook",
+          coachName: resolveCoachNameAt(nameLogBySchool.get(r.school_id) || [], r.changed_at, r.schools),
+          value: socialHandleKey(r.old_value).includes(key) ? r.old_value : r.new_value,
+          changed_at: r.changed_at,
+          source: r.source,
+        }));
+
+      setSocialLookupResults([...liveHits, ...historyHits].sort((a, b) => new Date(b.changed_at || Date.now()) - new Date(a.changed_at || Date.now())));
+    } catch (err) {
+      setSocialLookupError(err.message || "Could not search social handles.");
+      setSocialLookupResults(null);
+    } finally {
+      setSocialLookupLoading(false);
     }
   }
 
@@ -4002,6 +4147,87 @@ export default function DataQualityPage() {
           duplicateCells.map((d) => (
             <div className="log-item" key={d.digits} style={{ paddingBottom: 8 }}>
               <div style={{ fontSize: 12.5, fontWeight: 700, marginBottom: 4 }}>{fmtPhone(d.schools[0].hc_cell)}</div>
+              {d.schools.map((s) => (
+                <div key={s.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 12.5, padding: "2px 0" }}>
+                  <span>
+                    <strong>{s.name}</strong> — {s.city}, {s.state}
+                    {(s.hc_first_name || s.hc_last_name) && <span style={{ color: "#697386" }}> · {[s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ")}</span>}
+                  </span>
+                  <Link href={`/schools/${s.id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
+                </div>
+              ))}
+            </div>
+          ))
+        )}
+      </div>
+
+      <div className="card" style={{ marginBottom: 14 }}>
+        <h3 style={{ marginBottom: 4 }}>Social Handle Lookup</h3>
+        <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
+          Type in a Twitter/X or Facebook handle or URL to see every school it's ever been recorded as the head coach's for — current or past — and who that coach was at the time. Works
+          the same as Cell Number Lookup above, just for social handles.
+        </p>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          <input
+            value={socialLookupQuery}
+            onChange={(e) => setSocialLookupQuery(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && runSocialLookup()}
+            placeholder="e.g. @CoachSmith or facebook.com/CoachSmith"
+            style={{ maxWidth: 280 }}
+          />
+          <button className="btn btn-sm btn-gold" onClick={runSocialLookup} disabled={socialLookupLoading}>
+            {socialLookupLoading ? "Searching…" : "Search"}
+          </button>
+        </div>
+        {socialLookupError && <div className="notice danger" style={{ marginTop: 10 }}>{socialLookupError}</div>}
+        {socialLookupResults && (
+          <div style={{ marginTop: 10 }}>
+            {socialLookupResults.length === 0 ? (
+              <div className="empty-state">No school has ever had that handle on file, current or past.</div>
+            ) : (
+              socialLookupResults.map((r) => (
+                <div className="log-item" key={r.key} style={{ paddingBottom: 8 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+                    <div style={{ fontSize: 12.5 }}>
+                      <strong>{r.schoolName}</strong> — {r.city}, {r.state}
+                      <span className="badge" style={{ marginLeft: 8, color: "#3b5bdb", background: "#edf0ff" }}>{r.platform}</span>
+                      {r.current ? (
+                        <span className="badge" style={{ marginLeft: 4, color: "#1e7145", background: "#e6f4ea" }}>Current</span>
+                      ) : (
+                        <span className="badge" style={{ marginLeft: 4, color: "#697386", background: "#f0f1f4" }}>Past</span>
+                      )}
+                      <div style={{ color: "#697386", marginTop: 2 }}>
+                        {r.value}
+                        {r.coachName ? ` — ${r.coachName}` : ""}
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                      <Link href={`/schools/${r.school_id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
+                      {r.changed_at && <span style={{ fontSize: 11, color: "#9aa2b1", whiteSpace: "nowrap" }}>{new Date(r.changed_at).toLocaleDateString()}</span>}
+                    </div>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+      </div>
+
+      <div className="card" style={{ marginBottom: 14 }}>
+        <h3 style={{ marginBottom: 4 }}>Duplicate Social Handles ({duplicateSocials.length})</h3>
+        <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
+          The same Twitter/X or Facebook handle currently listed as live at two or more schools right now — usually a coach who moved and the old school's record was never updated.
+        </p>
+        {loadingDuplicateSocials ? (
+          <div className="empty-state">Loading…</div>
+        ) : duplicateSocials.length === 0 ? (
+          <div className="empty-state">No live social handle is currently shared by more than one school.</div>
+        ) : (
+          duplicateSocials.map((d) => (
+            <div className="log-item" key={d.key} style={{ paddingBottom: 8 }}>
+              <div style={{ fontSize: 12.5, fontWeight: 700, marginBottom: 4 }}>
+                {d.value} <span className="badge" style={{ marginLeft: 6, color: "#3b5bdb", background: "#edf0ff", fontWeight: 400 }}>{d.platform}</span>
+              </div>
               {d.schools.map((s) => (
                 <div key={s.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 12.5, padding: "2px 0" }}>
                   <span>
