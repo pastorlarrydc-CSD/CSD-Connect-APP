@@ -963,19 +963,33 @@ function BatchMaxPrepsPageInner() {
     try {
       const s = item.school;
       if (!s) return { ok: false, error: "Missing school." };
+      const wasNotAvailable = !!s.maxpreps_not_available;
       const { error: updateErr } = await supabase
         .from("schools")
-        .update({ verification_status: "verified", last_verified_at: new Date().toISOString() })
+        .update({ verification_status: "verified", last_verified_at: new Date().toISOString(), maxpreps_not_available: true })
         .eq("id", s.id);
       if (updateErr) throw updateErr;
-      const { error: logErr } = await supabase.from("school_change_log").insert({
-        school_id: s.id,
-        field_name: "maxpreps_url",
-        old_value: s.maxpreps_url || null,
-        new_value: s.maxpreps_url || null,
-        source: "Batch MaxPreps review -- confirmed no data available",
-        changed_by: user.id,
-      });
+      const logRows = [
+        {
+          school_id: s.id,
+          field_name: "maxpreps_url",
+          old_value: s.maxpreps_url || null,
+          new_value: s.maxpreps_url || null,
+          source: "Batch MaxPreps review -- confirmed no data available",
+          changed_by: user.id,
+        },
+      ];
+      if (!wasNotAvailable) {
+        logRows.push({
+          school_id: s.id,
+          field_name: "maxpreps_not_available",
+          old_value: String(wasNotAvailable),
+          new_value: "true",
+          source: "Batch MaxPreps review -- confirmed no data available",
+          changed_by: user.id,
+        });
+      }
+      const { error: logErr } = await supabase.from("school_change_log").insert(logRows);
       if (logErr) throw logErr;
       const { error: itemErr } = await supabase
         .from("maxpreps_batch_items")
