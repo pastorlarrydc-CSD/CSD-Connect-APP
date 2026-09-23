@@ -1,9 +1,9 @@
 "use client";
 
 // State Progress -- a single cross-tool view of exactly what's still
-// missing, by state, across all five data types the batch/bulk discovery
-// tools chase (coach name, email, athletics URL, MaxPreps URL, social
-// media). Built in response to Larry's ask: pick a state, see what's left,
+// missing, by state, across all six data types the batch/bulk discovery
+// tools chase (coach name, email, cell phone, athletics URL, MaxPreps URL,
+// social media). Built in response to Larry's ask: pick a state, see what's left,
 // jump straight into the right batch tool already scoped to clear it --
 // instead of typing a state code into each tool's "custom states" box with
 // no idea how much is actually left there.
@@ -53,6 +53,7 @@ const PRIORITY_STATES = ["TX", "FL", "GA", "CA", "OH", "IN"];
 const METRICS = [
   { key: "needs_coach_name", label: "Coach Name", short: "Coach", href: (state) => `/admin/batch-coach-info?state=${state}&mode=no_name` },
   { key: "needs_email", label: "Email", short: "Email", href: (state) => `/admin/batch-coach-info?state=${state}&mode=missing_email` },
+  { key: "needs_cell", label: "Cell Phone", short: "Cell", href: (state) => `/admin/batch-coach-info?state=${state}&mode=missing_cell` },
   { key: "needs_athletics_url", label: "Athletics URL", short: "Athletics", href: (state) => `/admin/batch-athletics?state=${state}` },
   { key: "needs_maxpreps_url", label: "MaxPreps URL", short: "MaxPreps", href: (state) => `/admin/batch-maxpreps?state=${state}` },
   { key: "needs_social", label: "Social Media", short: "Social", href: (state) => `/admin/batch-social?state=${state}` },
@@ -278,8 +279,8 @@ export default function StateProgressPage() {
         <div>
           <h1>State Progress</h1>
           <p>
-            What's still genuinely missing, state by state, across coach name, email, athletics URL, MaxPreps URL, and social media -- pick a state, see the real gap, and jump straight
-            into the right batch tool sized to clear it in one run. The Marked Reviewed column shows how much of each state has actually been touched and confirmed.
+            What's still genuinely missing, state by state, across coach name, email, cell phone, athletics URL, MaxPreps URL, and social media -- pick a state, see the real gap, and jump
+            straight into the right batch tool sized to clear it in one run. The Marked Reviewed column shows how much of each state has actually been touched and confirmed.
           </p>
         </div>
       </div>
@@ -359,8 +360,9 @@ export default function StateProgressPage() {
         {!loading && states.length > 0 && (
           <div style={{ fontSize: 12, color: "#697386", marginBottom: 10 }}>
             Across {states.length} states / {totalOpen.toLocaleString()} open schools: <strong>{totals.needs_coach_name}</strong> missing a coach name,{" "}
-            <strong>{totals.needs_email}</strong> missing an email, <strong>{totals.needs_athletics_url}</strong> missing an athletics URL, <strong>{totals.needs_maxpreps_url}</strong>{" "}
-            missing a MaxPreps URL, and <strong>{totals.needs_social}</strong> missing a social handle. <strong>{totalReviewed.toLocaleString()}</strong> schools (
+            <strong>{totals.needs_email}</strong> missing an email, <strong>{totals.needs_cell}</strong> missing a cell number, <strong>{totals.needs_athletics_url}</strong> missing an
+            athletics URL, <strong>{totals.needs_maxpreps_url}</strong> missing a MaxPreps URL, and <strong>{totals.needs_social}</strong> missing a social handle.{" "}
+            <strong>{totalReviewed.toLocaleString()}</strong> schools (
             {totalOpen ? Math.round((100 * totalReviewed) / totalOpen) : 0}%) are marked reviewed so far, <strong>{totalReviewedRecent}</strong> of those in the last 7 days --{" "}
             <strong style={{ color: "#b3261e" }}>{(totalOpen - totalReviewed).toLocaleString()}</strong> still left to verify.
           </div>
