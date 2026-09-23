@@ -22,7 +22,7 @@
     },
     {
       "path": "/api/cron/weekly-social-batch",
-      "schedule": "0 13 * * 1"
+      "schedule": "0 13 * * *"
     },
     {
       "path": "/api/cron/weekly-maxpreps-batch",
