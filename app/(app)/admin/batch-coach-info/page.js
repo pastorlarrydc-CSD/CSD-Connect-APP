@@ -229,13 +229,17 @@ function BatchCoachInfoPageInner() {
   // coach name on file at all. "missing_email": a school already HAS a
   // coach name but is missing just the email (and often phone/socials) --
   // a much smaller, much closer-to-done pool that the original targeting
-  // never touched (it required BOTH name fields blank). Since the coach's
-  // name is already known here, fetch-item passes contactOnly:true and
-  // gets buildSearchQuery's name-targeted query (lib/coachInfoLookup.js)
-  // instead of the generic "who is the coach" search, so it's more likely
-  // to actually surface an email. Every other mode -- and the single-
-  // school button -- gets the open query by default, precisely so a wrong
-  // or stale on-file name can still be caught rather than re-confirmed.
+  // never touched (it required BOTH name fields blank). "missing_cell":
+  // the same idea as missing_email, targeting hc_cell instead -- added so
+  // "still need a cell number" can be worked as its own queue instead of
+  // being buried inside the general no-name sweep. Since the coach's name
+  // is already known in both of these modes, fetch-item passes
+  // contactOnly:true and gets buildSearchQuery's name-targeted query
+  // (lib/coachInfoLookup.js) instead of the generic "who is the coach"
+  // search, so it's more likely to actually surface contact info. Every
+  // other mode -- and the single-school button -- gets the open query by
+  // default, precisely so a wrong or stale on-file name can still be
+  // caught rather than re-confirmed.
   // "re_verify": the odd one out -- every other mode excludes any school
   // this tool has EVER touched before (see startRun's excludedIds below).
   // re_verify is specifically FOR re-including those schools once their
@@ -254,8 +258,8 @@ function BatchCoachInfoPageInner() {
   const stateFromUrl = searchParams.get("state");
   const modeFromUrl = searchParams.get("mode");
   const [candidateMode, setCandidateMode] = useState(
-    ["no_name", "missing_email"].includes(modeFromUrl) ? modeFromUrl : "no_name"
-  ); // "no_name" | "missing_email" | "re_verify"
+    ["no_name", "missing_email", "missing_cell"].includes(modeFromUrl) ? modeFromUrl : "no_name"
+  ); // "no_name" | "missing_email" | "missing_cell" | "re_verify"
   const [scopeMode, setScopeMode] = useState(stateFromUrl ? "all" : "priority"); // "priority" | "all"
   const [customStates, setCustomStates] = useState(stateFromUrl || PRIORITY_STATES.join(", "));
   // A state deep-link means "clear this whole state" -- 1000 (the largest
@@ -882,6 +886,15 @@ function BatchCoachInfoPageInner() {
             .not("hc_last_name", "is", null)
             .neq("hc_last_name", "")
             .or("hc_email.is.null,hc_email.eq.");
+        } else if (candidateMode === "missing_cell") {
+          // Same idea as missing_email, targeting hc_cell instead -- name
+          // known, cell blank.
+          query = query
+            .not("hc_first_name", "is", null)
+            .neq("hc_first_name", "")
+            .not("hc_last_name", "is", null)
+            .neq("hc_last_name", "")
+            .or("hc_cell.is.null,hc_cell.eq.");
         } else {
           query = query.or("hc_first_name.is.null,hc_first_name.eq.").or("hc_last_name.is.null,hc_last_name.eq.");
         }
@@ -889,13 +902,14 @@ function BatchCoachInfoPageInner() {
         // requireAthletics narrows the source pool to just Athletics URL.
         // Outside that, "no_name" mode keeps the looser "athletics OR general
         // website" check this tool has always used (a page to search from is
-        // essential when the coach isn't known yet); "missing_email" mode
-        // doesn't require a URL at all by default -- the name-targeted search
-        // alone is usually enough to find an email, and requiring a URL here
-        // would needlessly shrink an already-small candidate pool.
+        // essential when the coach isn't known yet); "missing_email"/
+        // "missing_cell" modes don't require a URL at all by default -- the
+        // name-targeted search alone is usually enough to find contact info,
+        // and requiring a URL here would needlessly shrink an already-small
+        // candidate pool.
         if (requireAthletics) {
           query = query.not("athletics_url", "is", null).neq("athletics_url", "");
-        } else if (candidateMode !== "missing_email") {
+        } else if (candidateMode !== "missing_email" && candidateMode !== "missing_cell") {
           query = query.or("athletics_url.not.is.null,website.not.is.null");
         }
 
@@ -910,6 +924,8 @@ function BatchCoachInfoPageInner() {
           setCreateError(
             candidateMode === "missing_email"
               ? "No schools matched -- everyone with a coach name on file in this scope already has an email, or has already been through this tool before."
+              : candidateMode === "missing_cell"
+              ? "No schools matched -- everyone with a coach name on file in this scope already has a cell number, or has already been through this tool before."
               : "No schools matched -- everyone missing coach info in this scope has already been through this tool before, or has no website/athletics URL on file to search from."
           );
           return;
@@ -1530,6 +1546,8 @@ function BatchCoachInfoPageInner() {
         <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
           {candidateMode === "missing_email"
             ? "Pulls schools that already have a head coach name on file but are missing an email -- searches for that specific coach by name instead of the generic \"who is the coach\" search."
+            : candidateMode === "missing_cell"
+            ? "Pulls schools that already have a head coach name on file but are missing a cell number -- searches for that specific coach by name instead of the generic \"who is the coach\" search."
             : candidateMode === "re_verify"
             ? "Pulls schools this tool has already touched before, but not recently -- a fresh open search per school (not name-anchored), so a coach who's since changed gets caught instead of re-confirmed."
             : "Pulls schools missing a head coach name that have an athletics or general website on file to search from -- schools with neither can't be helped by this tool."}
@@ -1547,6 +1565,10 @@ function BatchCoachInfoPageInner() {
             <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
               <input type="radio" checked={candidateMode === "missing_email"} onChange={() => setCandidateMode("missing_email")} />
               Has a coach name, but missing an email
+            </label>
+            <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
+              <input type="radio" checked={candidateMode === "missing_cell"} onChange={() => setCandidateMode("missing_cell")} />
+              Has a coach name, but missing a cell number
             </label>
             <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
               <input type="radio" checked={candidateMode === "re_verify"} onChange={() => setCandidateMode("re_verify")} />
@@ -1655,6 +1677,8 @@ function BatchCoachInfoPageInner() {
                     {r.requested_count === 1 ? "" : "s"}
                     {r.candidate_mode === "missing_email"
                       ? " — missing email"
+                      : r.candidate_mode === "missing_cell"
+                      ? " — missing cell"
                       : r.candidate_mode === "re_verify"
                       ? " — re-verify"
                       : r.candidate_mode === "csv_upload"
