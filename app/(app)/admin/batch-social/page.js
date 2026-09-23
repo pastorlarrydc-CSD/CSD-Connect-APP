@@ -1,5 +1,5 @@
 "use client";
-import { useState, useEffect, useCallback, Suspense } from "react";
+import { useState, useEffect, useCallback, useRef, Suspense } from "react";
 import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import Papa from "papaparse";
@@ -42,7 +42,7 @@ const FETCH_CONCURRENCY = 8; // matches the weekly automated cron's own concurre
 const APPLY_CONCURRENCY = 5; // applying is just a DB write, no web fetch/AI call, so higher concurrency than FETCH_CONCURRENCY is safe -- matches batch-athletics/batch-coach-info
 
 const ITEM_SELECT =
-  "id,batch_run_id,school_id,fetch_status,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,hc_first_name,hc_last_name,hc_twitter,hc_facebook)";
+  "id,batch_run_id,school_id,fetch_status,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,hc_first_name,hc_last_name,hc_twitter,hc_facebook,verification_status,last_verified_at)";
 
 async function runWithConcurrency(items, limit, worker) {
   let next = 0;
@@ -126,6 +126,20 @@ function WaitingBadge({ run }) {
     );
   }
   return null;
+}
+
+// True when a school in this run got marked verification_status="verified"
+// AFTER this run was created -- handled through some other channel (Needs-
+// Review, a Quick Fix on a different batch tool, a manual edit) while this
+// run sat open. Same helper as Batch Coach-Info's own; see that page for the
+// full reasoning. Scoped to pending rows only.
+function wasVerifiedElsewhere(item, run) {
+  const s = item?.school;
+  if (!s || !run) return false;
+  if (item.review_status !== "pending") return false;
+  if (s.verification_status !== "verified") return false;
+  if (!s.last_verified_at) return false;
+  return new Date(s.last_verified_at).getTime() > new Date(run.created_at).getTime();
 }
 
 function confidenceColor(confidence) {
@@ -234,6 +248,12 @@ function BatchSocialPageInner() {
   const [savingEdit, setSavingEdit] = useState(false);
   const [editError, setEditError] = useState("");
 
+  // Undo toast after a Quick Fix save -- see Batch Coach-Info's identical
+  // state for the full reasoning. Single-slot, auto-clears after 8s.
+  const [undoToast, setUndoToast] = useState(null);
+  const undoTimeoutRef = useRef(null);
+  useEffect(() => () => clearTimeout(undoTimeoutRef.current), []);
+
   // Keeps sessionStorage in lockstep with the editor -- see Batch
   // Coach-Info's identical effect for the full reasoning.
   useEffect(() => {
@@ -284,6 +304,8 @@ function BatchSocialPageInner() {
     setSavingEdit(true);
     setEditError("");
     const s = item.school;
+    const previousSchool = { ...(s || {}) };
+    const previousReviewStatus = item.review_status;
     try {
       const update = {};
       const changes = [];
@@ -311,10 +333,57 @@ function BatchSocialPageInner() {
       if (itemErr) throw itemErr;
       setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: sawChange ? "applied" : "skipped" } : i)));
       setEditingId(null);
+      if (sawChange) {
+        clearTimeout(undoTimeoutRef.current);
+        const toastId = Date.now();
+        setUndoToast({ id: toastId, itemId: item.id, schoolName: previousSchool.name, previousSchool, previousReviewStatus });
+        undoTimeoutRef.current = setTimeout(() => {
+          setUndoToast((cur) => (cur && cur.id === toastId ? null : cur));
+        }, 8000);
+      }
     } catch (err) {
       setEditError(err.message || "Could not save this edit.");
     } finally {
       setSavingEdit(false);
+    }
+  }
+
+  // Reverts a Quick Fix save back to exactly what was on file before it --
+  // see Batch Coach-Info's identical action for the full reasoning. Social's
+  // saveEdit never touches verification_status itself, so Undo doesn't
+  // either -- only hc_twitter/hc_facebook are restored.
+  async function undoQuickFixSave() {
+    if (!undoToast) return;
+    const { itemId, previousSchool, previousReviewStatus } = undoToast;
+    setReviewError("");
+    try {
+      const current = items.find((i) => i.id === itemId)?.school || {};
+      const restore = {};
+      const changes = [];
+      ["hc_twitter", "hc_facebook"].forEach((f) => {
+        const priorVal = previousSchool[f] || null;
+        const curVal = current[f] || null;
+        if (priorVal !== curVal) {
+          restore[f] = priorVal;
+          changes.push({ school_id: previousSchool.id, field_name: f, old_value: curVal, new_value: priorVal, source: "Quick Fix Undo -- reverted to pre-save value", changed_by: user.id });
+        }
+      });
+      if (Object.keys(restore).length > 0) {
+        const { error: updateErr } = await supabase.from("schools").update(restore).eq("id", previousSchool.id);
+        if (updateErr) throw updateErr;
+        const { error: logErr } = await supabase.from("school_change_log").insert(changes);
+        if (logErr) throw logErr;
+      }
+      const { error: itemErr } = await supabase
+        .from("social_batch_items")
+        .update({ review_status: previousReviewStatus, reviewed_at: null, reviewed_by: null })
+        .eq("id", itemId);
+      if (itemErr) throw itemErr;
+      setItems((prev) => prev.map((i) => (i.id === itemId ? { ...i, review_status: previousReviewStatus, school: { ...i.school, ...restore } } : i)));
+      setUndoToast(null);
+      clearTimeout(undoTimeoutRef.current);
+    } catch (err) {
+      setReviewError(err.message || "Could not undo this save.");
     }
   }
 
@@ -333,10 +402,40 @@ function BatchSocialPageInner() {
   const noContentCount = items.filter((i) => i.fetch_status === "no_content").length;
   const suggestedItems = items.filter((i) => i.suggestion);
   const matchedItems = suggestedItems.filter((i) => i.suggestion.twitter_url || i.suggestion.facebook_url);
-  const noMatchItems = suggestedItems.filter((i) => !i.suggestion.twitter_url && !i.suggestion.facebook_url && !i.suggestion_error);
-  const failedItems = suggestedItems.filter((i) => i.suggestion_error);
+  // Pending-only on both -- once confirmed via confirmNoDataAvailable,
+  // review_status moves to "confirmed_no_data" but the underlying suggestion
+  // shape (no urls / an error) doesn't change, so without this check a
+  // confirmed row would keep showing up in the "Confirm no data available"
+  // section forever.
+  const noMatchItems = suggestedItems.filter((i) => !i.suggestion.twitter_url && !i.suggestion.facebook_url && !i.suggestion_error && i.review_status === "pending");
+  const failedItems = suggestedItems.filter((i) => i.suggestion_error && i.review_status === "pending");
   const pendingReview = matchedItems.filter((i) => i.review_status === "pending");
   const reviewedItems = matchedItems.filter((i) => i.review_status !== "pending");
+  const verifiedElsewhereItems = pendingReview.filter((i) => wasVerifiedElsewhere(i, selectedRun));
+  // Everything with nothing usable to apply -- an outright AI failure
+  // (failedItems) or a search that ran fine but found no confident match on
+  // either platform (noMatchItems). Both get the same "Confirm no data
+  // available" treatment below.
+  const noDataItems = [...noMatchItems, ...failedItems];
+  // Duplicate-suggestion groups among the pending rows -- e.g. a whole
+  // district sharing one general athletics Twitter/Facebook page across
+  // several schools' coaches. Grouped separately per platform since a school
+  // can match on one but not the other. Only groups with 2+ members are
+  // worth a bulk button; a single match is just a normal row.
+  function groupByValue(getValue) {
+    const groups = new Map();
+    pendingReview.forEach((item) => {
+      const v = getValue(item.suggestion);
+      if (!v) return;
+      if (!groups.has(v)) groups.set(v, []);
+      groups.get(v).push(item);
+    });
+    return Array.from(groups.entries())
+      .filter(([, list]) => list.length >= 2)
+      .map(([value, list]) => ({ value, items: list }));
+  }
+  const duplicateTwitterGroups = groupByValue((sug) => sug?.twitter_url);
+  const duplicateFacebookGroups = groupByValue((sug) => sug?.facebook_url);
   const highConfidencePendingCount = pendingReview.filter((i) => i.suggestion?.confidence === "high").length;
   // Pending rows whose Coach-Info suggestion was already Applied -- the
   // "safe to trust, apply without opening the record" set. Any confidence
@@ -925,6 +1024,119 @@ function BatchSocialPageInner() {
     }
   }
 
+  // Clears every pending row whose school already got verified through some
+  // other channel since this run started -- see wasVerifiedElsewhere.
+  async function bulkSkipVerifiedElsewhere() {
+    const targets = verifiedElsewhereItems;
+    if (!targets.length) return;
+    setBulkApplying(true);
+    setReviewError("");
+    try {
+      const { error } = await supabase
+        .from("social_batch_items")
+        .update({ review_status: "skipped", reviewed_at: new Date().toISOString(), reviewed_by: user.id })
+        .in("id", targets.map((i) => i.id));
+      if (error) throw error;
+      const skippedIds = new Set(targets.map((i) => i.id));
+      setItems((prev) => prev.map((i) => (skippedIds.has(i.id) ? { ...i, review_status: "skipped" } : i)));
+      setFocusedIndex(0);
+    } catch (err) {
+      setReviewError(err.message || "Could not skip these suggestions.");
+    } finally {
+      setBulkApplying(false);
+    }
+  }
+
+  // Applies one duplicate-suggestion group in one click (see
+  // duplicateTwitterGroups/duplicateFacebookGroups) -- same
+  // applySuggestionCore write path as every other apply here, just run
+  // across a pre-grouped list instead of "every high-confidence item."
+  async function bulkApplyGroup(groupItems) {
+    if (!groupItems.length) return;
+    setBulkApplying(true);
+    setReviewError("");
+    setBulkProgress({ done: 0, total: groupItems.length });
+    let done = 0;
+    const failures = [];
+    await runWithConcurrency(groupItems, APPLY_CONCURRENCY, async (item) => {
+      const result = await applySuggestionCore(item);
+      if (result.ok) {
+        setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: "applied" } : i)));
+      } else {
+        failures.push(`${item.school?.name || `#${item.id}`}: ${result.error}`);
+      }
+      done++;
+      setBulkProgress({ done, total: groupItems.length });
+    });
+    setBulkApplying(false);
+    setFocusedIndex(0);
+    if (failures.length > 0) {
+      setReviewError(`Applied ${groupItems.length - failures.length} of ${groupItems.length}. ${failures.length} failed: ${failures.slice(0, 3).join("; ")}${failures.length > 3 ? "…" : ""}`);
+    }
+  }
+
+  // "Confirmed, no data available" -- see Batch Coach-Info's identical
+  // action for the full reasoning. Logs a confirmation (old===new) against
+  // BOTH hc_twitter and hc_facebook, since either could be the one actually
+  // missing for a given school, and marks the school verified so it stops
+  // resurfacing in every future Social run.
+  async function confirmNoDataAvailableCore(item) {
+    try {
+      const s = item.school;
+      if (!s) return { ok: false, error: "Missing school." };
+      const { error: updateErr } = await supabase
+        .from("schools")
+        .update({ verification_status: "verified", last_verified_at: new Date().toISOString() })
+        .eq("id", s.id);
+      if (updateErr) throw updateErr;
+      const { error: logErr } = await supabase.from("school_change_log").insert([
+        { school_id: s.id, field_name: "hc_twitter", old_value: s.hc_twitter || null, new_value: s.hc_twitter || null, source: "Batch Social review -- confirmed no data available", changed_by: user.id },
+        { school_id: s.id, field_name: "hc_facebook", old_value: s.hc_facebook || null, new_value: s.hc_facebook || null, source: "Batch Social review -- confirmed no data available", changed_by: user.id },
+      ]);
+      if (logErr) throw logErr;
+      const { error: itemErr } = await supabase
+        .from("social_batch_items")
+        .update({ review_status: "confirmed_no_data", reviewed_at: new Date().toISOString(), reviewed_by: user.id })
+        .eq("id", item.id);
+      if (itemErr) throw itemErr;
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message || "Could not confirm this school." };
+    }
+  }
+
+  async function confirmNoDataAvailable(item) {
+    setApplyingId(item.id);
+    setReviewError("");
+    const result = await confirmNoDataAvailableCore(item);
+    if (result.ok) {
+      setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: "confirmed_no_data" } : i)));
+    } else {
+      setReviewError(result.error);
+    }
+    setApplyingId(null);
+  }
+
+  async function bulkConfirmNoDataAvailable() {
+    const targets = noDataItems;
+    if (!targets.length) return;
+    setBulkApplying(true);
+    setReviewError("");
+    const failures = [];
+    await runWithConcurrency(targets, APPLY_CONCURRENCY, async (item) => {
+      const result = await confirmNoDataAvailableCore(item);
+      if (result.ok) {
+        setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: "confirmed_no_data" } : i)));
+      } else {
+        failures.push(`${item.school?.name || `#${item.id}`}: ${result.error}`);
+      }
+    });
+    setBulkApplying(false);
+    if (failures.length > 0) {
+      setReviewError(`Confirmed ${targets.length - failures.length} of ${targets.length}. ${failures.length} failed: ${failures.slice(0, 3).join("; ")}${failures.length > 3 ? "…" : ""}`);
+    }
+  }
+
   function exportRunCsv() {
     if (!selectedRun || !visibleRows.length) return;
     const csv = Papa.unparse({
@@ -1192,8 +1404,9 @@ function BatchSocialPageInner() {
             <div>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
                 <p style={{ fontSize: 12.5, color: "#697386", margin: 0 }}>
-                  {pendingReview.length} suggestion{pendingReview.length === 1 ? "" : "s"} to review, {reviewedItems.length} already reviewed, {noMatchItems.length} where the AI found no
-                  confident match on either platform, {failedItems.length} the AI couldn't produce a suggestion for.
+                  {pendingReview.length} suggestion{pendingReview.length === 1 ? "" : "s"} to review
+                  {verifiedElsewhereItems.length > 0 ? ` (${verifiedElsewhereItems.length} of those already verified elsewhere since this run started)` : ""}, {reviewedItems.length} already
+                  reviewed, {noMatchItems.length} where the AI found no confident match on either platform, {failedItems.length} the AI couldn't produce a suggestion for.
                 </p>
                 <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
                   <label style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}>
@@ -1287,9 +1500,107 @@ function BatchSocialPageInner() {
                 </div>
               )}
 
+              {verifiedElsewhereItems.length > 0 && (
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                    gap: 10,
+                    marginBottom: 10,
+                    padding: "10px 12px",
+                    background: "#eefbf3",
+                    border: "1px solid #cdeedd",
+                    borderRadius: 8,
+                  }}
+                >
+                  <span style={{ fontSize: 12.5 }}>
+                    <strong>{verifiedElsewhereItems.length}</strong> of these schools got marked <strong>verified elsewhere</strong> since this run started. Reviewing them here would be
+                    redundant work.
+                  </span>
+                  <button className="btn btn-sm" onClick={bulkSkipVerifiedElsewhere} disabled={bulkApplying}>
+                    {bulkApplying ? "Skipping…" : `Skip All — Already Verified Elsewhere (${verifiedElsewhereItems.length})`}
+                  </button>
+                </div>
+              )}
+
+              {(duplicateTwitterGroups.length > 0 || duplicateFacebookGroups.length > 0) && (
+                <div
+                  style={{
+                    marginBottom: 10,
+                    padding: "10px 12px",
+                    background: "#f5f6f8",
+                    border: "1px solid #e3e6ea",
+                    borderRadius: 8,
+                  }}
+                >
+                  <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 6 }}>Same handle suggested for multiple schools</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {duplicateTwitterGroups.map((g) => (
+                      <div key={`tw-${g.value}`} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, fontSize: 12 }}>
+                        <span>
+                          Twitter/X <strong>{g.value}</strong> suggested for {g.items.length} schools ({g.items.map((i) => i.school?.name).slice(0, 3).join(", ")}
+                          {g.items.length > 3 ? "…" : ""})
+                        </span>
+                        <button className="btn btn-sm" onClick={() => bulkApplyGroup(g.items)} disabled={bulkApplying}>
+                          Apply to All {g.items.length}
+                        </button>
+                      </div>
+                    ))}
+                    {duplicateFacebookGroups.map((g) => (
+                      <div key={`fb-${g.value}`} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, fontSize: 12 }}>
+                        <span>
+                          Facebook <strong>{g.value}</strong> suggested for {g.items.length} schools ({g.items.map((i) => i.school?.name).slice(0, 3).join(", ")}
+                          {g.items.length > 3 ? "…" : ""})
+                        </span>
+                        <button className="btn btn-sm" onClick={() => bulkApplyGroup(g.items)} disabled={bulkApplying}>
+                          Apply to All {g.items.length}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {reviewError && (
                 <div className="notice danger" style={{ marginBottom: 10, fontSize: 12.5 }}>
                   {reviewError}
+                </div>
+              )}
+
+              {noDataItems.length > 0 && (
+                <div
+                  style={{
+                    marginBottom: 14,
+                    padding: "10px 12px",
+                    background: "#fff8f0",
+                    border: "1px solid #f0dfc2",
+                    borderRadius: 8,
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 8 }}>
+                    <span style={{ fontSize: 12.5 }}>
+                      <strong>{noDataItems.length}</strong> school{noDataItems.length === 1 ? "" : "s"} with no confident match on either platform, or the AI couldn't produce a
+                      suggestion at all. If there's genuinely no social media findable, confirm it below so it stops resurfacing in every future run.
+                    </span>
+                    <button className="btn btn-sm" onClick={bulkConfirmNoDataAvailable} disabled={bulkApplying}>
+                      {bulkApplying ? "Confirming…" : `Confirm All — No Data Available (${noDataItems.length})`}
+                    </button>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    {noDataItems.map((item) => (
+                      <div key={item.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, fontSize: 12, padding: "3px 0" }}>
+                        <span>
+                          {item.school?.name} — {item.school?.city}, {item.school?.state}
+                          {item.suggestion_error && <span style={{ color: "#9aa1ab" }}> ({item.suggestion_error})</span>}
+                        </span>
+                        <button className="btn btn-sm" onClick={() => confirmNoDataAvailable(item)} disabled={applyingId === item.id || bulkApplying}>
+                          {applyingId === item.id ? "Confirming…" : "Confirm — No Data Available"}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
 
@@ -1334,6 +1645,11 @@ function BatchSocialPageInner() {
                             <div style={{ color: "#9aa1ab" }}>
                               {[s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ") || "(no coach name)"}
                             </div>
+                            {wasVerifiedElsewhere(item, selectedRun) && (
+                              <span className="badge" style={{ fontSize: 10.5, color: "#1e7145", background: "#1e714519", fontWeight: 600, marginTop: 2, display: "inline-block" }}>
+                                ✓ Verified elsewhere since this run started
+                              </span>
+                            )}
                             {/* Only present on a run chained from Coach-Info
                                 -- see coachInfoReviewMap's loading effect and
                                 the bulk-apply banner above. Tells you at a
@@ -1487,6 +1803,41 @@ function BatchSocialPageInner() {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {undoToast && (
+        <div
+          style={{
+            position: "fixed",
+            bottom: 20,
+            right: 20,
+            zIndex: 50,
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+            padding: "10px 14px",
+            background: "#1c1f24",
+            color: "#fff",
+            borderRadius: 10,
+            boxShadow: "0 4px 16px rgba(0,0,0,0.25)",
+            fontSize: 12.5,
+          }}
+        >
+          <span>Saved {undoToast.schoolName}.</span>
+          <button className="btn btn-sm btn-gold" onClick={undoQuickFixSave} style={{ whiteSpace: "nowrap" }}>
+            Undo
+          </button>
+          <button
+            onClick={() => {
+              clearTimeout(undoTimeoutRef.current);
+              setUndoToast(null);
+            }}
+            style={{ background: "none", border: "none", color: "#9aa1ab", cursor: "pointer", fontSize: 14, padding: 0 }}
+            aria-label="Dismiss"
+          >
+            ×
+          </button>
         </div>
       )}
     </div>
