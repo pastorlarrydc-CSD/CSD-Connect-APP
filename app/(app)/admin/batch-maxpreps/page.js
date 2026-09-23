@@ -1,6 +1,6 @@
 "use client";
-import { useState, useEffect, useCallback, Suspense } from "react";
-import { useSearchParams } from "next/navigation";
+import { useState, useEffect, useCallback, useRef, Suspense } from "react";
+import { useRouter, usePathname, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
@@ -40,7 +40,7 @@ const FETCH_CONCURRENCY = 8; // matches the weekly automated cron's own concurre
 const APPLY_CONCURRENCY = 5; // applying is just a DB write, no web fetch/AI call, so higher concurrency than FETCH_CONCURRENCY is safe -- matches batch-athletics/batch-social
 
 const ITEM_SELECT =
-  "id,batch_run_id,school_id,fetch_status,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,maxpreps_url)";
+  "id,batch_run_id,school_id,fetch_status,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,maxpreps_url,verification_status,last_verified_at)";
 
 async function runWithConcurrency(items, limit, worker) {
   let next = 0;
@@ -126,6 +126,20 @@ function WaitingBadge({ run }) {
   return null;
 }
 
+// True when a school in this run got marked verification_status="verified"
+// AFTER this run was created -- handled through some other channel (Needs-
+// Review, a Quick Fix on a different batch tool, a manual edit) while this
+// run sat open. Same helper as Batch Coach-Info's own; see that page for the
+// full reasoning. Scoped to pending rows only.
+function wasVerifiedElsewhere(item, run) {
+  const s = item?.school;
+  if (!s || !run) return false;
+  if (item.review_status !== "pending") return false;
+  if (s.verification_status !== "verified") return false;
+  if (!s.last_verified_at) return false;
+  return new Date(s.last_verified_at).getTime() > new Date(run.created_at).getTime();
+}
+
 function confidenceColor(confidence) {
   if (confidence === "high") return "#1e7145";
   if (confidence === "medium") return "#8a6100";
@@ -139,11 +153,24 @@ function BatchMaxPrepsPageInner() {
   const supabase = getSupabaseBrowserClient();
   const { user, profile } = useAuth();
   const canReview = profile?.role === "verifier" || profile?.role === "sysadmin";
+  const router = useRouter();
+  const pathname = usePathname();
   const searchParams = useSearchParams();
   // Set when this page was opened via a "Focus →" link from State Progress
   // -- see batch-athletics's own stateFromUrl comment for the full
   // reasoning, identical here.
   const stateFromUrl = searchParams.get("state");
+
+  // Set when this page was opened via the "Start MaxPreps URL Discovery for
+  // These Schools" chain button on a completed Batch Coach-Info run -- see
+  // Batch Athletics' identical chainSourceRunId for the full reasoning.
+  const [chainSourceRunId] = useState(() => {
+    const fromUrl = Number(searchParams.get("fromCoachInfoRun"));
+    return Number.isFinite(fromUrl) && fromUrl > 0 ? fromUrl : null;
+  });
+  const [chainDismissed, setChainDismissed] = useState(false);
+  const [chainCreating, setChainCreating] = useState(false);
+  const [chainError, setChainError] = useState("");
 
   const [runs, setRuns] = useState([]);
   const [runPendingCounts, setRunPendingCounts] = useState({});
@@ -211,6 +238,12 @@ function BatchMaxPrepsPageInner() {
   const [savingEdit, setSavingEdit] = useState(false);
   const [editError, setEditError] = useState("");
 
+  // Undo toast after a Quick Fix save -- see Batch Coach-Info's identical
+  // state for the full reasoning. Single-slot, auto-clears after 8s.
+  const [undoToast, setUndoToast] = useState(null);
+  const undoTimeoutRef = useRef(null);
+  useEffect(() => () => clearTimeout(undoTimeoutRef.current), []);
+
   // Keeps sessionStorage in lockstep with the editor -- see Batch
   // Coach-Info's identical effect for the full reasoning.
   useEffect(() => {
@@ -245,6 +278,8 @@ function BatchMaxPrepsPageInner() {
     setSavingEdit(true);
     setEditError("");
     const s = item.school;
+    const previousSchool = { ...(s || {}) };
+    const previousReviewStatus = item.review_status;
     const newVal = (editDraft || "").trim();
     try {
       const sawChange = newVal !== (s.maxpreps_url || "");
@@ -268,10 +303,54 @@ function BatchMaxPrepsPageInner() {
       if (itemErr) throw itemErr;
       setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: sawChange ? "applied" : "skipped" } : i)));
       setEditingId(null);
+      if (sawChange) {
+        clearTimeout(undoTimeoutRef.current);
+        const toastId = Date.now();
+        setUndoToast({ id: toastId, itemId: item.id, schoolName: previousSchool.name, previousSchool, previousReviewStatus });
+        undoTimeoutRef.current = setTimeout(() => {
+          setUndoToast((cur) => (cur && cur.id === toastId ? null : cur));
+        }, 8000);
+      }
     } catch (err) {
       setEditError(err.message || "Could not save this edit.");
     } finally {
       setSavingEdit(false);
+    }
+  }
+
+  // Reverts a Quick Fix save back to exactly what was on file before it --
+  // see Batch Coach-Info's identical action for the full reasoning.
+  async function undoQuickFixSave() {
+    if (!undoToast) return;
+    const { itemId, previousSchool, previousReviewStatus } = undoToast;
+    setReviewError("");
+    try {
+      const current = items.find((i) => i.id === itemId)?.school || {};
+      const priorVal = previousSchool.maxpreps_url || null;
+      const curVal = current.maxpreps_url || null;
+      if (priorVal !== curVal) {
+        const { error: updateErr } = await supabase.from("schools").update({ maxpreps_url: priorVal }).eq("id", previousSchool.id);
+        if (updateErr) throw updateErr;
+        const { error: logErr } = await supabase.from("school_change_log").insert({
+          school_id: previousSchool.id,
+          field_name: "maxpreps_url",
+          old_value: curVal,
+          new_value: priorVal,
+          source: "Quick Fix Undo -- reverted to pre-save value",
+          changed_by: user.id,
+        });
+        if (logErr) throw logErr;
+      }
+      const { error: itemErr } = await supabase
+        .from("maxpreps_batch_items")
+        .update({ review_status: previousReviewStatus, reviewed_at: null, reviewed_by: null })
+        .eq("id", itemId);
+      if (itemErr) throw itemErr;
+      setItems((prev) => prev.map((i) => (i.id === itemId ? { ...i, review_status: previousReviewStatus, school: { ...i.school, maxpreps_url: priorVal } } : i)));
+      setUndoToast(null);
+      clearTimeout(undoTimeoutRef.current);
+    } catch (err) {
+      setReviewError(err.message || "Could not undo this save.");
     }
   }
 
@@ -282,11 +361,35 @@ function BatchMaxPrepsPageInner() {
   const noContentCount = items.filter((i) => i.fetch_status === "no_content").length;
   const suggestedItems = items.filter((i) => i.suggestion);
   const matchedItems = suggestedItems.filter((i) => i.suggestion.best_url);
-  const noMatchItems = suggestedItems.filter((i) => !i.suggestion.best_url && !i.suggestion_error);
-  const failedItems = suggestedItems.filter((i) => i.suggestion_error);
+  // Pending-only on both -- once confirmed via confirmNoDataAvailable,
+  // review_status moves to "confirmed_no_data" but the underlying suggestion
+  // shape doesn't change, so without this check a confirmed row would keep
+  // showing up in the "Confirm no data available" section forever.
+  const noMatchItems = suggestedItems.filter((i) => !i.suggestion.best_url && !i.suggestion_error && i.review_status === "pending");
+  const failedItems = suggestedItems.filter((i) => i.suggestion_error && i.review_status === "pending");
   const pendingReview = matchedItems.filter((i) => i.review_status === "pending");
   const reviewedItems = matchedItems.filter((i) => i.review_status !== "pending");
   const highConfidencePendingCount = pendingReview.filter((i) => i.suggestion?.confidence === "high").length;
+  const verifiedElsewhereItems = pendingReview.filter((i) => wasVerifiedElsewhere(i, selectedRun));
+  // Everything with nothing usable to apply -- an outright AI failure
+  // (failedItems) or a search that ran fine but found no confident match
+  // (noMatchItems). Both get the same "Confirm no data available" treatment.
+  const noDataItems = [...noMatchItems, ...failedItems];
+  // Duplicate-suggestion groups -- e.g. a whole district sharing one
+  // MaxPreps program page across several of its schools. Only groups with
+  // 2+ members are worth a bulk button; a single match is just a normal row.
+  const duplicateUrlGroups = (() => {
+    const groups = new Map();
+    pendingReview.forEach((item) => {
+      const v = item.suggestion?.best_url;
+      if (!v) return;
+      if (!groups.has(v)) groups.set(v, []);
+      groups.get(v).push(item);
+    });
+    return Array.from(groups.entries())
+      .filter(([, list]) => list.length >= 2)
+      .map(([value, list]) => ({ value, items: list }));
+  })();
 
   function isRunOpen(r) {
     if (r.status !== "collected") return true;
@@ -714,6 +817,186 @@ function BatchMaxPrepsPageInner() {
     }
   }
 
+  // Clears every pending row whose school already got verified through some
+  // other channel since this run started -- see wasVerifiedElsewhere.
+  async function bulkSkipVerifiedElsewhere() {
+    const targets = verifiedElsewhereItems;
+    if (!targets.length) return;
+    setBulkApplying(true);
+    setReviewError("");
+    try {
+      const { error } = await supabase
+        .from("maxpreps_batch_items")
+        .update({ review_status: "skipped", reviewed_at: new Date().toISOString(), reviewed_by: user.id })
+        .in("id", targets.map((i) => i.id));
+      if (error) throw error;
+      const skippedIds = new Set(targets.map((i) => i.id));
+      setItems((prev) => prev.map((i) => (skippedIds.has(i.id) ? { ...i, review_status: "skipped" } : i)));
+      setFocusedIndex(0);
+    } catch (err) {
+      setReviewError(err.message || "Could not skip these suggestions.");
+    } finally {
+      setBulkApplying(false);
+    }
+  }
+
+  // Applies one duplicate-suggestion group in one click (see
+  // duplicateUrlGroups) -- same applySuggestionCore write path as every
+  // other apply here, just run across a pre-grouped list.
+  async function bulkApplyGroup(groupItems) {
+    if (!groupItems.length) return;
+    setBulkApplying(true);
+    setReviewError("");
+    setBulkProgress({ done: 0, total: groupItems.length });
+    let done = 0;
+    const failures = [];
+    await runWithConcurrency(groupItems, APPLY_CONCURRENCY, async (item) => {
+      const result = await applySuggestionCore(item);
+      if (result.ok) {
+        setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: "applied" } : i)));
+      } else {
+        failures.push(`${item.school?.name || `#${item.id}`}: ${result.error}`);
+      }
+      done++;
+      setBulkProgress({ done, total: groupItems.length });
+    });
+    setBulkApplying(false);
+    setFocusedIndex(0);
+    if (failures.length > 0) {
+      setReviewError(`Applied ${groupItems.length - failures.length} of ${groupItems.length}. ${failures.length} failed: ${failures.slice(0, 3).join("; ")}${failures.length > 3 ? "…" : ""}`);
+    }
+  }
+
+  // "Confirmed, no data available" -- see Batch Coach-Info's identical
+  // action for the full reasoning. Marks the school verified so it stops
+  // resurfacing in every future MaxPreps run.
+  async function confirmNoDataAvailableCore(item) {
+    try {
+      const s = item.school;
+      if (!s) return { ok: false, error: "Missing school." };
+      const { error: updateErr } = await supabase
+        .from("schools")
+        .update({ verification_status: "verified", last_verified_at: new Date().toISOString() })
+        .eq("id", s.id);
+      if (updateErr) throw updateErr;
+      const { error: logErr } = await supabase.from("school_change_log").insert({
+        school_id: s.id,
+        field_name: "maxpreps_url",
+        old_value: s.maxpreps_url || null,
+        new_value: s.maxpreps_url || null,
+        source: "Batch MaxPreps review -- confirmed no data available",
+        changed_by: user.id,
+      });
+      if (logErr) throw logErr;
+      const { error: itemErr } = await supabase
+        .from("maxpreps_batch_items")
+        .update({ review_status: "confirmed_no_data", reviewed_at: new Date().toISOString(), reviewed_by: user.id })
+        .eq("id", item.id);
+      if (itemErr) throw itemErr;
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message || "Could not confirm this school." };
+    }
+  }
+
+  async function confirmNoDataAvailable(item) {
+    setApplyingId(item.id);
+    setReviewError("");
+    const result = await confirmNoDataAvailableCore(item);
+    if (result.ok) {
+      setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: "confirmed_no_data" } : i)));
+    } else {
+      setReviewError(result.error);
+    }
+    setApplyingId(null);
+  }
+
+  async function bulkConfirmNoDataAvailable() {
+    const targets = noDataItems;
+    if (!targets.length) return;
+    setBulkApplying(true);
+    setReviewError("");
+    const failures = [];
+    await runWithConcurrency(targets, APPLY_CONCURRENCY, async (item) => {
+      const result = await confirmNoDataAvailableCore(item);
+      if (result.ok) {
+        setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: "confirmed_no_data" } : i)));
+      } else {
+        failures.push(`${item.school?.name || `#${item.id}`}: ${result.error}`);
+      }
+    });
+    setBulkApplying(false);
+    if (failures.length > 0) {
+      setReviewError(`Confirmed ${targets.length - failures.length} of ${targets.length}. ${failures.length} failed: ${failures.slice(0, 3).join("; ")}${failures.length > 3 ? "…" : ""}`);
+    }
+  }
+
+  // Chained run: scoped to exactly the schools Batch Coach-Info just
+  // processed in run #chainSourceRunId, instead of a state/count pull --
+  // same pattern as Batch Athletics' own startChainedRun. Still re-runs
+  // MaxPreps' own eligibility filter (no MaxPreps URL, not marked
+  // unavailable/closed, not already run through this tool before) -- a
+  // school landing in the Coach-Info run doesn't bypass any of MaxPreps'
+  // own rules, it just narrows the candidate pool.
+  async function startChainedRun() {
+    if (!chainSourceRunId) return;
+    setChainCreating(true);
+    setChainError("");
+    try {
+      const { data: sourceItems, error: srcErr } = await supabase
+        .from("coach_info_batch_items")
+        .select("school_id")
+        .eq("batch_run_id", chainSourceRunId);
+      if (srcErr) throw srcErr;
+      const schoolIds = Array.from(new Set((sourceItems || []).map((i) => i.school_id).filter(Boolean)));
+      if (!schoolIds.length) {
+        setChainError(`Coach-Info run #${chainSourceRunId} doesn't have any schools to chain from.`);
+        return;
+      }
+
+      const { data: touchedRows, error: touchedErr } = await supabase.from("maxpreps_batch_items").select("school_id");
+      if (touchedErr) throw touchedErr;
+      const excludedIds = new Set((touchedRows || []).map((r) => r.school_id));
+
+      const { data: rawSchoolsData, error: schoolsErr } = await supabase
+        .from("schools")
+        .select("id,name,city,state")
+        .in("id", schoolIds)
+        .or("maxpreps_url.is.null,maxpreps_url.eq.")
+        .eq("maxpreps_not_available", false)
+        .eq("is_closed", false)
+        .neq("verification_status", "verified")
+        .order("id", { ascending: true });
+      if (schoolsErr) throw schoolsErr;
+      const schoolsData = (rawSchoolsData || []).filter((s) => !excludedIds.has(s.id));
+      if (!schoolsData.length) {
+        setChainError(
+          `None of the schools from Coach-Info run #${chainSourceRunId} currently qualify -- they may already have a MaxPreps URL on file, be marked unavailable or closed, or have already been through MaxPreps Discovery before.`
+        );
+        return;
+      }
+
+      const { data: runRow, error: runErr } = await supabase
+        .from("maxpreps_batch_runs")
+        .insert({ status: "collecting", state_filter: null, requested_count: schoolsData.length, created_by: user.id, source_coach_info_run_id: chainSourceRunId })
+        .select()
+        .single();
+      if (runErr) throw runErr;
+
+      const itemRows = schoolsData.map((s) => ({ batch_run_id: runRow.id, school_id: s.id }));
+      const { error: itemsErr } = await supabase.from("maxpreps_batch_items").insert(itemRows);
+      if (itemsErr) throw itemsErr;
+
+      await loadRuns();
+      openRun(runRow.id);
+      router.replace(pathname, { scroll: false });
+    } catch (err) {
+      setChainError(err.message || "Could not start a chained batch run.");
+    } finally {
+      setChainCreating(false);
+    }
+  }
+
   function exportRunCsv() {
     if (!selectedRun || !visibleRows.length) return;
     const csv = Papa.unparse({
@@ -765,52 +1048,83 @@ function BatchMaxPrepsPageInner() {
         </div>
       </div>
 
-      <div className="card" style={{ marginBottom: 14 }}>
-        <h3>Start a New Batch Run</h3>
-        <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
-          Pulls schools with no MaxPreps URL on file yet. A school's MaxPreps team page is the fallback source the nightly Coach-Change Radar checks when there's no athletics URL on file,
-          and it's often the fastest way for recruiting staff to confirm a roster is current -- closing this gap raises the accuracy ceiling here too.
-          {" "}Any school already applied, skipped, or attempted here before is automatically left out of every future run.
-        </p>
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
-            <input type="radio" checked={scopeMode === "priority"} onChange={() => setScopeMode("priority")} />
-            Priority recruiting states ({PRIORITY_STATES.join(", ")})
-          </label>
-          <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
-            <input type="radio" checked={scopeMode === "all"} onChange={() => setScopeMode("all")} />
-            All states (or type a custom list below)
-          </label>
-          {scopeMode === "all" && (
-            <input
-              value={customStates}
-              onChange={(e) => setCustomStates(e.target.value)}
-              placeholder="Leave blank for every state, or type e.g. TX, OK, AR"
-              style={{ maxWidth: 360 }}
-            />
-          )}
-          <label style={{ fontSize: 13 }}>
-            How many schools:{" "}
-            <select value={targetCount} onChange={(e) => setTargetCount(Number(e.target.value))}>
-              {TARGET_COUNTS.map((n) => (
-                <option key={n} value={n}>
-                  {n}
-                </option>
-              ))}
-            </select>
-          </label>
-          <div>
-            <button className="btn btn-primary btn-sm" onClick={startRun} disabled={creating}>
-              {creating ? "Starting…" : "Start Run"}
+      {chainSourceRunId && !chainDismissed ? (
+        <div className="card" style={{ marginBottom: 14, border: "1px solid #cfe0f2", background: "#f5f9fd" }}>
+          <h3 style={{ marginBottom: 4 }}>Chained from Batch Coach-Info Discovery — Run #{chainSourceRunId}</h3>
+          <p style={{ fontSize: 12.5, color: "#697386" }}>
+            This starts a MaxPreps URL Discovery run scoped to just the schools from that Coach-Info run -- not a new state/count pull. Each one still has to actually qualify (no MaxPreps
+            URL on file, not marked unavailable or closed, and not already run through this tool before) -- schools that don't qualify are simply left out, same as any other run.
+          </p>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <button className="btn btn-primary btn-sm" onClick={startChainedRun} disabled={chainCreating}>
+              {chainCreating ? "Starting…" : "Start MaxPreps URL Discovery for These Schools"}
+            </button>
+            <button
+              type="button"
+              className="btn btn-sm"
+              disabled={chainCreating}
+              onClick={() => {
+                setChainDismissed(true);
+                router.replace(pathname, { scroll: false });
+              }}
+            >
+              Cancel — start a regular run instead
             </button>
           </div>
-          {createError && (
-            <div className="notice danger" style={{ fontSize: 12.5 }}>
-              {createError}
+          {chainError && (
+            <div className="notice danger" style={{ marginTop: 10, fontSize: 12.5 }}>
+              {chainError}
             </div>
           )}
         </div>
-      </div>
+      ) : (
+        <div className="card" style={{ marginBottom: 14 }}>
+          <h3>Start a New Batch Run</h3>
+          <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
+            Pulls schools with no MaxPreps URL on file yet. A school's MaxPreps team page is the fallback source the nightly Coach-Change Radar checks when there's no athletics URL on file,
+            and it's often the fastest way for recruiting staff to confirm a roster is current -- closing this gap raises the accuracy ceiling here too.
+            {" "}Any school already applied, skipped, or attempted here before is automatically left out of every future run.
+          </p>
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
+              <input type="radio" checked={scopeMode === "priority"} onChange={() => setScopeMode("priority")} />
+              Priority recruiting states ({PRIORITY_STATES.join(", ")})
+            </label>
+            <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
+              <input type="radio" checked={scopeMode === "all"} onChange={() => setScopeMode("all")} />
+              All states (or type a custom list below)
+            </label>
+            {scopeMode === "all" && (
+              <input
+                value={customStates}
+                onChange={(e) => setCustomStates(e.target.value)}
+                placeholder="Leave blank for every state, or type e.g. TX, OK, AR"
+                style={{ maxWidth: 360 }}
+              />
+            )}
+            <label style={{ fontSize: 13 }}>
+              How many schools:{" "}
+              <select value={targetCount} onChange={(e) => setTargetCount(Number(e.target.value))}>
+                {TARGET_COUNTS.map((n) => (
+                  <option key={n} value={n}>
+                    {n}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <div>
+              <button className="btn btn-primary btn-sm" onClick={startRun} disabled={creating}>
+                {creating ? "Starting…" : "Start Run"}
+              </button>
+            </div>
+            {createError && (
+              <div className="notice danger" style={{ fontSize: 12.5 }}>
+                {createError}
+              </div>
+            )}
+          </div>
+        </div>
+      )}
 
       <div className="card" style={{ marginBottom: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 8 }}>
@@ -933,8 +1247,9 @@ function BatchMaxPrepsPageInner() {
             <div>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
                 <p style={{ fontSize: 12.5, color: "#697386", margin: 0 }}>
-                  {pendingReview.length} suggestion{pendingReview.length === 1 ? "" : "s"} to review, {reviewedItems.length} already reviewed, {noMatchItems.length} where the AI found no
-                  confident match, {failedItems.length} the AI couldn't produce a suggestion for.
+                  {pendingReview.length} suggestion{pendingReview.length === 1 ? "" : "s"} to review
+                  {verifiedElsewhereItems.length > 0 ? ` (${verifiedElsewhereItems.length} of those already verified elsewhere since this run started)` : ""}, {reviewedItems.length} already
+                  reviewed, {noMatchItems.length} where the AI found no confident match, {failedItems.length} the AI couldn't produce a suggestion for.
                 </p>
                 <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
                   <label style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}>
@@ -997,9 +1312,96 @@ function BatchMaxPrepsPageInner() {
                 </div>
               )}
 
+              {verifiedElsewhereItems.length > 0 && (
+                <div
+                  style={{
+                    display: "flex",
+                    justifyContent: "space-between",
+                    alignItems: "center",
+                    flexWrap: "wrap",
+                    gap: 10,
+                    marginBottom: 10,
+                    padding: "10px 12px",
+                    background: "#eefbf3",
+                    border: "1px solid #cdeedd",
+                    borderRadius: 8,
+                  }}
+                >
+                  <span style={{ fontSize: 12.5 }}>
+                    <strong>{verifiedElsewhereItems.length}</strong> of these schools got marked <strong>verified elsewhere</strong> since this run started. Reviewing them here would be
+                    redundant work.
+                  </span>
+                  <button className="btn btn-sm" onClick={bulkSkipVerifiedElsewhere} disabled={bulkApplying}>
+                    {bulkApplying ? "Skipping…" : `Skip All — Already Verified Elsewhere (${verifiedElsewhereItems.length})`}
+                  </button>
+                </div>
+              )}
+
+              {duplicateUrlGroups.length > 0 && (
+                <div
+                  style={{
+                    marginBottom: 10,
+                    padding: "10px 12px",
+                    background: "#f5f6f8",
+                    border: "1px solid #e3e6ea",
+                    borderRadius: 8,
+                  }}
+                >
+                  <div style={{ fontSize: 12.5, fontWeight: 600, marginBottom: 6 }}>Same URL suggested for multiple schools</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    {duplicateUrlGroups.map((g) => (
+                      <div key={g.value} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, fontSize: 12 }}>
+                        <span>
+                          <strong>{g.value}</strong> suggested for {g.items.length} schools ({g.items.map((i) => i.school?.name).slice(0, 3).join(", ")}
+                          {g.items.length > 3 ? "…" : ""})
+                        </span>
+                        <button className="btn btn-sm" onClick={() => bulkApplyGroup(g.items)} disabled={bulkApplying}>
+                          Apply to All {g.items.length}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
               {reviewError && (
                 <div className="notice danger" style={{ marginBottom: 10, fontSize: 12.5 }}>
                   {reviewError}
+                </div>
+              )}
+
+              {noDataItems.length > 0 && (
+                <div
+                  style={{
+                    marginBottom: 14,
+                    padding: "10px 12px",
+                    background: "#fff8f0",
+                    border: "1px solid #f0dfc2",
+                    borderRadius: 8,
+                  }}
+                >
+                  <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 8 }}>
+                    <span style={{ fontSize: 12.5 }}>
+                      <strong>{noDataItems.length}</strong> school{noDataItems.length === 1 ? "" : "s"} with no confident MaxPreps URL match, or the AI couldn't produce a suggestion at
+                      all. If there's genuinely no MaxPreps page findable, confirm it below so it stops resurfacing in every future run.
+                    </span>
+                    <button className="btn btn-sm" onClick={bulkConfirmNoDataAvailable} disabled={bulkApplying}>
+                      {bulkApplying ? "Confirming…" : `Confirm All — No Data Available (${noDataItems.length})`}
+                    </button>
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                    {noDataItems.map((item) => (
+                      <div key={item.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, fontSize: 12, padding: "3px 0" }}>
+                        <span>
+                          {item.school?.name} — {item.school?.city}, {item.school?.state}
+                          {item.suggestion_error && <span style={{ color: "#9aa1ab" }}> ({item.suggestion_error})</span>}
+                        </span>
+                        <button className="btn btn-sm" onClick={() => confirmNoDataAvailable(item)} disabled={applyingId === item.id || bulkApplying}>
+                          {applyingId === item.id ? "Confirming…" : "Confirm — No Data Available"}
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
 
@@ -1041,6 +1443,11 @@ function BatchMaxPrepsPageInner() {
                             <div style={{ color: "#9aa1ab" }}>
                               {s.city}, {s.state}
                             </div>
+                            {wasVerifiedElsewhere(item, selectedRun) && (
+                              <span className="badge" style={{ fontSize: 10.5, color: "#1e7145", background: "#1e714519", fontWeight: 600, marginTop: 2, display: "inline-block" }}>
+                                ✓ Verified elsewhere since this run started
+                              </span>
+                            )}
                           </td>
                           <td style={{ padding: "8px", minWidth: 260 }}>
                             <div style={{ color: "#1e7145", fontWeight: 600 }}>{sug.best_url}</div>
@@ -1138,6 +1545,41 @@ function BatchMaxPrepsPageInner() {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {undoToast && (
+        <div
+          style={{
+            position: "fixed",
+            bottom: 20,
+            right: 20,
+            zIndex: 50,
+            display: "flex",
+            alignItems: "center",
+            gap: 12,
+            padding: "10px 14px",
+            background: "#1c1f24",
+            color: "#fff",
+            borderRadius: 10,
+            boxShadow: "0 4px 16px rgba(0,0,0,0.25)",
+            fontSize: 12.5,
+          }}
+        >
+          <span>Saved {undoToast.schoolName}.</span>
+          <button className="btn btn-sm btn-gold" onClick={undoQuickFixSave} style={{ whiteSpace: "nowrap" }}>
+            Undo
+          </button>
+          <button
+            onClick={() => {
+              clearTimeout(undoTimeoutRef.current);
+              setUndoToast(null);
+            }}
+            style={{ background: "none", border: "none", color: "#9aa1ab", cursor: "pointer", fontSize: 14, padding: 0 }}
+            aria-label="Dismiss"
+          >
+            ×
+          </button>
         </div>
       )}
     </div>
