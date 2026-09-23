@@ -1235,6 +1235,25 @@ export default function SchoolProfilePage() {
         source: reason ? `${label}: ${reason}` : label,
         changed_by: user.id,
       });
+      // Closing a school stops it from being picked up by FUTURE batch runs
+      // (every batch tool's candidate query already filters is_closed=false),
+      // but says nothing about rows that already exist from runs created
+      // before today -- without this, a school closed today still shows up
+      // as "pending" in every older run it was ever swept into, forever,
+      // and a reviewer has to notice and skip it by hand in each one. Clear
+      // every still-pending row for this school across all four batch
+      // tools' item tables in one shot instead, same as an ordinary Skip
+      // (review_status stays within the tools' existing "skipped" badge/CSV
+      // handling -- no new status value needed).
+      await Promise.all(
+        ["coach_info_batch_items", "social_batch_items", "athletics_batch_items", "maxpreps_batch_items"].map((table) =>
+          supabase
+            .from(table)
+            .update({ review_status: "skipped", reviewed_at: now, reviewed_by: user.id })
+            .eq("school_id", id)
+            .eq("review_status", "pending")
+        )
+      );
       setShowCloseForm(false);
       setCloseReason("");
       setCloseCategory("school_closed");
