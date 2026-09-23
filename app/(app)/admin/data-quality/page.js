@@ -2470,6 +2470,20 @@ export default function DataQualityPage() {
     });
   }
 
+  // Same editor as Quick Fix, opened from a flagged row. An automated flag's
+  // reason text literally ends with "Please verify and use AI Coach-Info
+  // lookup..." -- so when the flag that triggered this edit was automated,
+  // this fires that AI lookup immediately instead of making the reviewer
+  // click "Suggest Coach Info (AI)" themselves. A coach-reported flag has no
+  // such signal to chase, so it opens the plain blank-prefilled editor just
+  // like Quick Fix anywhere else.
+  function startEditFromFlag(school, flag) {
+    startEdit(school);
+    if (isAutomatedFlag(flag?.reason)) {
+      suggestCoachInfo(school);
+    }
+  }
+
   // Same editor as Quick Fix, but opened specifically to record a head
   // coach change: the coach fields start blank (rather than pre-filled
   // with the outgoing coach's info) so you're not left editing stale
@@ -3314,6 +3328,7 @@ export default function DataQualityPage() {
             {todaysFlags.map((flag) => {
               const s = flag.schools;
               const isAutomated = isAutomatedFlag(flag.reason);
+              const isEditing = editingId === s?.id;
               return (
                 <div className="log-item" key={`flag-${flag.id}`} style={{ paddingBottom: 10 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
@@ -3325,39 +3340,355 @@ export default function DataQualityPage() {
                       >
                         {isAutomated ? "Automated flag" : "Coach-reported flag"}
                       </span>
+                      {s?.needs_review && (
+                        <span className="badge" style={{ marginLeft: 8, color: "#8a6100", background: "#fff4dc" }} title={s.needs_review_note || "Marked for review"}>
+                          🔖 Marked for review
+                        </span>
+                      )}
                       <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
                         {flag.reason ? `"${flag.reason}"` : "No reason given."}
                       </div>
+                      {s && (
+                        <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
+                          On file: {[s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ") || "no name"}
+                          {s.hc_email ? ` · ${s.hc_email}` : ""}
+                          {s.hc_cell ? ` · ${fmtPhone(s.hc_cell)}` : ""}
+                        </div>
+                      )}
                     </div>
-                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                    <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "flex-end", gap: 6, maxWidth: 320 }}>
                       <Link href={`/schools/${flag.school_id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
+                      {!isEditing && s && (
+                        <>
+                          <button className="btn btn-sm btn-primary" onClick={() => startEditFromFlag(s, flag)}>
+                            {isAutomated ? "Quick Fix (AI lookup)" : "Quick Fix"}
+                          </button>
+                          <button className="btn btn-sm" onClick={() => startCoachChange(s)}>Mark Coach Change</button>
+                          {s.needs_review ? (
+                            <button className="btn btn-sm" disabled={markingReviewId === s.id} onClick={() => unmarkForReview(s)}>
+                              {markingReviewId === s.id ? "Updating…" : "Unmark Review"}
+                            </button>
+                          ) : (
+                            <button className="btn btn-sm" disabled={markingReviewId === s.id} onClick={() => startMarkForReview(s)}>
+                              Mark for Review
+                            </button>
+                          )}
+                        </>
+                      )}
                       <button className="btn btn-sm" disabled={flagActionId === flag.id} onClick={() => confirmAccurate(flag)}>
                         {flagActionId === flag.id ? "Saving…" : "Confirm accurate"}
                       </button>
                     </div>
                   </div>
+
+                  {isEditing && s && coachChangeFrom?.id === s.id && (
+                    <div className="notice" style={{ marginTop: 8, fontSize: 12.5 }}>
+                      Recording a new head coach at <strong>{s.name}</strong>. Outgoing: {[coachChangeFrom.hc_first_name, coachChangeFrom.hc_last_name].filter(Boolean).join(" ") || "no name on file"}
+                      {coachChangeFrom.hc_email ? ` · ${coachChangeFrom.hc_email}` : ""}
+                      {coachChangeFrom.hc_cell ? ` · ${fmtPhone(coachChangeFrom.hc_cell)}` : ""}. Fields left blank below will be cleared, not carried over.
+                    </div>
+                  )}
+                  {s && reviewDraftId === s.id && (
+                    <div className="notice" style={{ marginTop: 8, fontSize: 12.5 }}>
+                      <div style={{ marginBottom: 6 }}>What should the next person check on <strong>{s.name}</strong>? (optional)</div>
+                      <input
+                        value={reviewDraftNote}
+                        onChange={(e) => setReviewDraftNote(e.target.value)}
+                        placeholder="e.g. double-check this Twitter handle"
+                        style={{ width: "100%", marginBottom: 8 }}
+                      />
+                      {markReviewError && <div style={{ color: "#b3261e", marginBottom: 8 }}>{markReviewError}</div>}
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button className="btn btn-sm btn-gold" disabled={markingReviewId === s.id} onClick={() => saveMarkForReview(s)}>
+                          {markingReviewId === s.id ? "Saving…" : "Save"}
+                        </button>
+                        <button type="button" className="btn btn-sm" onClick={cancelMarkForReview} disabled={markingReviewId === s.id}>
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {isEditing && s && (
+                    <div style={{ background: "#f7f8fa", border: "1px solid #dde1e7", borderRadius: 8, padding: 10, marginTop: 8 }}>
+                      <div className="grid grid-2" style={{ marginBottom: 8 }}>
+                        {EDIT_FIELDS.map(([field, label]) => (
+                          <div className="form-field" key={field} style={{ marginBottom: 0 }}>
+                            <label>{label}</label>
+                            <input value={editValues[field] || ""} onChange={(e) => setEditValues((prev) => ({ ...prev, [field]: e.target.value }))} />
+                          </div>
+                        ))}
+                      </div>
+                      <div style={{ marginBottom: 8 }}>
+                        <button type="button" className="btn btn-sm" disabled={discovering} onClick={() => discoverMaxPreps(s)}>
+                          {discovering ? "Searching…" : "Find MaxPreps page"}
+                        </button>
+                        {discoverError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverError}</div>}
+                        {suggestions.length > 0 && (
+                          <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                            {suggestions.map((sugg) => (
+                              <button
+                                type="button"
+                                key={sugg.link}
+                                className="btn btn-sm"
+                                style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
+                                onClick={() => pickSuggestion(sugg.link)}
+                              >
+                                {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                        <button type="button" className="btn btn-sm" disabled={discoveringAthletics} onClick={() => discoverAthletics(s)} style={{ marginLeft: 6 }}>
+                          {discoveringAthletics ? "Searching…" : "Find Athletics page"}
+                        </button>
+                        {discoverAthleticsError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverAthleticsError}</div>}
+                        {athleticsSuggestions.length > 0 && (
+                          <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                            {athleticsSuggestions.map((sugg) => (
+                              <button
+                                type="button"
+                                key={sugg.link}
+                                className="btn btn-sm"
+                                style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
+                                onClick={() => pickAthleticsSuggestion(sugg.link)}
+                              >
+                                {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                        <button type="button" className="btn btn-sm" disabled={aiSuggesting} onClick={() => suggestCoachInfo(s)} style={{ marginLeft: 6 }}>
+                          {aiSuggesting ? "Looking…" : "Suggest Coach Info (AI)"}
+                        </button>
+                        {aiSuggestError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{aiSuggestError}</div>}
+                        {aiSuggestInfo && (
+                          <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
+                            AI suggestion ({aiSuggestInfo.confidence} confidence, from the {aiSuggestInfo.source}) filled into the fields below — review before saving.
+                            {aiSuggestInfo.notes ? ` ${aiSuggestInfo.notes}` : ""}
+                          </div>
+                        )}
+                        <button type="button" className="btn btn-sm" disabled={discoveringSocial} onClick={() => discoverSocial(s)} style={{ marginLeft: 6 }}>
+                          {discoveringSocial ? "Searching…" : "Find Social Media"}
+                        </button>
+                        {discoverSocialError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverSocialError}</div>}
+                        {(socialSuggestions.twitter.length > 0 || socialSuggestions.facebook.length > 0) && (
+                          <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 10 }}>
+                            {socialSuggestions.twitter.length > 0 && (
+                              <div>
+                                <div style={{ fontSize: 11, fontWeight: 600, color: "#697386", marginBottom: 4 }}>TWITTER / X RESULTS</div>
+                                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                                  {socialSuggestions.twitter.map((sugg) => (
+                                    <button type="button" key={sugg.link} className="btn btn-sm" style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }} onClick={() => pickSocialSuggestion("hc_twitter", sugg.link)}>
+                                      {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                            {socialSuggestions.facebook.length > 0 && (
+                              <div>
+                                <div style={{ fontSize: 11, fontWeight: 600, color: "#697386", marginBottom: 4 }}>FACEBOOK RESULTS</div>
+                                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                                  {socialSuggestions.facebook.map((sugg) => (
+                                    <button type="button" key={sugg.link} className="btn btn-sm" style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }} onClick={() => pickSocialSuggestion("hc_facebook", sugg.link)}>
+                                      {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                      {saveError && <div className="notice danger" style={{ marginBottom: 8 }}>{saveError}</div>}
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
+                          {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : "Save & Mark Verified"}
+                        </button>
+                        <button type="button" className="btn btn-sm" onClick={cancelEdit} disabled={saving === s.id}>
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               );
             })}
             {todaysRecheck.map((s) => {
               const days = daysSince(s.last_verified_at);
+              const isEditing = editingId === s.id;
               return (
                 <div className="log-item" key={`recheck-${s.id}`} style={{ paddingBottom: 10 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
                     <div>
                       <strong>{s.name}</strong> — {s.city}, {s.state}
                       <span className="badge badge-unverified" style={{ marginLeft: 8 }}>{days}d since verified</span>
+                      {s.needs_review && (
+                        <span className="badge" style={{ marginLeft: 8, color: "#8a6100", background: "#fff4dc" }} title={s.needs_review_note || "Marked for review"}>
+                          🔖 Marked for review
+                        </span>
+                      )}
                       <div style={{ fontSize: 12, color: "#697386", marginTop: 2 }}>
                         {[s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ") || "no coach name"}
+                        {s.hc_email ? ` · ${s.hc_email}` : ""}
+                        {s.hc_cell ? ` · ${fmtPhone(s.hc_cell)}` : ""}
                       </div>
                     </div>
-                    <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                    <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "flex-end", gap: 6, maxWidth: 320 }}>
                       <Link href={`/schools/${s.id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
-                      <button className="btn btn-sm" disabled={markingVerifiedId === s.id} onClick={() => markVerified(s)}>
-                        {markingVerifiedId === s.id ? "Marking…" : "Mark Verified"}
-                      </button>
+                      {!isEditing && (
+                        <>
+                          <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
+                          <button className="btn btn-sm" onClick={() => startCoachChange(s)}>Mark Coach Change</button>
+                          {s.needs_review ? (
+                            <button className="btn btn-sm" disabled={markingReviewId === s.id} onClick={() => unmarkForReview(s)}>
+                              {markingReviewId === s.id ? "Updating…" : "Unmark Review"}
+                            </button>
+                          ) : (
+                            <button className="btn btn-sm" disabled={markingReviewId === s.id} onClick={() => startMarkForReview(s)}>
+                              Mark for Review
+                            </button>
+                          )}
+                          <button className="btn btn-sm" disabled={markingVerifiedId === s.id} onClick={() => markVerified(s)}>
+                            {markingVerifiedId === s.id ? "Marking…" : "Mark Verified"}
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
+
+                  {isEditing && coachChangeFrom?.id === s.id && (
+                    <div className="notice" style={{ marginTop: 8, fontSize: 12.5 }}>
+                      Recording a new head coach at <strong>{s.name}</strong>. Outgoing: {[coachChangeFrom.hc_first_name, coachChangeFrom.hc_last_name].filter(Boolean).join(" ") || "no name on file"}
+                      {coachChangeFrom.hc_email ? ` · ${coachChangeFrom.hc_email}` : ""}
+                      {coachChangeFrom.hc_cell ? ` · ${fmtPhone(coachChangeFrom.hc_cell)}` : ""}. Fields left blank below will be cleared, not carried over.
+                    </div>
+                  )}
+                  {reviewDraftId === s.id && (
+                    <div className="notice" style={{ marginTop: 8, fontSize: 12.5 }}>
+                      <div style={{ marginBottom: 6 }}>What should the next person check on <strong>{s.name}</strong>? (optional)</div>
+                      <input
+                        value={reviewDraftNote}
+                        onChange={(e) => setReviewDraftNote(e.target.value)}
+                        placeholder="e.g. double-check this Twitter handle"
+                        style={{ width: "100%", marginBottom: 8 }}
+                      />
+                      {markReviewError && <div style={{ color: "#b3261e", marginBottom: 8 }}>{markReviewError}</div>}
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button className="btn btn-sm btn-gold" disabled={markingReviewId === s.id} onClick={() => saveMarkForReview(s)}>
+                          {markingReviewId === s.id ? "Saving…" : "Save"}
+                        </button>
+                        <button type="button" className="btn btn-sm" onClick={cancelMarkForReview} disabled={markingReviewId === s.id}>
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {isEditing && (
+                    <div style={{ background: "#f7f8fa", border: "1px solid #dde1e7", borderRadius: 8, padding: 10, marginTop: 8 }}>
+                      <div className="grid grid-2" style={{ marginBottom: 8 }}>
+                        {EDIT_FIELDS.map(([field, label]) => (
+                          <div className="form-field" key={field} style={{ marginBottom: 0 }}>
+                            <label>{label}</label>
+                            <input value={editValues[field] || ""} onChange={(e) => setEditValues((prev) => ({ ...prev, [field]: e.target.value }))} />
+                          </div>
+                        ))}
+                      </div>
+                      <div style={{ marginBottom: 8 }}>
+                        <button type="button" className="btn btn-sm" disabled={discovering} onClick={() => discoverMaxPreps(s)}>
+                          {discovering ? "Searching…" : "Find MaxPreps page"}
+                        </button>
+                        {discoverError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverError}</div>}
+                        {suggestions.length > 0 && (
+                          <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                            {suggestions.map((sugg) => (
+                              <button
+                                type="button"
+                                key={sugg.link}
+                                className="btn btn-sm"
+                                style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
+                                onClick={() => pickSuggestion(sugg.link)}
+                              >
+                                {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                        <button type="button" className="btn btn-sm" disabled={discoveringAthletics} onClick={() => discoverAthletics(s)} style={{ marginLeft: 6 }}>
+                          {discoveringAthletics ? "Searching…" : "Find Athletics page"}
+                        </button>
+                        {discoverAthleticsError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverAthleticsError}</div>}
+                        {athleticsSuggestions.length > 0 && (
+                          <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 4 }}>
+                            {athleticsSuggestions.map((sugg) => (
+                              <button
+                                type="button"
+                                key={sugg.link}
+                                className="btn btn-sm"
+                                style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }}
+                                onClick={() => pickAthleticsSuggestion(sugg.link)}
+                              >
+                                {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
+                        <button type="button" className="btn btn-sm" disabled={aiSuggesting} onClick={() => suggestCoachInfo(s)} style={{ marginLeft: 6 }}>
+                          {aiSuggesting ? "Looking…" : "Suggest Coach Info (AI)"}
+                        </button>
+                        {aiSuggestError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{aiSuggestError}</div>}
+                        {aiSuggestInfo && (
+                          <div style={{ fontSize: 12, color: "#697386", marginTop: 6 }}>
+                            AI suggestion ({aiSuggestInfo.confidence} confidence, from the {aiSuggestInfo.source}) filled into the fields below — review before saving.
+                            {aiSuggestInfo.notes ? ` ${aiSuggestInfo.notes}` : ""}
+                          </div>
+                        )}
+                        <button type="button" className="btn btn-sm" disabled={discoveringSocial} onClick={() => discoverSocial(s)} style={{ marginLeft: 6 }}>
+                          {discoveringSocial ? "Searching…" : "Find Social Media"}
+                        </button>
+                        {discoverSocialError && <div style={{ fontSize: 12, color: "#b3261e", marginTop: 6 }}>{discoverSocialError}</div>}
+                        {(socialSuggestions.twitter.length > 0 || socialSuggestions.facebook.length > 0) && (
+                          <div style={{ marginTop: 6, display: "flex", flexDirection: "column", gap: 10 }}>
+                            {socialSuggestions.twitter.length > 0 && (
+                              <div>
+                                <div style={{ fontSize: 11, fontWeight: 600, color: "#697386", marginBottom: 4 }}>TWITTER / X RESULTS</div>
+                                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                                  {socialSuggestions.twitter.map((sugg) => (
+                                    <button type="button" key={sugg.link} className="btn btn-sm" style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }} onClick={() => pickSocialSuggestion("hc_twitter", sugg.link)}>
+                                      {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                            {socialSuggestions.facebook.length > 0 && (
+                              <div>
+                                <div style={{ fontSize: 11, fontWeight: 600, color: "#697386", marginBottom: 4 }}>FACEBOOK RESULTS</div>
+                                <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                                  {socialSuggestions.facebook.map((sugg) => (
+                                    <button type="button" key={sugg.link} className="btn btn-sm" style={{ textAlign: "left", justifyContent: "flex-start", whiteSpace: "normal" }} onClick={() => pickSocialSuggestion("hc_facebook", sugg.link)}>
+                                      {sugg.title} — <span style={{ color: "#697386" }}>{sugg.link}</span>
+                                    </button>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        )}
+                      </div>
+                      {saveError && <div className="notice danger" style={{ marginBottom: 8 }}>{saveError}</div>}
+                      <div style={{ display: "flex", gap: 8 }}>
+                        <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
+                          {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : "Save & Mark Verified"}
+                        </button>
+                        <button type="button" className="btn btn-sm" onClick={cancelEdit} disabled={saving === s.id}>
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               );
             })}
