@@ -75,12 +75,12 @@ export async function POST(req) {
       return NextResponse.json({ error: "Batch item not found." }, { status: 404 });
     }
 
-    // Only the "missing_email" candidate mode has an independent reason to
-    // already trust the on-file name (see buildSearchQuery's own comment in
-    // lib/coachInfoLookup.js) -- every other mode gets the safe, open
-    // identity-confirming query by default.
+    // Only the "missing_email"/"missing_cell" candidate modes have an
+    // independent reason to already trust the on-file name (see
+    // buildSearchQuery's own comment in lib/coachInfoLookup.js) -- every
+    // other mode gets the safe, open identity-confirming query by default.
     const { data: run } = await supabase.from("coach_info_batch_runs").select("candidate_mode").eq("id", item.batch_run_id).maybeSingle();
-    const contactOnly = run?.candidate_mode === "missing_email";
+    const contactOnly = run?.candidate_mode === "missing_email" || run?.candidate_mode === "missing_cell";
 
     const { data: school, error: schoolErr } = await supabase
       .from("schools")
@@ -94,9 +94,9 @@ export async function POST(req) {
 
     const athleticsUrl = withProtocol(school.athletics_url);
     const websiteUrl = withProtocol(school.website);
-    // Name-targeted search only for "missing_email" runs (see contactOnly
-    // above and buildSearchQuery's own comment) -- every other mode gets
-    // the open, identity-confirming query.
+    // Name-targeted search only for "missing_email"/"missing_cell" runs
+    // (see contactOnly above and buildSearchQuery's own comment) -- every
+    // other mode gets the open, identity-confirming query.
     const searchQuery = buildSearchQuery(school, { contactOnly });
     // See the matching comment in app/api/schools/[id]/discover-coach-info's
     // own route -- biases the primary Serper search itself toward this
