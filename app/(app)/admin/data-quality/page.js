@@ -103,6 +103,27 @@ function readPageTabCache() {
   }
 }
 
+// Today's List used to be recomputed live from flaggedQueue/needsRecheck on
+// every render -- so the moment one row got fixed (Quick Fix, Confirm
+// accurate, Mark Verified), it vanished from those source arrays and every
+// row below it visibly jumped up to fill the gap, closing whatever editor
+// was open on it mid-edit. Larry asked for the list (and the Quick Fix
+// panel on any row in it) to just stay put while he works through it.
+// QUICKFIX_CACHE_KEY freezes Today's List into a one-time "snapshot" (see
+// buildTodaysSnapshot below) plus whichever row's Quick Fix editor is open
+// and its in-progress draft -- session-scoped like the caches above, read
+// synchronously at initial render for the same race-avoidance reason
+// readPageTabCache is.
+const QUICKFIX_CACHE_KEY = "csd_dq_quickfix_cache_v1";
+function readQuickFixCache() {
+  try {
+    const raw = sessionStorage.getItem(QUICKFIX_CACHE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
 function fmtRelativeTime(date) {
   if (!date) return "";
   const seconds = Math.floor((Date.now() - date.getTime()) / 1000);
@@ -427,15 +448,32 @@ export default function DataQualityPage() {
   const [filter, setFilter] = useState("all");
   const [sortBy, setSortBy] = useState("default");
 
-  const [editingId, setEditingId] = useState(null);
-  const [editValues, setEditValues] = useState({});
+  // Lazy-initialized from QUICKFIX_CACHE_KEY (see that constant's comment)
+  // so a same-tab remount -- Larry's browser occasionally navigating an
+  // "Open Profile" link in the same tab instead of a new one, or a
+  // browser-back press -- lands back with whichever row's editor was open,
+  // and the in-progress edits still in it, instead of a blank page.
+  const [editingId, setEditingId] = useState(() => readQuickFixCache()?.editingId ?? null);
+  const [editValues, setEditValues] = useState(() => readQuickFixCache()?.editValues ?? {});
   const [saving, setSaving] = useState(null);
   const [saveError, setSaveError] = useState("");
   // Set only when the open editor was opened via "Mark Coach Change" rather
   // than plain "Quick Fix" -- holds the pre-change school row so the form
   // can show who the outgoing coach was and saveEdit can tag the write
   // distinctly in school_change_log (see COACH_CHANGE_SOURCE_META).
-  const [coachChangeFrom, setCoachChangeFrom] = useState(null);
+  const [coachChangeFrom, setCoachChangeFrom] = useState(() => readQuickFixCache()?.coachChangeFrom ?? null);
+  // Set the moment saveEdit() succeeds, cleared by opening a different
+  // editor or explicitly closing this one. Editing no longer auto-closes
+  // the panel on save (see saveEdit) -- this drives the "✓ Saved" banner
+  // that replaces the old silent close, so Larry can see the save landed
+  // and keep working the same row (another AI lookup, a follow-up tweak)
+  // before dismissing it himself.
+  const [justSavedId, setJustSavedId] = useState(null);
+  // Today's List's frozen snapshot -- see buildTodaysSnapshot below, and
+  // QUICKFIX_CACHE_KEY's comment for why this needs to survive a same-tab
+  // remount too. null until the first build (either restored from cache
+  // here, or built fresh once flaggedQueue/needsRecheck finish loading).
+  const [todaysSnapshot, setTodaysSnapshot] = useState(() => readQuickFixCache()?.todaysSnapshot ?? null);
   // A lighter-weight sibling to Quick Fix -- for a school found via search
   // or turned up by a scan where nothing actually needs to change, just a
   // "yes, I checked this, it's still right" without opening the editor.
@@ -1290,6 +1328,64 @@ export default function DataQualityPage() {
     document.addEventListener("visibilitychange", onVisibilityChange);
     return () => document.removeEventListener("visibilitychange", onVisibilityChange);
   }, [loadFlags, loadNeedsRecheck]);
+
+  // Freezes Today's List's current composition into todaysSnapshot -- same
+  // TODAYS_LIST_FLAG_CAP/TODAYS_LIST_SIZE slice as before, just captured
+  // once instead of recomputed live on every render. Each row's "done"
+  // status is still worked out live (see isTodaysFlagResolved/
+  // isTodaysRecheckResolved below, which just check whether the row is
+  // still present in the live flaggedQueue/needsRecheck) -- only the LIST
+  // ITSELF, and the order/position of rows in it, is frozen. That's what
+  // stops a completed row from vanishing out from under an open Quick Fix
+  // panel and everything below it jumping up to fill the gap.
+  function buildTodaysSnapshot() {
+    const flags = flaggedQueue.slice(0, TODAYS_LIST_FLAG_CAP);
+    const recheck = needsRecheck.slice(0, Math.max(0, TODAYS_LIST_SIZE - flags.length));
+    setTodaysSnapshot({ flags, recheck });
+  }
+
+  // Builds the snapshot exactly once per visit: as soon as both source
+  // queues have finished their first load, but only if nothing was already
+  // restored from QUICKFIX_CACHE_KEY (todaysSnapshot's lazy initializer) --
+  // a same-tab remount should keep showing the same frozen list, not
+  // silently swap in a fresh one. Larry can always pull a new batch on
+  // purpose with the "Refresh List" button (calls buildTodaysSnapshot
+  // directly), which is the only other thing that ever replaces it.
+  useEffect(() => {
+    if (todaysSnapshot || loadingFlags || loadingNeedsRecheck) return;
+    buildTodaysSnapshot();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loadingFlags, loadingNeedsRecheck]);
+
+  // Keeps QUICKFIX_CACHE_KEY in sync with whichever editor is open (plus
+  // its in-progress draft) and the current Today's List snapshot -- see
+  // that constant's comment for why this exists and why editingId/
+  // editValues/coachChangeFrom/todaysSnapshot are all read back via lazy
+  // useState initializers rather than a restore-on-mount effect (same
+  // clobber race PAGE_TAB_CACHE_KEY's comment describes). Deliberately
+  // skips capturing editingId/editValues/coachChangeFrom when the open
+  // editor belongs to a "Find & Edit a School" search result -- that case
+  // is already owned end-to-end by FIND_SCHOOL_CACHE_KEY above (including
+  // its own schoolQuery/searchResults), so caching it here too would just
+  // give the same editingId two different owners.
+  useEffect(() => {
+    try {
+      const editingASearchResult = editingId != null && searchResults.some((s) => s.id === editingId);
+      sessionStorage.setItem(
+        QUICKFIX_CACHE_KEY,
+        JSON.stringify({
+          editingId: editingASearchResult ? null : editingId,
+          editValues: editingASearchResult ? null : editValues,
+          coachChangeFrom: editingASearchResult ? null : coachChangeFrom,
+          todaysSnapshot,
+        })
+      );
+    } catch {
+      // Storage full/unavailable -- editing/Today's List still work for
+      // this tab, they just won't survive a same-tab remount. Not worth
+      // surfacing an error for.
+    }
+  }, [editingId, editValues, coachChangeFrom, todaysSnapshot, searchResults]);
 
   const loadReviewMarked = useCallback(async () => {
     if (!canReview) {
@@ -2448,6 +2544,7 @@ export default function DataQualityPage() {
   function startEdit(school) {
     setEditingId(school.id);
     setCoachChangeFrom(null);
+    setJustSavedId(null);
     setSaveError("");
     setDiscoverError("");
     setSuggestions([]);
@@ -2493,6 +2590,7 @@ export default function DataQualityPage() {
   function startCoachChange(school) {
     setEditingId(school.id);
     setCoachChangeFrom(school);
+    setJustSavedId(null);
     setSaveError("");
     setDiscoverError("");
     setSuggestions([]);
@@ -2518,6 +2616,7 @@ export default function DataQualityPage() {
   function cancelEdit() {
     setEditingId(null);
     setCoachChangeFrom(null);
+    setJustSavedId(null);
     setSaveError("");
     setDiscoverError("");
     setSuggestions([]);
@@ -2930,8 +3029,16 @@ export default function DataQualityPage() {
       if (changes.some((c) => COACH_CHANGE_TRACKED_FIELDS.includes(c.field_name))) {
         loadCoachChanges();
       }
-      setEditingId(null);
+      // Used to close the editor here automatically. Larry asked for the
+      // panel to stay open through a save instead of snapping shut --
+      // clearing coachChangeFrom (so the "recording a new coach" notice
+      // doesn't linger after the save it was for) and setting justSavedId
+      // drives the "✓ Saved" banner below; editingId is left alone, so the
+      // panel itself, and whichever row it's on, doesn't move or vanish.
+      // The reviewer closes it explicitly (the same Cancel button, now
+      // labeled "Close") whenever they're actually done with this row.
       setCoachChangeFrom(null);
+      setJustSavedId(before.id);
     } catch (err) {
       setSaveError(err.message || "Could not save this fix.");
     } finally {
@@ -3004,13 +3111,18 @@ export default function DataQualityPage() {
   // open-ended scroll through hundreds of rows. Flags come first (someone
   // already reported or the sweep already detected a possible problem, so
   // they're the most urgent), then the oldest overdue re-checks fill any
-  // remaining slots up to TODAYS_LIST_SIZE. Both queues are already
-  // sorted oldest-first, and both are live state -- completing an item
-  // here (Confirm Accurate / Mark Verified) removes it from its source
-  // list, which removes it from here too, no separate bookkeeping needed.
-  const todaysFlags = flaggedQueue.slice(0, TODAYS_LIST_FLAG_CAP);
-  const todaysRecheck = needsRecheck.slice(0, Math.max(0, TODAYS_LIST_SIZE - todaysFlags.length));
+  // remaining slots up to TODAYS_LIST_SIZE. The rows themselves come from
+  // todaysSnapshot (frozen -- see buildTodaysSnapshot) rather than being
+  // sliced live off flaggedQueue/needsRecheck every render; "done" status
+  // per row is still worked out live, just without moving or removing the
+  // row itself, so completing one doesn't jump the rest of the list.
+  const todaysFlags = todaysSnapshot?.flags || [];
+  const todaysRecheck = todaysSnapshot?.recheck || [];
   const todaysListTotal = todaysFlags.length + todaysRecheck.length;
+  const isTodaysFlagResolved = (flag) => !flaggedQueue.some((f) => f.id === flag.id);
+  const isTodaysRecheckResolved = (s) => !needsRecheck.some((r) => r.id === s.id);
+  const todaysRemaining =
+    todaysFlags.filter((f) => !isTodaysFlagResolved(f)).length + todaysRecheck.filter((s) => !isTodaysRecheckResolved(s)).length;
 
   return (
     <div className="view">
@@ -3313,24 +3425,37 @@ export default function DataQualityPage() {
       {pageTab === "radar" && (
       <>
       <div className="card" style={{ marginBottom: 14 }}>
-        <h3 style={{ marginBottom: 4 }}>Today&apos;s List ({todaysListTotal})</h3>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+          <h3 style={{ marginBottom: 4 }}>
+            Today&apos;s List ({todaysRemaining} to go{todaysListTotal ? ` of ${todaysListTotal}` : ""})
+          </h3>
+          <button className="btn btn-sm" onClick={buildTodaysSnapshot} disabled={loadingFlags || loadingNeedsRecheck}>
+            Refresh List
+          </button>
+        </div>
         <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
-          A short, finishable list instead of a long scroll — flagged/possibly-outdated schools first (up to {TODAYS_LIST_FLAG_CAP}), then whatever&apos;s most overdue for a re-check fills the rest, up to {TODAYS_LIST_SIZE} total. Clear one and it drops off the list.
+          A short, finishable list instead of a long scroll — flagged/possibly-outdated schools first (up to {TODAYS_LIST_FLAG_CAP}), then whatever&apos;s most overdue for a re-check fills the rest, up to {TODAYS_LIST_SIZE} total. This list holds still while you work it — a row you fix or confirm gets a ✓ instead of disappearing out from under you. Click &quot;Refresh List&quot; whenever you want a clean batch (e.g. once everything below is done).
         </p>
         {flagActionError && <div className="notice danger" style={{ marginBottom: 10 }}>{flagActionError}</div>}
         {markVerifiedError && <div className="notice danger" style={{ marginBottom: 10 }}>{markVerifiedError}</div>}
-        {loadingFlags || loadingNeedsRecheck ? (
+        {!todaysSnapshot && (loadingFlags || loadingNeedsRecheck) ? (
           <div className="empty-state">Loading…</div>
         ) : todaysListTotal === 0 ? (
           <div className="empty-state">Nothing urgent right now — no flags pending, and nothing overdue for a re-check.</div>
         ) : (
           <>
+            {todaysRemaining === 0 && (
+              <div className="notice" style={{ marginBottom: 10, background: "#e6f4ea", color: "#1a7f37", borderColor: "#b7dfc4" }}>
+                ✓ All {todaysListTotal} handled — nice work. Click &quot;Refresh List&quot; above to pull a new batch.
+              </div>
+            )}
             {todaysFlags.map((flag) => {
               const s = flag.schools;
               const isAutomated = isAutomatedFlag(flag.reason);
               const isEditing = editingId === s?.id;
+              const isResolved = isTodaysFlagResolved(flag);
               return (
-                <div className="log-item" key={`flag-${flag.id}`} style={{ paddingBottom: 10 }}>
+                <div className="log-item" key={`flag-${flag.id}`} style={{ paddingBottom: 10, opacity: isResolved && !isEditing ? 0.6 : 1 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
                     <div>
                       <strong>{s?.name || `School #${flag.school_id}`}</strong> — {s?.city}, {s?.state}
@@ -3340,6 +3465,11 @@ export default function DataQualityPage() {
                       >
                         {isAutomated ? "Automated flag" : "Coach-reported flag"}
                       </span>
+                      {isResolved && (
+                        <span className="badge" style={{ marginLeft: 8, color: "#1a7f37", background: "#e6f4ea" }}>
+                          ✓ Handled
+                        </span>
+                      )}
                       {s?.needs_review && (
                         <span className="badge" style={{ marginLeft: 8, color: "#8a6100", background: "#fff4dc" }} title={s.needs_review_note || "Marked for review"}>
                           🔖 Marked for review
@@ -3358,7 +3488,7 @@ export default function DataQualityPage() {
                     </div>
                     <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "flex-end", gap: 6, maxWidth: 320 }}>
                       <Link href={`/schools/${flag.school_id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
-                      {!isEditing && s && (
+                      {!isEditing && !isResolved && s && (
                         <>
                           <button className="btn btn-sm btn-primary" onClick={() => startEditFromFlag(s, flag)}>
                             {isAutomated ? "Quick Fix (AI lookup)" : "Quick Fix"}
@@ -3375,9 +3505,11 @@ export default function DataQualityPage() {
                           )}
                         </>
                       )}
-                      <button className="btn btn-sm" disabled={flagActionId === flag.id} onClick={() => confirmAccurate(flag)}>
-                        {flagActionId === flag.id ? "Saving…" : "Confirm accurate"}
-                      </button>
+                      {!isResolved && (
+                        <button className="btn btn-sm" disabled={flagActionId === flag.id} onClick={() => confirmAccurate(flag)}>
+                          {flagActionId === flag.id ? "Saving…" : "Confirm accurate"}
+                        </button>
+                      )}
                     </div>
                   </div>
 
@@ -3501,13 +3633,18 @@ export default function DataQualityPage() {
                           </div>
                         )}
                       </div>
+                      {justSavedId === s.id && (
+                        <div className="notice" style={{ marginBottom: 8, background: "#e6f4ea", color: "#1a7f37", borderColor: "#b7dfc4" }}>
+                          ✓ Saved and marked verified. Make another change above, or Close when you&apos;re done.
+                        </div>
+                      )}
                       {saveError && <div className="notice danger" style={{ marginBottom: 8 }}>{saveError}</div>}
                       <div style={{ display: "flex", gap: 8 }}>
                         <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
-                          {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : "Save & Mark Verified"}
+                          {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : justSavedId === s.id ? "Save Again" : "Save & Mark Verified"}
                         </button>
                         <button type="button" className="btn btn-sm" onClick={cancelEdit} disabled={saving === s.id}>
-                          Cancel
+                          {justSavedId === s.id ? "Close" : "Cancel"}
                         </button>
                       </div>
                     </div>
@@ -3518,12 +3655,18 @@ export default function DataQualityPage() {
             {todaysRecheck.map((s) => {
               const days = daysSince(s.last_verified_at);
               const isEditing = editingId === s.id;
+              const isResolved = isTodaysRecheckResolved(s);
               return (
-                <div className="log-item" key={`recheck-${s.id}`} style={{ paddingBottom: 10 }}>
+                <div className="log-item" key={`recheck-${s.id}`} style={{ paddingBottom: 10, opacity: isResolved && !isEditing ? 0.6 : 1 }}>
                   <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
                     <div>
                       <strong>{s.name}</strong> — {s.city}, {s.state}
                       <span className="badge badge-unverified" style={{ marginLeft: 8 }}>{days}d since verified</span>
+                      {isResolved && (
+                        <span className="badge" style={{ marginLeft: 8, color: "#1a7f37", background: "#e6f4ea" }}>
+                          ✓ Handled
+                        </span>
+                      )}
                       {s.needs_review && (
                         <span className="badge" style={{ marginLeft: 8, color: "#8a6100", background: "#fff4dc" }} title={s.needs_review_note || "Marked for review"}>
                           🔖 Marked for review
@@ -3537,7 +3680,7 @@ export default function DataQualityPage() {
                     </div>
                     <div style={{ display: "flex", flexWrap: "wrap", justifyContent: "flex-end", gap: 6, maxWidth: 320 }}>
                       <Link href={`/schools/${s.id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
-                      {!isEditing && (
+                      {!isEditing && !isResolved && (
                         <>
                           <button className="btn btn-sm btn-primary" onClick={() => startEdit(s)}>Quick Fix</button>
                           <button className="btn btn-sm" onClick={() => startCoachChange(s)}>Mark Coach Change</button>
@@ -3678,13 +3821,18 @@ export default function DataQualityPage() {
                           </div>
                         )}
                       </div>
+                      {justSavedId === s.id && (
+                        <div className="notice" style={{ marginBottom: 8, background: "#e6f4ea", color: "#1a7f37", borderColor: "#b7dfc4" }}>
+                          ✓ Saved and marked verified. Make another change above, or Close when you&apos;re done.
+                        </div>
+                      )}
                       {saveError && <div className="notice danger" style={{ marginBottom: 8 }}>{saveError}</div>}
                       <div style={{ display: "flex", gap: 8 }}>
                         <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
-                          {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : "Save & Mark Verified"}
+                          {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : justSavedId === s.id ? "Save Again" : "Save & Mark Verified"}
                         </button>
                         <button type="button" className="btn btn-sm" onClick={cancelEdit} disabled={saving === s.id}>
-                          Cancel
+                          {justSavedId === s.id ? "Close" : "Cancel"}
                         </button>
                       </div>
                     </div>
@@ -3886,13 +4034,18 @@ export default function DataQualityPage() {
                       </div>
                     )}
                   </div>
+                  {justSavedId === s.id && (
+                    <div className="notice" style={{ marginBottom: 8, background: "#e6f4ea", color: "#1a7f37", borderColor: "#b7dfc4" }}>
+                      ✓ Saved and marked verified. Make another change above, or Close when you&apos;re done.
+                    </div>
+                  )}
                   {saveError && <div className="notice danger" style={{ marginBottom: 8 }}>{saveError}</div>}
                   <div style={{ display: "flex", gap: 8 }}>
                     <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
-                      {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : "Save & Mark Verified"}
+                      {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : justSavedId === s.id ? "Save Again" : "Save & Mark Verified"}
                     </button>
                     <button type="button" className="btn btn-sm" onClick={cancelEdit} disabled={saving === s.id}>
-                      Cancel
+                      {justSavedId === s.id ? "Close" : "Cancel"}
                     </button>
                   </div>
                 </div>
@@ -4769,13 +4922,18 @@ export default function DataQualityPage() {
                           </div>
                         )}
                       </div>
+                      {justSavedId === s.id && (
+                        <div className="notice" style={{ marginBottom: 8, background: "#e6f4ea", color: "#1a7f37", borderColor: "#b7dfc4" }}>
+                          ✓ Saved and marked verified. Make another change above, or Close when you&apos;re done.
+                        </div>
+                      )}
                       {saveError && <div className="notice danger" style={{ marginBottom: 8 }}>{saveError}</div>}
                       <div style={{ display: "flex", gap: 8 }}>
                         <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
-                          {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : "Save & Mark Verified"}
+                          {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : justSavedId === s.id ? "Save Again" : "Save & Mark Verified"}
                         </button>
                         <button type="button" className="btn btn-sm" onClick={cancelEdit} disabled={saving === s.id}>
-                          Cancel
+                          {justSavedId === s.id ? "Close" : "Cancel"}
                         </button>
                       </div>
                     </div>
@@ -4942,13 +5100,18 @@ export default function DataQualityPage() {
                           </div>
                         )}
                       </div>
+                      {justSavedId === s.id && (
+                        <div className="notice" style={{ marginBottom: 8, background: "#e6f4ea", color: "#1a7f37", borderColor: "#b7dfc4" }}>
+                          ✓ Saved and marked verified. Make another change above, or Close when you&apos;re done.
+                        </div>
+                      )}
                       {saveError && <div className="notice danger" style={{ marginBottom: 8 }}>{saveError}</div>}
                       <div style={{ display: "flex", gap: 8 }}>
                         <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
-                          {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : "Save & Mark Verified"}
+                          {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : justSavedId === s.id ? "Save Again" : "Save & Mark Verified"}
                         </button>
                         <button type="button" className="btn btn-sm" onClick={cancelEdit} disabled={saving === s.id}>
-                          Cancel
+                          {justSavedId === s.id ? "Close" : "Cancel"}
                         </button>
                       </div>
                     </div>
@@ -5227,13 +5390,18 @@ export default function DataQualityPage() {
                         </div>
                       )}
                     </div>
+                    {justSavedId === s.id && (
+                      <div className="notice" style={{ marginBottom: 8, background: "#e6f4ea", color: "#1a7f37", borderColor: "#b7dfc4" }}>
+                        ✓ Saved and marked verified. Make another change above, or Close when you&apos;re done.
+                      </div>
+                    )}
                     {saveError && <div className="notice danger" style={{ marginBottom: 8 }}>{saveError}</div>}
                     <div style={{ display: "flex", gap: 8 }}>
                       <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
-                        {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : "Save & Mark Verified"}
+                        {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : justSavedId === s.id ? "Save Again" : "Save & Mark Verified"}
                       </button>
                       <button type="button" className="btn btn-sm" onClick={cancelEdit} disabled={saving === s.id}>
-                        Cancel
+                        {justSavedId === s.id ? "Close" : "Cancel"}
                       </button>
                     </div>
                   </div>
@@ -5568,12 +5736,18 @@ export default function DataQualityPage() {
                             </div>
                           )}
                         </div>
+                        {justSavedId === s.id && (
+                          <div className="notice" style={{ marginBottom: 8, background: "#e6f4ea", color: "#1a7f37", borderColor: "#b7dfc4" }}>
+                            ✓ Saved and marked verified. Make another change above, or Close when you&apos;re done.
+                          </div>
+                        )}
+                        {saveError && <div className="notice danger" style={{ marginBottom: 8 }}>{saveError}</div>}
                         <div style={{ display: "flex", gap: 8 }}>
                           <button className="btn btn-sm btn-gold" disabled={saving === s.id} onClick={() => saveEdit(s)}>
-                            {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : "Save & Mark Verified"}
+                            {saving === s.id ? "Saving…" : coachChangeFrom?.id === s.id ? "Save Coach Change" : justSavedId === s.id ? "Save Again" : "Save & Mark Verified"}
                           </button>
                           <button type="button" className="btn btn-sm" onClick={cancelEdit} disabled={saving === s.id}>
-                            Cancel
+                            {justSavedId === s.id ? "Close" : "Cancel"}
                           </button>
                         </div>
                       </div>
