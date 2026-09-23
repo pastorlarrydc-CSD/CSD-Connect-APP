@@ -338,8 +338,11 @@ function BatchCoachInfoPageInner() {
   // "all" shows everything, same as before this existed.
   const [confidenceFilter, setConfidenceFilter] = useState(() => {
     const fromUrl = searchParams.get("confidence");
-    return ["all", "high", "medium", "low"].includes(fromUrl) ? fromUrl : "all";
-  }); // "all" | "high" | "medium" | "low"
+    return ["all", "high", "medium", "low", "reviewed"].includes(fromUrl) ? fromUrl : "all";
+  }); // "all" | "high" | "medium" | "low" | "reviewed" -- "reviewed" is a quick-jump filter to the
+  // already-reviewed rows (only meaningful, and only shown as a tab, while showReviewed is on --
+  // see the reset-on-uncheck logic below) so Larry doesn't have to scroll past every pending row
+  // to find the ones with a reviewed-date badge.
   // Free-text filter on school name/city -- useful once a run's list runs
   // into the hundreds and a reviewer wants to jump straight to one school
   // (e.g. checking whether a specific school they were just asked about
@@ -662,8 +665,18 @@ function BatchCoachInfoPageInner() {
     high: reviewBaseRows.filter((i) => i.suggestion?.confidence === "high").length,
     medium: reviewBaseRows.filter((i) => i.suggestion?.confidence === "medium").length,
     low: reviewBaseRows.filter((i) => i.suggestion?.confidence === "low").length,
+    // Count of already-reviewed rows within the current base set -- only
+    // non-zero (and only rendered as a tab) while showReviewed is on, since
+    // reviewBaseRows excludes reviewed items otherwise.
+    reviewed: reviewBaseRows.filter((i) => i.review_status !== "pending").length,
   };
-  const visibleRows = reviewBaseRows.filter((i) => (confidenceFilter === "all" || i.suggestion?.confidence === confidenceFilter) && matchesSearch(i));
+  const visibleRows = reviewBaseRows.filter((i) => {
+    // "reviewed" isn't a confidence tier -- it's a shortcut to the
+    // already-reviewed rows so Larry can jump straight to the ones with a
+    // reviewed-date badge instead of scrolling past every pending row first.
+    const tierMatch = confidenceFilter === "reviewed" ? i.review_status !== "pending" : confidenceFilter === "all" || i.suggestion?.confidence === confidenceFilter;
+    return tierMatch && matchesSearch(i);
+  });
 
   // Keyboard-nav targets mirror the table's own row filter (pendingReview,
   // minus suggestion_error items, with the same confidence/search filters
@@ -1836,7 +1849,16 @@ function BatchCoachInfoPageInner() {
                 </p>
                 <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
                   <label style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}>
-                    <input type="checkbox" checked={showReviewed} onChange={(e) => setShowReviewed(e.target.checked)} />
+                    <input
+                      type="checkbox"
+                      checked={showReviewed}
+                      onChange={(e) => {
+                        setShowReviewed(e.target.checked);
+                        // Unchecking hides every reviewed row, so a "Reviewed" tab
+                        // selection would otherwise silently show zero rows.
+                        if (!e.target.checked && confidenceFilter === "reviewed") setConfidenceFilter("all");
+                      }}
+                    />
                     Show already-reviewed
                   </label>
                   <button className="btn btn-sm" onClick={exportRunCsv} disabled={visibleRows.length === 0}>
@@ -1892,7 +1914,10 @@ function BatchCoachInfoPageInner() {
 
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 10, marginBottom: 10 }}>
                 <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-                  {["all", "high", "medium", "low"].map((tier) => {
+                  {/* "reviewed" only appears once there's something to jump to -- it stays
+                      hidden while showReviewed is off since reviewBaseRows has no reviewed
+                      rows in it at all then. */}
+                  {(showReviewed ? ["all", "high", "medium", "low", "reviewed"] : ["all", "high", "medium", "low"]).map((tier) => {
                     const active = confidenceFilter === tier;
                     const label = tier === "all" ? "All" : tier[0].toUpperCase() + tier.slice(1);
                     return (
