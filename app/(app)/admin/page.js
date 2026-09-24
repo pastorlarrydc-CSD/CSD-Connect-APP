@@ -241,6 +241,11 @@ export default function AdminPage() {
                   Business Dashboard
                 </Link>
               )}
+              {isOwner && (
+                <Link href="/admin/accounts" className="btn btn-sm btn-gold" style={{ marginRight: 8 }}>
+                  Accounts
+                </Link>
+              )}
               <Link href="/admin/leads" className="btn btn-sm btn-primary" style={{ marginRight: 8 }}>
                 College Outreach
               </Link>
