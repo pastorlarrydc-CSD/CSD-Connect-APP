@@ -291,7 +291,7 @@ function BatchCoachInfoPageInner() {
   const modeFromUrl = searchParams.get("mode");
   const [candidateMode, setCandidateMode] = useState(
     ["no_name", "missing_email", "missing_cell"].includes(modeFromUrl) ? modeFromUrl : "no_name"
-  ); // "no_name" | "missing_email" | "missing_cell" | "re_verify"
+  ); // "no_name" | "missing_email" | "missing_cell" | "re_verify" | "bounce_recovery"
   const [scopeMode, setScopeMode] = useState(stateFromUrl ? "all" : "priority"); // "priority" | "all"
   const [customStates, setCustomStates] = useState(stateFromUrl || PRIORITY_STATES.join(", "));
   // A state deep-link means "clear this whole state" -- 1000 (the largest
@@ -934,6 +934,45 @@ function BatchCoachInfoPageInner() {
           );
           return;
         }
+      } else if (candidateMode === "bounce_recovery") {
+        // Sourced from email_bounce_events instead of the schools table
+        // directly -- a durable record of on-file emails confirmed dead
+        // (today seeded from Larry's Sept 2026 HS Coach Newsletter #1 hard-
+        // bounce report; see the bounce-recovery feature's project doc).
+        // Designed to also be written to later by the automated
+        // Resend-webhook bounce-tracking feature (see
+        // claude/bounce-tracking-auto-flag-spec.md), so this mode keeps
+        // working unchanged once that ships. Same touchedIds exclusion
+        // every other mode below uses: a school already applied, skipped,
+        // or attempted here before -- through THIS mode or any other -- is
+        // left out, so each bounced school only ever surfaces once.
+        const { data: touchedRows, error: touchedErr } = await supabase.from("coach_info_batch_items").select("school_id");
+        if (touchedErr) throw touchedErr;
+        const excludedIds = new Set((touchedRows || []).map((r) => r.school_id));
+
+        const { data: bounceRows, error: bounceErr } = await supabase
+          .from("email_bounce_events")
+          .select("school_id,school:schools(id,name,city,state,is_closed)")
+          .order("id", { ascending: true })
+          .limit(targetCount * 3);
+        if (bounceErr) throw bounceErr;
+
+        let candidates = (bounceRows || [])
+          .filter((r) => r.school && !r.school.is_closed && !excludedIds.has(r.school_id))
+          .map((r) => ({ id: r.school.id, name: r.school.name, city: r.school.city, state: r.school.state }));
+
+        if (scopeMode !== "all" || states.length) {
+          const stateSet = new Set(states);
+          candidates = candidates.filter((s) => stateSet.has(s.state));
+        }
+
+        schoolsData = candidates.slice(0, targetCount);
+        if (!schoolsData || schoolsData.length === 0) {
+          setCreateError(
+            "No bounced-email schools matched -- everyone in this scope has already been through this tool before, or there's nothing left in the bounce list for this scope."
+          );
+          return;
+        }
       } else {
         // Excludes every school that's EVER gone through this tool before --
         // applied, skipped, or a suggestion that errored out -- not just ones
@@ -1045,6 +1084,20 @@ function BatchCoachInfoPageInner() {
       const itemRows = schoolsData.map((s) => ({ batch_run_id: runRow.id, school_id: s.id }));
       const { error: itemsErr } = await supabase.from("coach_info_batch_items").insert(itemRows);
       if (itemsErr) throw itemsErr;
+
+      // Marks these schools' bounce events reviewed the moment they're
+      // queued into a run -- not waiting for the eventual Apply/Skip click
+      // -- so email_bounce_events itself always answers "how many bounced
+      // records has Larry sent through AI review" without joining back
+      // through coach_info_batch_items. The touchedIds exclusion above is
+      // still what actually stops a school from being offered again.
+      if (candidateMode === "bounce_recovery") {
+        const { error: bounceUpdateErr } = await supabase
+          .from("email_bounce_events")
+          .update({ reviewed: true, reviewed_at: new Date().toISOString(), reviewed_by: user.id })
+          .in("school_id", schoolsData.map((s) => s.id));
+        if (bounceUpdateErr) console.error("Could not mark email_bounce_events reviewed for this run", bounceUpdateErr);
+      }
 
       await loadRuns();
       openRun(runRow.id);
@@ -1653,6 +1706,8 @@ function BatchCoachInfoPageInner() {
             ? "Pulls schools that already have a head coach name on file but are missing a cell number -- searches for that specific coach by name instead of the generic \"who is the coach\" search."
             : candidateMode === "re_verify"
             ? "Pulls schools this tool has already touched before, but not recently -- a fresh open search per school (not name-anchored), so a coach who's since changed gets caught instead of re-confirmed."
+            : candidateMode === "bounce_recovery"
+            ? "Pulls schools from the bounce list (email_bounce_events) whose on-file coach email is confirmed dead -- the AI is told explicitly that address bounced, and every suggestion from this mode always waits for your manual Apply click, even a high-confidence one, since it's overwriting data that was often recently marked verified."
             : "Pulls schools missing a head coach name that have an athletics or general website on file to search from -- schools with neither can't be helped by this tool."}
           {" "}
           {candidateMode === "re_verify"
@@ -1676,6 +1731,10 @@ function BatchCoachInfoPageInner() {
             <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
               <input type="radio" checked={candidateMode === "re_verify"} onChange={() => setCandidateMode("re_verify")} />
               Re-verify: schools not (re-)checked recently, including ones already run before
+            </label>
+            <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
+              <input type="radio" checked={candidateMode === "bounce_recovery"} onChange={() => setCandidateMode("bounce_recovery")} />
+              Bounced emails: schools whose on-file email is confirmed dead (from a bounce report)
             </label>
             {candidateMode === "re_verify" && (
               <label style={{ fontSize: 13, marginLeft: 22 }}>
@@ -1786,6 +1845,8 @@ function BatchCoachInfoPageInner() {
                       ? " — re-verify"
                       : r.candidate_mode === "csv_upload"
                       ? " — from CSV import"
+                      : r.candidate_mode === "bounce_recovery"
+                      ? " — bounce recovery"
                       : ""}
                     {r.status === "collected" && pendingCount > 0 ? ` — ${pendingCount} to review` : ""}
                     {runLastWorked[r.id] ? ` — last worked ${fmtReviewedRelative(runLastWorked[r.id])}` : ""}
