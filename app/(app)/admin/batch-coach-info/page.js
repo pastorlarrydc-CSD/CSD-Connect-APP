@@ -5,6 +5,7 @@ import Link from "next/link";
 import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
+import { fetchAllTouchedSchoolIds } from "@/lib/batchExclusion";
 
 // Overnight Coach-Info Batch API job -- see the batch-coach-info-discovery
 // spec doc in the project for the full plan this implements. Turns the
@@ -946,9 +947,10 @@ function BatchCoachInfoPageInner() {
         // every other mode below uses: a school already applied, skipped,
         // or attempted here before -- through THIS mode or any other -- is
         // left out, so each bounced school only ever surfaces once.
-        const { data: touchedRows, error: touchedErr } = await supabase.from("coach_info_batch_items").select("school_id");
-        if (touchedErr) throw touchedErr;
-        const excludedIds = new Set((touchedRows || []).map((r) => r.school_id));
+        // Paginated -- see lib/batchExclusion.js's own comment for why an
+        // unpaginated select silently drops rows once this table passes
+        // 1000 and can't be trusted to exclude everything it should.
+        const excludedIds = await fetchAllTouchedSchoolIds(supabase, "coach_info_batch_items");
 
         const { data: bounceRows, error: bounceErr } = await supabase
           .from("email_bounce_events")
@@ -988,9 +990,10 @@ function BatchCoachInfoPageInner() {
         // time someone wants to force a fresh look at one specific school.
         // (re_verify above is the other, run-level way to force another
         // look -- at a whole stale slice of schools at once.)
-        const { data: touchedRows, error: touchedErr } = await supabase.from("coach_info_batch_items").select("school_id");
-        if (touchedErr) throw touchedErr;
-        const excludedIds = new Set((touchedRows || []).map((r) => r.school_id));
+        // Paginated -- see lib/batchExclusion.js's own comment for why an
+        // unpaginated select silently drops rows once this table passes
+        // 1000 and can't be trusted to exclude everything it should.
+        const excludedIds = await fetchAllTouchedSchoolIds(supabase, "coach_info_batch_items");
 
         let query = supabase
           .from("schools")
