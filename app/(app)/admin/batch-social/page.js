@@ -6,6 +6,7 @@ import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 import { fetchAllTouchedSchoolIds } from "@/lib/batchExclusion";
+import { isEligibleSocialClassification } from "@/lib/socialLookup";
 
 // Overnight Social Media Batch API job -- the social-handle counterpart to
 // /admin/batch-athletics (see that page for the pattern this mirrors, and
@@ -769,7 +770,7 @@ function BatchSocialPageInner() {
       // vice versa, and this run can still fill in whichever's missing.
       let query = supabase
         .from("schools")
-        .select("id,name,city,state,hc_first_name,hc_last_name")
+        .select("id,name,city,state,classification,hc_first_name,hc_last_name")
         .not("hc_first_name", "is", null)
         .neq("hc_first_name", "")
         .not("hc_last_name", "is", null)
@@ -791,16 +792,30 @@ function BatchSocialPageInner() {
         // wants to force a fresh look at one specific school.
         .neq("verification_status", "verified")
         .order("id", { ascending: true })
-        .limit(targetCount * 3);
+        // Was targetCount * 3. Bumped once a scope can also lose a big
+        // chunk of rows to isEligibleSocialClassification (TX/GA/IN/CA/OH
+        // now only keep their bigger classification tiers) stacked on top
+        // of the existing exclusion filter -- 3x headroom was already
+        // tight with just one filter and could under-fill a run's target
+        // count in a heavily-filtered state even when plenty more eligible
+        // schools exist further down the id-ordered list.
+        .limit(targetCount * 6);
       if (scopeMode !== "all" || states.length) {
         query = query.in("state", states);
       }
 
       const { data: rawSchoolsData, error: schoolsErr } = await query;
       if (schoolsErr) throw schoolsErr;
-      const schoolsData = (rawSchoolsData || []).filter((s) => !excludedIds.has(s.id)).slice(0, targetCount);
+      // isEligibleSocialClassification is a no-op (always true) for any
+      // state outside lib/socialLookup's CLASSIFICATION_FILTERED_STATES --
+      // see that file's comment for why TX/GA/IN/CA/OH specifically get
+      // narrowed to their bigger classification tiers and every other
+      // state doesn't.
+      const schoolsData = (rawSchoolsData || [])
+        .filter((s) => !excludedIds.has(s.id) && isEligibleSocialClassification(s.state, s.classification))
+        .slice(0, targetCount);
       if (!schoolsData || schoolsData.length === 0) {
-        setCreateError("No schools matched -- everyone with a coach name on file in this scope already has both a Twitter/X and Facebook handle, or has already been through this tool before.");
+        setCreateError("No schools matched -- everyone with a coach name on file in this scope already has both a Twitter/X and Facebook handle, has already been through this tool before, or falls below the classification tier this scope now searches.");
         return;
       }
 
