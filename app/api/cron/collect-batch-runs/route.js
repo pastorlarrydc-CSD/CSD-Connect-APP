@@ -192,9 +192,14 @@ export async function GET(req) {
     }
 
     toolLoop: for (const tool of TOOLS) {
+      // candidate_mode is only meaningful for coach_info (see the
+      // bounce_recovery carve-out below), but harmless to select for every
+      // tool -- the other three runsTables don't have the column at all
+      // reachable here since this select only ever touches coach_info's
+      // own runsTable for that check.
       const { data: runs, error: runsErr } = await supabase
         .from(tool.runsTable)
-        .select("id,status,anthropic_batch_id,submitted_at")
+        .select(tool.key === "coach_info" ? "id,status,anthropic_batch_id,submitted_at,candidate_mode" : "id,status,anthropic_batch_id,submitted_at")
         .in("status", ["submitted", "processing"])
         .not("anthropic_batch_id", "is", null)
         .order("submitted_at", { ascending: true });
@@ -320,7 +325,18 @@ export async function GET(req) {
           const { error: itemErr } = await supabase.from(tool.itemsTable).update(patch).eq("id", itemId);
           if (itemErr) console.error(`cron collect-batch-runs: item update error for ${tool.key} run ${run.id} item ${itemId}`, itemErr);
 
-          if (!itemErr && tool.autoApplyHighConfidence && patch.suggestion?.confidence === "high") {
+          // bounce_recovery runs are the one coach_info carve-out: they're
+          // overwriting an email that was often recently marked "verified"
+          // (that's the whole reason it's worth flagging -- see the
+          // bounce-recovery feature's project doc), not just filling a
+          // blank field the way every other coach_info run's high-confidence
+          // auto-apply assumes. Larry chose "always manual review" for this
+          // candidate_mode specifically, so it skips auto-apply here even
+          // though tool.autoApplyHighConfidence is true for coach_info as a
+          // whole -- every suggestion from a bounce_recovery run still lands
+          // in the review queue for a human Apply click, same as
+          // medium/low-confidence suggestions from any other run.
+          if (!itemErr && tool.autoApplyHighConfidence && run.candidate_mode !== "bounce_recovery" && patch.suggestion?.confidence === "high") {
             const schoolId = schoolIdByItemId?.get(itemId);
             if (schoolId) {
               const applyResult = await autoApplyHighConfidenceSuggestion({
