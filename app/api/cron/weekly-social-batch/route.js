@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
 import { searchWeb } from "@/lib/coachInfoLookup";
-import { buildSocialSourceText, SYSTEM_PROMPT, MODEL, MAX_TOKENS } from "@/lib/socialLookup";
+import { buildSocialSourceText, SYSTEM_PROMPT, MODEL, MAX_TOKENS, isEligibleSocialClassification } from "@/lib/socialLookup";
 
 export const maxDuration = 60;
 
@@ -89,7 +89,7 @@ export async function GET(req) {
     // manual tool's own candidate query (see app/(app)/admin/batch-social).
     const { data: rawCandidates, error: candErr } = await supabase
       .from("schools")
-      .select("id,name,city,state,hc_first_name,hc_last_name,hc_twitter,hc_facebook")
+      .select("id,name,city,state,classification,hc_first_name,hc_last_name,hc_twitter,hc_facebook")
       .not("hc_first_name", "is", null)
       .neq("hc_first_name", "")
       .not("hc_last_name", "is", null)
@@ -101,13 +101,31 @@ export async function GET(req) {
       .eq("is_closed", false)
       .in("state", PRIORITY_STATES)
       .order("id", { ascending: true })
-      .limit(WEEKLY_TARGET_COUNT * 3);
+      // Was WEEKLY_TARGET_COUNT * 3. Bumped for the same reason as the
+      // manual tool's own over-fetch (see app/(app)/admin/batch-social) --
+      // isEligibleSocialClassification below can now drop a large share of
+      // TX/GA/IN/CA/OH rows on top of the existing exclusion filter, and
+      // 3x headroom risked under-filling the day's run even when plenty
+      // more eligible schools existed further down the id order.
+      .limit(WEEKLY_TARGET_COUNT * 6);
     if (candErr) throw candErr;
 
-    const candidates = (rawCandidates || []).filter((s) => !excludedIds.has(s.id)).slice(0, WEEKLY_TARGET_COUNT);
+    // isEligibleSocialClassification only actually filters TX/GA/IN/CA/OH
+    // (see lib/socialLookup.js's CLASSIFICATION_FILTERED_STATES comment for
+    // why those five and not every priority state, and why "bigger" means
+    // opposite things in the XA states vs. the Division states) -- it's a
+    // pass-through for every other state.
+    const candidates = (rawCandidates || [])
+      .filter((s) => !excludedIds.has(s.id) && isEligibleSocialClassification(s.state, s.classification))
+      .slice(0, WEEKLY_TARGET_COUNT);
     if (candidates.length === 0) {
-      console.log("cron weekly-social-batch: skipped -- no eligible schools (everyone with a coach name already has both handles, has already been through this tool before, or priority-state coverage is complete)");
-      return NextResponse.json({ skipped: true, reason: "No eligible schools -- everyone with a coach name on file in the priority states already has both handles, or has already been through this tool before." });
+      console.log(
+        "cron weekly-social-batch: skipped -- no eligible schools (everyone with a coach name already has both handles, has already been through this tool before, priority-state coverage is complete, or what's left falls below the classification tier this cron now searches)"
+      );
+      return NextResponse.json({
+        skipped: true,
+        reason: "No eligible schools -- everyone with a coach name on file in the priority states already has both handles, has already been through this tool before, or falls below the classification tier this cron now searches.",
+      });
     }
 
     const { data: runRow, error: runErr } = await supabase
