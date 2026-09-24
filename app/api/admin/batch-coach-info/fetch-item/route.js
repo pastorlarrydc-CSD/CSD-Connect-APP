@@ -82,6 +82,26 @@ export async function POST(req) {
     const { data: run } = await supabase.from("coach_info_batch_runs").select("candidate_mode").eq("id", item.batch_run_id).maybeSingle();
     const contactOnly = run?.candidate_mode === "missing_email" || run?.candidate_mode === "missing_cell";
 
+    // bounce_recovery runs need to tell buildSourceBlocks which on-file
+    // email is confirmed dead (see that function's bouncedEmail param) --
+    // pulled from email_bounce_events rather than carried on the item row
+    // itself, since that table is the one shared record of a bounce event
+    // (today seeded from Larry's newsletter bounce report, later also
+    // written to by the automated Resend-webhook flagging feature -- see
+    // claude/bounce-tracking-auto-flag-spec.md). Most recent event wins if
+    // a school somehow has more than one on file.
+    let bouncedEmail = null;
+    if (run?.candidate_mode === "bounce_recovery") {
+      const { data: bounceRow } = await supabase
+        .from("email_bounce_events")
+        .select("bounced_email")
+        .eq("school_id", item.school_id)
+        .order("detected_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      bouncedEmail = bounceRow?.bounced_email || null;
+    }
+
     const { data: school, error: schoolErr } = await supabase
       .from("schools")
       .select("id,name,city,state,athletics_url,website,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,ad_name,ad_email")
@@ -142,6 +162,7 @@ export async function POST(req) {
       knowledgeGraph: primarySearch.knowledgeGraph,
       answerBox: primarySearch.answerBox,
       duplicateSchools,
+      bouncedEmail,
     });
 
     if (!hasUsableContent) {
