@@ -53,7 +53,14 @@ export async function POST(req, { params }) {
       return NextResponse.json({ error: "ANTHROPIC_API_KEY is missing from the server environment." }, { status: 500 });
     }
 
-    const { data: run, error: runErr } = await supabase.from("coach_info_batch_runs").select("id,status,anthropic_batch_id").eq("id", runId).maybeSingle();
+    // candidate_mode needed for the bounce_recovery carve-out below -- see
+    // the matching check (and its own comment) in
+    // app/api/cron/collect-batch-runs/route.js, which this manual button
+    // had been missing entirely until Larry caught a bounce-recovery run
+    // that got auto-applied through THIS route instead of the overnight
+    // cron. Same rule either way a run gets collected: bounce_recovery
+    // always waits for a human Apply click, regardless of confidence.
+    const { data: run, error: runErr } = await supabase.from("coach_info_batch_runs").select("id,status,anthropic_batch_id,candidate_mode").eq("id", runId).maybeSingle();
     if (runErr || !run) {
       return NextResponse.json({ error: "Batch run not found." }, { status: 404 });
     }
@@ -106,6 +113,7 @@ export async function POST(req, { params }) {
     let succeeded = 0;
     let failed = 0;
     let autoApplied = 0;
+    let autoApplyHeld = 0;
     let autoApplyErrors = 0;
     let saveErr = null;
 
@@ -147,7 +155,17 @@ export async function POST(req, { params }) {
       const { error: itemErr } = await supabase.from("coach_info_batch_items").update(patch).eq("id", itemId);
       if (itemErr && !saveErr) saveErr = itemErr;
 
-      if (!itemErr && patch.suggestion?.confidence === "high") {
+      // bounce_recovery is the one candidate_mode this button must NOT
+      // auto-apply for -- same rule the overnight cron already enforces
+      // (see collect-batch-runs/route.js), now enforced here too so
+      // clicking "Collect Results" manually on a bounce-recovery run can't
+      // silently auto-apply an email that's often recently been marked
+      // "verified" (the whole reason bounce recovery flags it in the first
+      // place). Larry chose "always manual review" for this mode
+      // specifically -- every suggestion from a bounce_recovery run should
+      // land in the review queue for a human Apply click, no matter which
+      // button collected the results.
+      if (!itemErr && run.candidate_mode !== "bounce_recovery" && patch.suggestion?.confidence === "high") {
         const schoolId = schoolIdByItemId.get(itemId);
         if (schoolId) {
           const result = await autoApplyHighConfidenceSuggestion({
@@ -159,7 +177,13 @@ export async function POST(req, { params }) {
             actorUserId: userData.user.id,
           });
           if (result.applied) autoApplied++;
-          else {
+          else if (result.held) {
+            // Not an error -- see OVERWRITE_GATED_FIELDS in
+            // lib/coachInfoLookup.js. The suggestion would have replaced an
+            // existing coach name/email with a different one, so it was
+            // left "pending" for a human instead of auto-applied.
+            autoApplyHeld++;
+          } else {
             autoApplyErrors++;
             console.error("batch-coach-info collect auto-apply error for item", itemId, result.error);
           }
@@ -179,7 +203,7 @@ export async function POST(req, { params }) {
       console.error("batch-coach-info collect run-update error", updateErr);
     }
 
-    return NextResponse.json({ status: "collected", succeeded, failed, auto_applied: autoApplied, auto_apply_errors: autoApplyErrors });
+    return NextResponse.json({ status: "collected", succeeded, failed, auto_applied: autoApplied, auto_apply_held: autoApplyHeld, auto_apply_errors: autoApplyErrors });
   } catch (err) {
     console.error("batch-coach-info collect error", err);
     return NextResponse.json({ error: "Could not collect this run's results. Please try again." }, { status: 500 });
