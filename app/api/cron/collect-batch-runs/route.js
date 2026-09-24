@@ -77,6 +77,17 @@ const COLLECT_CONCURRENCY = 8;
 // /admin/batch-status dashboard (same underlying batch_tool_pool_status()
 // Postgres function powers both) in response to Larry asking for a
 // pool-depletion alert so a tool running dry doesn't go unnoticed.
+//
+// And a duplicate-touch canary right after that -- a second, independent
+// check (batch_duplicate_touch_status(), also shared with /admin/batch-
+// status) that emails Larry if any tool's count of schools touched more
+// than once GROWS past the baseline recorded when the Sept 24 2026
+// row-cap exclusion bug was fixed (see
+// claude/batch-exclusion-row-cap-bug-fix.md). That fix should make new
+// duplicates permanently impossible going forward -- this is the trip
+// wire that catches it if the exclusion logic ever breaks again in some
+// new way, instead of it going unnoticed for weeks the way the original
+// bug did.
 const TIME_BUDGET_MS = 50_000;
 
 const SYSTEM_USER_ID = "d24ad753-f759-479d-8958-fae8f995faa1"; // CSD sysadmin account (Larry) -- same attribution every other cron uses for automated writes
@@ -96,6 +107,18 @@ const SITE_URL = process.env.NEXT_PUBLIC_SITE_URL || "https://coachconnect.verce
 // false once the pool recovers above POOL_ALERT_THRESHOLD, so a later
 // dip alerts again.
 const poolAlertSettingKey = (toolKey) => `batch_pool_alert_sent__${toolKey}`;
+
+// Same "don't re-send every day" pattern as poolAlertSettingKey above, for
+// the duplicate-touch canary below -- one system_settings row per tool
+// records whether Larry's already been alerted for the CURRENT spell of
+// new duplicates, and batch_duplicate_baseline__<tool> holds the
+// known-duplicate count from the moment the row-cap exclusion fix shipped
+// (Sept 24 2026 -- see claude/batch-exclusion-row-cap-bug-fix.md). The
+// baseline is deliberately never reset back down after an alert -- once a
+// tool's count is confirmed to have grown past it, that's the new floor
+// this canary watches from.
+const duplicateAlertSettingKey = (toolKey) => `batch_duplicate_alert_sent__${toolKey}`;
+const duplicateBaselineSettingKey = (toolKey) => `batch_duplicate_baseline__${toolKey}`;
 
 // One entry per batch discovery tool -- everything that differs between
 // them (table names, how a parsed suggestion gets normalized) lives here;
@@ -286,6 +309,7 @@ export async function GET(req) {
         let failed = 0;
         let autoApplied = 0;
         let autoApplyErrors = 0;
+        let autoApplyHeld = 0;
         let autoConfirmed = 0;
         let autoConfirmErrors = 0;
 
@@ -348,7 +372,15 @@ export async function GET(req) {
                 actorUserId: SYSTEM_USER_ID,
               });
               if (applyResult.applied) autoApplied++;
-              else {
+              else if (applyResult.held) {
+                // Not an error -- autoApplyHighConfidenceSuggestion itself
+                // decided this suggestion would overwrite an existing
+                // coach name/email with a different value and held it back
+                // for a human instead (see OVERWRITE_GATED_FIELDS in
+                // lib/coachInfoLookup.js). The item stays "pending" and
+                // surfaces on the review page same as any other suggestion.
+                autoApplyHeld++;
+              } else {
                 autoApplyErrors++;
                 console.error(`cron collect-batch-runs: auto-apply error for ${tool.key} run ${run.id} item ${itemId}`, applyResult.error);
               }
@@ -395,6 +427,7 @@ export async function GET(req) {
           succeeded,
           failed,
           auto_applied: autoApplied,
+          auto_apply_held: autoApplyHeld,
           auto_apply_errors: autoApplyErrors,
           auto_confirmed_no_data: autoConfirmed,
           auto_confirm_errors: autoConfirmErrors,
@@ -402,7 +435,7 @@ export async function GET(req) {
         console.log(
           `cron collect-batch-runs: collected ${tool.key} run ${run.id} -- ${succeeded} succeeded, ${failed} failed` +
             (tool.notAvailableField ? `, ${autoConfirmed} auto-confirmed no-data, ${autoConfirmErrors} auto-confirm errors` : "") +
-            (tool.autoApplyHighConfidence ? `, ${autoApplied} auto-applied, ${autoApplyErrors} auto-apply errors` : "")
+            (tool.autoApplyHighConfidence ? `, ${autoApplied} auto-applied, ${autoApplyHeld} held for review (would overwrite existing name/email), ${autoApplyErrors} auto-apply errors` : "")
         );
       }
     }
@@ -532,7 +565,121 @@ export async function GET(req) {
       poolAlert = { error: err.message || String(err) };
     }
 
-    return NextResponse.json({ summary, duration_ms: Date.now() - startedAt, pool_alert: poolAlert });
+    // --- Duplicate-touch canary --------------------------------------
+    // Same independent, non-fatal shape as the pool-depletion check above,
+    // reading batch_duplicate_touch_status() (a Postgres function -- see
+    // its own migration) instead of batch_tool_pool_status(). That
+    // function counts, per tool, how many schools have been touched by
+    // more than one run -- exactly the failure mode of the Sept 2026
+    // row-cap exclusion bug (claude/batch-exclusion-row-cap-bug-fix.md).
+    // The count itself never reaches zero (477+ schools were already
+    // duplicated before the fix, and those old extra rows are left in
+    // place rather than deleted), so this doesn't alert on the count being
+    // non-zero -- it alerts only when the count GROWS past the baseline
+    // recorded the moment the fix shipped, which would mean the exclusion
+    // logic broke again in some new way and deserves the same kind of
+    // attention the original bug got.
+    let duplicateAlert = null;
+    try {
+      const { data: dupRows, error: dupErr } = await supabase.rpc("batch_duplicate_touch_status");
+      if (dupErr) throw dupErr;
+
+      const settingKeys = TOOLS.flatMap((t) => [duplicateBaselineSettingKey(t.key), duplicateAlertSettingKey(t.key)]);
+      const { data: dupSettingRows, error: dupSettingErr } = await supabase.from("system_settings").select("key,value").in("key", settingKeys);
+      if (dupSettingErr) throw dupSettingErr;
+      const settingByKey = new Map((dupSettingRows || []).map((r) => [r.key, r.value]));
+      const dupByKey = new Map((dupRows || []).map((r) => [r.tool_key, Number(r.duplicate_schools)]));
+
+      const newlyDuplicated = [];
+      for (const tool of TOOLS) {
+        const current = dupByKey.get(tool.key);
+        if (current === undefined) continue;
+        const baseline = Number(settingByKey.get(duplicateBaselineSettingKey(tool.key)) ?? current);
+        const alreadyFlagged = settingByKey.get(duplicateAlertSettingKey(tool.key)) === true;
+        if (current > baseline && !alreadyFlagged) {
+          newlyDuplicated.push({ ...tool, current, baseline, grew_by: current - baseline });
+        }
+      }
+
+      if (newlyDuplicated.length > 0) {
+        const resendKey = process.env.RESEND_API_KEY;
+        if (!resendKey) {
+          console.warn("cron collect-batch-runs: duplicate-touch canary triggered but RESEND_API_KEY is not set -- skipping email:", newlyDuplicated.map((t) => t.key).join(", "));
+          duplicateAlert = { triggered: newlyDuplicated.map((t) => t.key), emailed: false, reason: "RESEND_API_KEY not set" };
+        } else {
+          const { data: recipientProfiles } = await supabase.from("profiles").select("id").in("role", ["sysadmin", "verifier"]);
+          const emails = [];
+          for (const p of recipientProfiles || []) {
+            const { data: userRes } = await supabase.auth.admin.getUserById(p.id);
+            if (userRes?.user?.email) emails.push(userRes.user.email);
+          }
+
+          if (emails.length === 0) {
+            duplicateAlert = { triggered: newlyDuplicated.map((t) => t.key), emailed: false, reason: "No sysadmin/verifier email addresses found" };
+          } else {
+            const rowsHtml = newlyDuplicated
+              .map(
+                (t) => `<tr>
+                <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;">${t.label}</td>
+                <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;text-align:right;font-weight:700;color:#b3261e;">+${t.grew_by}</td>
+                <td style="padding:8px 12px;border-bottom:1px solid #e5e7eb;color:#697386;">${t.baseline} → ${t.current}</td>
+              </tr>`
+              )
+              .join("");
+            const subject = `Batch Discovery: ${newlyDuplicated.length} tool${newlyDuplicated.length === 1 ? "" : "s"} showing NEW duplicate-touched schools`;
+            const html = `<div style="font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;max-width:640px;margin:0 auto;color:#1a1a1a;">
+              <h2 style="margin-bottom:4px;">Duplicate-touch canary tripped</h2>
+              <p style="color:#697386;margin-top:0;">
+                ${newlyDuplicated.length} of the four AI discovery tools now show MORE schools touched by more than one run than right after the
+                Sept 24 2026 exclusion-list fix. That fix was supposed to make this permanently impossible going forward -- this growing again means
+                something in the "already touched" exclusion logic broke a second time and is worth a look before it repeats what happened before.
+              </p>
+              <table style="width:100%;border-collapse:collapse;font-size:14px;">
+                <thead>
+                  <tr style="text-align:left;color:#697386;font-size:12px;text-transform:uppercase;">
+                    <th style="padding:8px 12px;border-bottom:2px solid #e5e7eb;">Tool</th>
+                    <th style="padding:8px 12px;border-bottom:2px solid #e5e7eb;text-align:right;">Grew by</th>
+                    <th style="padding:8px 12px;border-bottom:2px solid #e5e7eb;">Baseline → now</th>
+                  </tr>
+                </thead>
+                <tbody>${rowsHtml}</tbody>
+              </table>
+              <p style="margin-top:24px;">
+                <a href="${SITE_URL}/admin/batch-status" style="background:#1a1a2e;color:#fff;padding:10px 18px;border-radius:6px;text-decoration:none;display:inline-block;">
+                  Open Batch Discovery Status
+                </a>
+              </p>
+              <p style="color:#9ca3af;font-size:12px;margin-top:32px;">CSD CoachConnect — Collegiate Sports Data. You'll only get this once per tool until it's addressed.</p>
+            </div>`;
+
+            const sendRes = await fetch("https://api.resend.com/emails", {
+              method: "POST",
+              headers: { "content-type": "application/json", authorization: `Bearer ${resendKey}` },
+              body: JSON.stringify({ from: ALERT_FROM_EMAIL, to: emails, subject, html }),
+            });
+
+            if (sendRes.ok) {
+              for (const t of newlyDuplicated) {
+                await supabase
+                  .from("system_settings")
+                  .upsert({ key: duplicateAlertSettingKey(t.key), value: true, updated_at: new Date().toISOString() }, { onConflict: "key" });
+              }
+              duplicateAlert = { triggered: newlyDuplicated.map((t) => t.key), emailed: true, to: emails };
+              console.log("cron collect-batch-runs: duplicate-touch canary alert sent for", newlyDuplicated.map((t) => t.key).join(", "));
+            } else {
+              const detail = await sendRes.text().catch(() => "");
+              console.error("cron collect-batch-runs: duplicate-touch canary Resend error", sendRes.status, detail);
+              duplicateAlert = { triggered: newlyDuplicated.map((t) => t.key), emailed: false, reason: `Resend error ${sendRes.status}` };
+            }
+          }
+        }
+      }
+    } catch (err) {
+      console.error("cron collect-batch-runs: duplicate-touch canary failed (non-fatal -- the collection summary above still completed)", err);
+      duplicateAlert = { error: err.message || String(err) };
+    }
+
+    return NextResponse.json({ summary, duration_ms: Date.now() - startedAt, pool_alert: poolAlert, duplicate_touch_alert: duplicateAlert });
   } catch (err) {
     console.error("cron collect-batch-runs error", err);
     return NextResponse.json({ error: err.message || "Automated batch collection failed.", summary }, { status: 500 });
