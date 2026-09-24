@@ -25,6 +25,18 @@ import { useAuth } from "@/lib/auth-context";
 // The pool-depletion email alert added to app/api/cron/collect-batch-runs
 // reads the exact same function, so this page and that alert can never
 // quietly disagree about whether a tool is running low.
+//
+// Each card also shows "Touched >1x" -- how many schools that tool has
+// touched with more than one run, from batch_duplicate_touch_status()
+// (again shared with the collect-batch-runs cron's own alert). A nonzero
+// number here is expected and not itself a problem: 477+ schools were
+// already duplicated across all four tools by the Sept 24 2026 row-cap
+// exclusion bug before it was fixed (see
+// claude/batch-exclusion-row-cap-bug-fix.md), and those old rows are left
+// in place rather than cleaned up. What actually matters is the number
+// GROWING past the baseline recorded right when that fix shipped -- that
+// would mean the exclusion logic broke again, and this page turns the
+// line red the moment it does.
 const WEEKLY_TARGET_COUNT = 300; // matches every weekly-*-batch cron's own per-run target -- used here only to describe "how many runs' worth is left" and to color-code pool health
 
 const TOOLS = [
@@ -123,6 +135,21 @@ export default function BatchStatusPage() {
       if (poolErr) throw poolErr;
       const poolByKey = new Map((poolRows || []).map((r) => [r.tool_key, r]));
 
+      // Duplicate-touch canary (see batch_duplicate_touch_status()'s own
+      // migration comment and claude/batch-exclusion-row-cap-bug-fix.md):
+      // how many schools each tool has touched more than once, and whether
+      // that count has grown past the baseline recorded the moment the
+      // Sept 24 2026 row-cap exclusion fix shipped. The baseline itself
+      // (existing historical duplicates from before the fix) is expected
+      // and not shown as a problem -- only growth past it is, same bar the
+      // collect-batch-runs cron's own alert email uses.
+      const [{ data: dupRows }, { data: dupSettingRows }] = await Promise.all([
+        supabase.rpc("batch_duplicate_touch_status"),
+        supabase.from("system_settings").select("key,value").like("key", "batch_duplicate_baseline__%"),
+      ]);
+      const dupByKey = new Map((dupRows || []).map((r) => [r.tool_key, Number(r.duplicate_schools)]));
+      const dupBaselineByKey = new Map((dupSettingRows || []).map((r) => [r.key.replace("batch_duplicate_baseline__", ""), Number(r.value)]));
+
       const results = await Promise.all(
         TOOLS.map(async (tool) => {
           const [{ data: latestRuns }, { count: pending }, { count: applied }, { count: skipped }, { count: errors }] = await Promise.all([
@@ -138,6 +165,8 @@ export default function BatchStatusPage() {
             supabase.from(tool.itemsTable).select("id", { count: "exact", head: true }).not("suggestion_error", "is", null),
           ]);
           const pool = poolByKey.get(tool.key);
+          const dupCount = dupByKey.has(tool.key) ? dupByKey.get(tool.key) : null;
+          const dupBaseline = dupBaselineByKey.has(tool.key) ? dupBaselineByKey.get(tool.key) : dupCount;
           return [
             tool.key,
             {
@@ -148,6 +177,8 @@ export default function BatchStatusPage() {
               errors: errors || 0,
               remainingPool: pool ? Number(pool.remaining_pool) : null,
               totalTouched: pool ? Number(pool.total_touched) : null,
+              duplicateTouched: dupCount,
+              duplicateGrew: dupCount != null && dupBaseline != null && dupCount > dupBaseline,
             },
           ];
         })
@@ -174,6 +205,7 @@ export default function BatchStatusPage() {
 
   const criticalTools = TOOLS.filter((t) => rows[t.key] && rows[t.key].remainingPool !== null && rows[t.key].remainingPool < WEEKLY_TARGET_COUNT);
   const totalPending = TOOLS.reduce((sum, t) => sum + (rows[t.key]?.pending || 0), 0);
+  const duplicateGrewTools = TOOLS.filter((t) => rows[t.key]?.duplicateGrew);
 
   return (
     <div className="view">
@@ -204,6 +236,17 @@ export default function BatchStatusPage() {
           in the six priority states (TX, FL, GA, CA, OH, IN): {criticalTools.map((t) => t.label).join(", ")}. The "Remaining pool" number on each card
           below shows exactly how many schools are left -- a tool at 0 will keep coming back empty on its weekly automated run until it's given more
           states or a wider search to work with.
+        </div>
+      )}
+
+      {!loading && duplicateGrewTools.length > 0 && (
+        <div className="notice danger" style={{ marginBottom: 14 }}>
+          <strong>
+            {duplicateGrewTools.length} tool{duplicateGrewTools.length === 1 ? "" : "s"} showing NEW duplicate-touched schools
+          </strong>{" "}
+          since the Sept 24 2026 exclusion-list fix ({duplicateGrewTools.map((t) => t.label).join(", ")}) -- see the "Touched &gt;1x" line on each card
+          below. That fix was supposed to make this permanently impossible going forward, so growth here means the "already touched" exclusion logic
+          broke again in some new way and is worth a look.
         </div>
       )}
 
@@ -295,6 +338,12 @@ export default function BatchStatusPage() {
                   {r.totalTouched != null ? ` · ${r.totalTouched.toLocaleString()} touched lifetime` : ""}
                 </div>
                 <div style={{ fontSize: 11, color: "#9aa3b2", marginTop: 4 }}>{tool.criteria} — TX/FL/GA/CA/OH/IN</div>
+                {r.duplicateTouched != null && (
+                  <div style={{ fontSize: 11, color: r.duplicateGrew ? "#b3261e" : "#9aa3b2", marginTop: 2, fontWeight: r.duplicateGrew ? 700 : 400 }}>
+                    Touched &gt;1x: {r.duplicateTouched.toLocaleString()}
+                    {r.duplicateGrew ? " — new since the exclusion fix" : ""}
+                  </div>
+                )}
               </div>
             </div>
           );
