@@ -5,6 +5,7 @@ import Link from "next/link";
 import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
+import { fetchAllTouchedSchoolIds } from "@/lib/batchExclusion";
 
 // Overnight Athletics-URL Batch API job -- the athletics-discovery
 // counterpart to /admin/batch-coach-info (see that page and the
@@ -687,10 +688,10 @@ function BatchAthleticsPageInner() {
       // just ones sitting in a still-open run (same fix just made to Batch
       // Coach-Info's startRun; see that page for the full reasoning). Over-
       // fetches 3x and filters client-side rather than a giant SQL "not in"
-      // list.
-      const { data: touchedRows, error: touchedErr } = await supabase.from("athletics_batch_items").select("school_id");
-      if (touchedErr) throw touchedErr;
-      const excludedIds = new Set((touchedRows || []).map((r) => r.school_id));
+      // list. Paginated -- see lib/batchExclusion.js's own comment for why
+      // an unpaginated select silently drops rows once this table passes
+      // 1000 and can't be trusted to exclude everything it should.
+      const excludedIds = await fetchAllTouchedSchoolIds(supabase, "athletics_batch_items");
 
       let query = supabase
         .from("schools")
@@ -1096,9 +1097,10 @@ function BatchAthleticsPageInner() {
         return;
       }
 
-      const { data: touchedRows, error: touchedErr } = await supabase.from("athletics_batch_items").select("school_id");
-      if (touchedErr) throw touchedErr;
-      const excludedIds = new Set((touchedRows || []).map((r) => r.school_id));
+      // Paginated -- see lib/batchExclusion.js's own comment for why an
+      // unpaginated select silently drops rows once this table passes
+      // 1000 and can't be trusted to exclude everything it should.
+      const excludedIds = await fetchAllTouchedSchoolIds(supabase, "athletics_batch_items");
 
       const { data: rawSchoolsData, error: schoolsErr } = await supabase
         .from("schools")
