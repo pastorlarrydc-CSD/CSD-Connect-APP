@@ -1255,12 +1255,21 @@ function BatchCoachInfoPageInner() {
         update.last_verified_at = new Date().toISOString();
       }
       if (Object.keys(update).length > 0) {
-        // A human clicking Apply here is the same "someone just fixed it"
-        // signal as a Quick Fix save on the school's own profile -- clears
-        // the needs_review bookmark too (lib/needsReview.js), not just
-        // verification_status, so a bounce-recovery school doesn't keep
-        // sitting in the Needs Review queue after its suggestion is applied.
-        Object.assign(update, NEEDS_REVIEW_CLEAR_FIELDS);
+        // Clears the needs_review bookmark too (lib/needsReview.js) --
+        // but ONLY when hc_email is actually one of the fields this Apply
+        // just changed, not on any successful Apply. Caught the gap live
+        // on Run #36 (school 3977, Estrella Foothills): the AI confirmed a
+        // new coach name/office/Twitter but found no replacement for the
+        // already-confirmed-dead email, so hc_email was left untouched --
+        // yet the old unconditional version cleared needs_review anyway
+        // because *some* field changed, silently dropping a still-broken
+        // email out of the Needs Review queue. A Quick Fix save (saveEdit)
+        // and Import & Reconcile stay unconditional -- there a human is
+        // reading the flag's own note and deciding by hand whether it's
+        // resolved, which this AI-suggestion Apply path can't claim.
+        if (update.hc_email) {
+          Object.assign(update, NEEDS_REVIEW_CLEAR_FIELDS);
+        }
         const { error: updateErr } = await supabase.from("schools").update(update).eq("id", s.id);
         if (updateErr) throw updateErr;
         // changes can be empty here (e.g. the suggestion matched what was
@@ -1334,10 +1343,13 @@ function BatchCoachInfoPageInner() {
           update.verification_status = "verified";
           update.last_verified_at = new Date().toISOString();
         }
-        // Same needs_review clear as applySuggestionCore above -- a
-        // reviewed CSV row landing a real change on the school counts as
-        // "someone just fixed it" too.
-        Object.assign(update, NEEDS_REVIEW_CLEAR_FIELDS);
+        // Same needs_review clear as applySuggestionCore above, same fix --
+        // only when hc_email is actually one of the fields this row
+        // changed, not on any change (see the comment above that one for
+        // what went wrong when this was unconditional).
+        if (update.hc_email) {
+          Object.assign(update, NEEDS_REVIEW_CLEAR_FIELDS);
+        }
         const { error: updateErr } = await supabase.from("schools").update(update).eq("id", s.id);
         if (updateErr) throw updateErr;
         if (changes.length > 0) {
