@@ -13,6 +13,7 @@ import {
   ALL_FIELDS,
   BUCKET_LABELS,
 } from "@/lib/importReconcile";
+import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
 
 const PAGE_SIZE = 1000;
 const BATCH_SIZE = 300;
@@ -304,7 +305,12 @@ export default function ImportReconcilePage() {
     setRowError((p) => ({ ...p, [row.id]: null }));
     try {
       const now = new Date().toISOString();
-      const update = { verification_status: "verified", last_verified_at: now };
+      // Reviewing an import row and applying it is the same "someone just
+      // fixed it" signal Quick Fix and batch-tool Apply already clear
+      // needs_review for (lib/needsReview.js) -- a school landing here via
+      // a bounce-recovery CSV shouldn't keep sitting in the Needs Review
+      // queue once its fields are actually applied.
+      const update = { verification_status: "verified", last_verified_at: now, ...NEEDS_REVIEW_CLEAR_FIELDS };
       const logs = [];
       fieldsToApply.forEach((f) => {
         update[f.field] = f.new;
