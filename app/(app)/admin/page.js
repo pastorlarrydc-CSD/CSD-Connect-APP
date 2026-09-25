@@ -297,6 +297,9 @@ export default function AdminPage() {
               <Link href="/admin/needs-review" className="btn btn-sm btn-primary" style={{ marginRight: 8 }}>
                 Needs Review
               </Link>
+              <Link href="/admin/dead-email-recovery" className="btn btn-sm btn-gold" style={{ marginRight: 8 }}>
+                Dead Email Recovery
+              </Link>
               <Link href="/admin/state-progress" className="btn btn-sm btn-gold">
                 State Progress
               </Link>
