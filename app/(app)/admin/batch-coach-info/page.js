@@ -6,6 +6,7 @@ import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 import { fetchAllTouchedSchoolIds } from "@/lib/batchExclusion";
+import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
 
 // Overnight Coach-Info Batch API job -- see the batch-coach-info-discovery
 // spec doc in the project for the full plan this implements. Turns the
@@ -1254,6 +1255,12 @@ function BatchCoachInfoPageInner() {
         update.last_verified_at = new Date().toISOString();
       }
       if (Object.keys(update).length > 0) {
+        // A human clicking Apply here is the same "someone just fixed it"
+        // signal as a Quick Fix save on the school's own profile -- clears
+        // the needs_review bookmark too (lib/needsReview.js), not just
+        // verification_status, so a bounce-recovery school doesn't keep
+        // sitting in the Needs Review queue after its suggestion is applied.
+        Object.assign(update, NEEDS_REVIEW_CLEAR_FIELDS);
         const { error: updateErr } = await supabase.from("schools").update(update).eq("id", s.id);
         if (updateErr) throw updateErr;
         // changes can be empty here (e.g. the suggestion matched what was
@@ -1327,6 +1334,10 @@ function BatchCoachInfoPageInner() {
           update.verification_status = "verified";
           update.last_verified_at = new Date().toISOString();
         }
+        // Same needs_review clear as applySuggestionCore above -- a
+        // reviewed CSV row landing a real change on the school counts as
+        // "someone just fixed it" too.
+        Object.assign(update, NEEDS_REVIEW_CLEAR_FIELDS);
         const { error: updateErr } = await supabase.from("schools").update(update).eq("id", s.id);
         if (updateErr) throw updateErr;
         if (changes.length > 0) {
