@@ -937,32 +937,37 @@ function BatchCoachInfoPageInner() {
           return;
         }
       } else if (candidateMode === "bounce_recovery") {
-        // Sourced from email_bounce_events instead of the schools table
-        // directly -- a durable record of on-file emails confirmed dead
-        // (today seeded from Larry's Sept 2026 HS Coach Newsletter #1 hard-
-        // bounce report; see the bounce-recovery feature's project doc).
-        // Designed to also be written to later by the automated
-        // Resend-webhook bounce-tracking feature (see
-        // claude/bounce-tracking-auto-flag-spec.md), so this mode keeps
-        // working unchanged once that ships. Same touchedIds exclusion
-        // every other mode below uses: a school already applied, skipped,
-        // or attempted here before -- through THIS mode or any other -- is
-        // left out, so each bounced school only ever surfaces once.
-        // Paginated -- see lib/batchExclusion.js's own comment for why an
-        // unpaginated select silently drops rows once this table passes
-        // 1000 and can't be trusted to exclude everything it should.
+        // Sourced from the dead_email_schools view (migration
+        // create_dead_email_schools_view -- see Dead Email Recovery,
+        // claude/batch-exclusion-row-cap-bug-fix.md Part 7) instead of a raw
+        // email_bounce_events read. The view checks each school's CURRENT
+        // hc_email against its most recent bounce record, so a school
+        // already fixed some other way -- a Quick Fix save, Import &
+        // Reconcile, or a direct manual correction, none of which ever
+        // touch email_bounce_events -- never gets offered here wasting an
+        // AI lookup rediscovering something already solved. Caught this
+        // gap live: Asheville HS (school 440) was fixed by hand outside
+        // the batch tool entirely, and the old raw-table query would have
+        // kept treating it as an open candidate forever, since nothing in
+        // email_bounce_events itself ever re-checks the live email. Same
+        // touchedIds exclusion every other mode below uses: a school
+        // already applied, skipped, or attempted here before -- through
+        // THIS mode or any other -- is left out, so each bounced school
+        // only ever surfaces once through a NORMAL run here. (Dead Email
+        // Recovery's own retry action deliberately bypasses this
+        // exclusion for its "stuck" schools -- see that page.)
         const excludedIds = await fetchAllTouchedSchoolIds(supabase, "coach_info_batch_items");
 
-        const { data: bounceRows, error: bounceErr } = await supabase
-          .from("email_bounce_events")
-          .select("school_id,school:schools(id,name,city,state,is_closed)")
-          .order("id", { ascending: true })
+        const { data: deadRows, error: deadErr } = await supabase
+          .from("dead_email_schools")
+          .select("school_id,name,city,state")
+          .order("school_id", { ascending: true })
           .limit(targetCount * 3);
-        if (bounceErr) throw bounceErr;
+        if (deadErr) throw deadErr;
 
-        let candidates = (bounceRows || [])
-          .filter((r) => r.school && !r.school.is_closed && !excludedIds.has(r.school_id))
-          .map((r) => ({ id: r.school.id, name: r.school.name, city: r.school.city, state: r.school.state }));
+        let candidates = (deadRows || [])
+          .filter((r) => !excludedIds.has(r.school_id))
+          .map((r) => ({ id: r.school_id, name: r.name, city: r.city, state: r.state }));
 
         if (scopeMode !== "all" || states.length) {
           const stateSet = new Set(states);
@@ -972,7 +977,7 @@ function BatchCoachInfoPageInner() {
         schoolsData = candidates.slice(0, targetCount);
         if (!schoolsData || schoolsData.length === 0) {
           setCreateError(
-            "No bounced-email schools matched -- everyone in this scope has already been through this tool before, or there's nothing left in the bounce list for this scope."
+            "No bounced-email schools matched -- everyone in this scope has already been through this tool before, already had their email fixed another way, or there's nothing left in the bounce list for this scope."
           );
           return;
         }
