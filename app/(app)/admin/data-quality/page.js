@@ -6,6 +6,7 @@ import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 import { classifySchools, classifySchool, isBlank, hasFullCoachRecord } from "@/lib/dataQuality";
 import { phoneDigits, socialHandleKey, resolveCoachNameAt } from "@/lib/coachHistory";
+import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
 
 const PAGE_SIZE = 1000;
 const DISPLAY_CAP = 200;
@@ -2964,7 +2965,11 @@ export default function DataQualityPage() {
   // review queue, since the reviewer IS the one making the fix here) and
   // marks the record verified, same bookkeeping as the bulk-update tool:
   // a school_change_log row per changed field. Also clears any pending
-  // "possibly outdated" flags on this school, since a human just fixed it.
+  // "possibly outdated" flags on this school (school_flags, via
+  // resolvePendingFlags below) AND the separate needs_review bookmark
+  // (NEEDS_REVIEW_CLEAR_FIELDS, lib/needsReview.js) -- both are "a human
+  // just fixed it" signals, and a reviewer saving a Quick Fix here counts
+  // as exactly that for either one.
   async function saveEdit(school) {
     setSaving(school.id);
     setSaveError("");
@@ -2972,7 +2977,7 @@ export default function DataQualityPage() {
       const before = school;
       const isCoachChange = coachChangeFrom?.id === before.id;
       const changes = [];
-      const update = { verification_status: "verified", last_verified_at: new Date().toISOString() };
+      const update = { verification_status: "verified", last_verified_at: new Date().toISOString(), ...NEEDS_REVIEW_CLEAR_FIELDS };
       EDIT_FIELDS.forEach(([field]) => {
         // Defensive default: a browser can still be holding an older cached
         // editValues object (see the Find & Edit a School persistence
