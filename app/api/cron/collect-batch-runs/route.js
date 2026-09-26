@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
-import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion, autoConfirmNoDataAvailable, runWithConcurrency } from "@/lib/coachInfoLookup";
+import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion, autoConfirmNoDataAvailable, runWithConcurrency, findDuplicateNameSchoolsForMany } from "@/lib/coachInfoLookup";
 import { normalizeAthleticsSuggestion } from "@/lib/athleticsLookup";
 import { normalizeMaxPrepsSuggestion } from "@/lib/maxPrepsLookup";
 import { normalizeSocialSuggestion } from "@/lib/socialLookup";
@@ -283,20 +283,33 @@ export async function GET(req) {
         // coach_info auto-applies, athletics/maxpreps/social auto-confirm
         // "no data" -- both need a school_id per item, since a result line
         // itself only carries the item id. One query for the whole run
-        // instead of one per item. Also embeds each item's school city/state
-        // (via the school_id -> schools FK) for coach_info specifically --
-        // normalizeSuggestion's same-name-school confidence backstop needs
-        // it, and coach_info's is the one collect path that writes a
-        // specific value to the schools table with zero human review, so
-        // it's the most important place for that backstop to actually run.
+        // instead of one per item. Also embeds each item's school
+        // name/city/state (via the school_id -> schools FK) for coach_info
+        // specifically -- normalizeSuggestion's same-name-school confidence
+        // backstops need it, and coach_info's is the one collect path that
+        // writes a specific value to the schools table with zero human
+        // review, so it's the most important place for those backstops to
+        // actually run.
         let schoolIdByItemId = null;
         let schoolLocationByItemId = null;
         if (tool.autoApplyHighConfidence || tool.notAvailableField) {
-          const selectCols = tool.key === "coach_info" ? "id,school_id,school:schools(city,state)" : "id,school_id";
+          const selectCols = tool.key === "coach_info" ? "id,school_id,school:schools(name,city,state)" : "id,school_id";
           const { data: itemRows } = await supabase.from(tool.itemsTable).select(selectCols).eq("batch_run_id", run.id);
           schoolIdByItemId = new Map((itemRows || []).map((r) => [r.id, r.school_id]));
           if (tool.key === "coach_info") {
-            schoolLocationByItemId = new Map((itemRows || []).map((r) => [r.id, r.school]));
+            // hasKnownDuplicates per school -- one query for the whole run
+            // (see findDuplicateNameSchoolsForMany's own comment), same
+            // pattern as the manual collect route. This is the unattended
+            // auto-apply path, so it's the single most important place for
+            // this backstop to actually catch something before it writes
+            // to the schools table with nobody watching.
+            const duplicateMap = await findDuplicateNameSchoolsForMany({
+              supabase,
+              schools: (itemRows || []).map((r) => ({ id: r.school_id, name: r.school?.name })),
+            });
+            schoolLocationByItemId = new Map(
+              (itemRows || []).map((r) => [r.id, { ...(r.school || {}), hasKnownDuplicates: duplicateMap.get(r.school_id) || false }])
+            );
           }
         }
 
