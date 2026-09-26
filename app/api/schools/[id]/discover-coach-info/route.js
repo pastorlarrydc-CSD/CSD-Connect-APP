@@ -229,7 +229,14 @@ export async function POST(req, { params }) {
       return NextResponse.json({ error: "Could not parse the AI response. Please try again." }, { status: 502 });
     }
 
-    return NextResponse.json(normalizeSuggestion(parsed, defaultSource, { city: school.city, state: school.state }));
+    // hasKnownDuplicates -- see targetLocationConfirmed's own comment in
+    // lib/coachInfoLookup.js: lets normalizeSuggestion catch a same-name
+    // mix-up (Columbia HS, SC vs. Huntsville, AL) even when the model never
+    // names the WRONG place outright, which otherStatesMentioned alone
+    // can't do.
+    return NextResponse.json(
+      normalizeSuggestion(parsed, defaultSource, { city: school.city, state: school.state, hasKnownDuplicates: duplicateSchools.length > 0 })
+    );
   } catch (err) {
     console.error("discover-coach-info error", err);
     return NextResponse.json({ error: "Could not look up coach info right now. Please try again." }, { status: 500 });
