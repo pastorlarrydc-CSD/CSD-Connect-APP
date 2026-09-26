@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
-import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion, runWithConcurrency } from "@/lib/coachInfoLookup";
+import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion, runWithConcurrency, findDuplicateNameSchoolsForMany } from "@/lib/coachInfoLookup";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
 
@@ -93,13 +93,23 @@ export async function POST(req, { params }) {
 
     // Needed to auto-apply below (a result line only carries an item id, not
     // the school it belongs to) -- one query for the whole run instead of
-    // one per item. Also embeds each item's school city/state (via the
+    // one per item. Also embeds each item's school name/city/state (via the
     // school_id -> schools FK) so normalizeSuggestion's same-name-school
-    // backstop below has something to check the AI's answer against --
+    // backstops below have something to check the AI's answer against --
     // see that function's own comment in lib/coachInfoLookup.js.
-    const { data: itemRows } = await supabase.from("coach_info_batch_items").select("id,school_id,school:schools(city,state)").eq("batch_run_id", runId);
+    const { data: itemRows } = await supabase.from("coach_info_batch_items").select("id,school_id,school:schools(name,city,state)").eq("batch_run_id", runId);
     const schoolIdByItemId = new Map((itemRows || []).map((r) => [r.id, r.school_id]));
-    const schoolLocationByItemId = new Map((itemRows || []).map((r) => [r.id, r.school]));
+    // hasKnownDuplicates per school -- one query for the whole run (see
+    // findDuplicateNameSchoolsForMany's own comment) rather than one per
+    // item, folded into the same location object normalizeSuggestion
+    // already expects.
+    const duplicateMap = await findDuplicateNameSchoolsForMany({
+      supabase,
+      schools: (itemRows || []).map((r) => ({ id: r.school_id, name: r.school?.name })),
+    });
+    const schoolLocationByItemId = new Map(
+      (itemRows || []).map((r) => [r.id, { ...(r.school || {}), hasKnownDuplicates: duplicateMap.get(r.school_id) || false }])
+    );
 
     // Each result line updates an EXISTING item row (created back in the
     // "start run" step, one per school) -- so this is always an update,
