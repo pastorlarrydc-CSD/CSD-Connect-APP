@@ -60,6 +60,15 @@ export default function ImportReconcilePage() {
   const [committing, setCommitting] = useState(false);
   const [commitError, setCommitError] = useState("");
 
+  // "Paste research text (AI-parsed)" -- an alternative to Step 2's CSV
+  // upload, not a separate tool. See handlePasteParse below: it produces
+  // the exact same `preview` shape handleFileChange does, so everything
+  // from here down (the preview card, commitBatch, and the whole review
+  // screen) is unmodified and shared between both entry points.
+  const [pasteText, setPasteText] = useState("");
+  const [parsingPaste, setParsingPaste] = useState(false);
+  const [pasteError, setPasteError] = useState("");
+
   // Review screen (an opened, already-saved batch).
   const [selectedBatch, setSelectedBatch] = useState(null);
   const [rows, setRows] = useState([]);
@@ -208,6 +217,85 @@ export default function ImportReconcilePage() {
       setUploadError(err.message || "Could not read this file.");
     } finally {
       setUploading(false);
+    }
+  }
+
+  // Alternative to handleFileChange above: instead of a CSV, a reviewer
+  // pastes free-text research (their own -- see lib/bulkPasteParse.js's
+  // system prompt, which explicitly never searches or verifies, only
+  // structures). The AI-parse API route returns rows already in canonical
+  // field form, so from here it's the SAME matching pass handleFileChange
+  // runs -- same fetchAllSchools/existingByKey construction, same
+  // categorizeRow() call, same duplicate_in_file check -- just skipping the
+  // CSV-header-mapping step, which doesn't apply here. That's deliberate:
+  // a pasted school gets the identical same-name-school ambiguity handling
+  // and conflict-vs-new-info bucketing a CSV row gets, with no separate
+  // backstop logic needed in this function.
+  async function handlePasteParse() {
+    const text = pasteText.trim();
+    if (!text) {
+      setPasteError("Paste some research text first.");
+      return;
+    }
+    resetUpload();
+    setParsingPaste(true);
+    setPasteError("");
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const res = await fetch("/api/admin/bulk-parse", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session?.access_token}` },
+        body: JSON.stringify({ text }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || "Could not parse this text.");
+      const parsedSchools = json.schools || [];
+      if (!parsedSchools.length) throw new Error("Didn't find any school with both a name and a state in that text.");
+
+      const schools = await fetchAllSchools();
+      const existingById = new Map(schools.map((s) => [String(s.id), s]));
+      const existingByKey = new Map();
+      schools.forEach((s) => {
+        const key = matchKey(s.name, s.state);
+        if (!existingByKey.has(key)) existingByKey.set(key, []);
+        existingByKey.get(key).push(s);
+      });
+
+      const seenInFile = new Map();
+      const built = parsedSchools.map((s, i) => {
+        const { source_excerpt, notes, ...mapped } = s;
+        const result = categorizeRow(mapped, { existingById, existingByKey });
+
+        let duplicateInFile = false;
+        if (result.bucket === "new_school" && mapped.name && mapped.state) {
+          const key = matchKey(mapped.name, mapped.state);
+          if (seenInFile.has(key)) duplicateInFile = true;
+          seenInFile.set(key, true);
+        }
+
+        return {
+          row_index: i + 1,
+          label: mapped.name || `School ${i + 1}`,
+          raw_row: s, // kept whole (including source_excerpt/notes) for the audit trail and for RowCard's "AI parsing note" display below
+          mapped_data: mapped,
+          ...result,
+          duplicate_in_file: duplicateInFile,
+        };
+      });
+
+      const summary = {};
+      BUCKET_ORDER.forEach((b) => {
+        summary[b] = built.filter((r) => r.bucket === b).length;
+      });
+
+      setFileName(`Pasted research (AI-parsed) — ${new Date().toLocaleString()}`);
+      setPreview({ rows: built, columnMapping: { _source: "ai_paste_parse" }, summary });
+    } catch (err) {
+      setPasteError(err.message || "Could not parse this text.");
+    } finally {
+      setParsingPaste(false);
     }
   }
 
@@ -745,6 +833,27 @@ export default function ImportReconcilePage() {
         </div>
       </div>
 
+      <div className="card" style={{ marginBottom: 14 }}>
+        <h3>Or paste research text (AI-parsed)</h3>
+        <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
+          Paste any research you&apos;ve already done — one school or several, in whatever shape it&apos;s in. The AI only structures what you pasted into rows below; it never
+          searches the web or adds anything you didn&apos;t already write. Everything it finds still runs through the exact same matching and conflict checks as a CSV upload
+          before anything is saved — nothing is applied automatically.
+        </p>
+        {pasteError && <div className="notice danger" style={{ marginBottom: 10 }}>{pasteError}</div>}
+        <textarea
+          value={pasteText}
+          onChange={(e) => setPasteText(e.target.value)}
+          placeholder="Paste research for one or more schools here…"
+          rows={8}
+          style={{ width: "100%", fontFamily: "inherit", fontSize: 13, padding: 10, marginBottom: 10, boxSizing: "border-box" }}
+          disabled={parsingPaste}
+        />
+        <button className="btn btn-primary btn-sm" onClick={handlePasteParse} disabled={parsingPaste || !pasteText.trim()}>
+          {parsingPaste ? "Parsing…" : "Parse with AI"}
+        </button>
+      </div>
+
       {preview && (
         <div className="card" style={{ marginBottom: 14 }}>
           <h3>Preview — {fileName}</h3>
@@ -828,6 +937,17 @@ function RowCard({ row, busy, error, selection, onToggleField, onApplyNewInfo, o
           </span>
         )}
       </div>
+
+      {row.raw_row?.notes && (
+        <div style={{ fontSize: 12, color: "#8a6d3b", marginTop: 6 }}>
+          ⚠️ AI parsing note: {row.raw_row.notes}
+        </div>
+      )}
+      {row.raw_row?.source_excerpt && (
+        <div style={{ fontSize: 11.5, color: "#697386", marginTop: 4, fontStyle: "italic" }}>
+          Parsed from: &quot;{row.raw_row.source_excerpt}&quot;
+        </div>
+      )}
 
       {error && <div className="notice danger" style={{ marginTop: 8, fontSize: 12.5 }}>{error}</div>}
 
