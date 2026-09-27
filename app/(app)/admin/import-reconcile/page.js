@@ -30,6 +30,36 @@ const SCHOOL_SELECT_COLUMNS = [
   ...DIFF_FIELDS.map(([f]) => f),
 ].join(",");
 
+// Larry asked for this page to "stay open" across a navigation away and
+// back -- the review screen on an opened batch was resetting to the batch
+// list on every same-tab remount, and worse, an AI-parsed preview that
+// hadn't been saved yet (see handlePasteParse) was lost outright, with no
+// way to recover it short of re-pasting and re-parsing. Same session-scoped
+// "where was I" caching Data Quality already uses (SCAN_CACHE_KEY,
+// QUICKFIX_CACHE_KEY, etc.) -- see the two effects below for how it's read
+// and written, and readImportReconcileCache's comment for the restore
+// approach.
+const IMPORT_RECONCILE_CACHE_KEY = "csd_import_reconcile_cache_v1";
+
+// Reads IMPORT_RECONCILE_CACHE_KEY synchronously, for use as a useState
+// lazy initializer for `preview`/`fileName` below -- the uncommitted-preview
+// half of this cache needs no network call to restore, so it's read the
+// same race-free way Data Quality's PAGE_TAB_CACHE_KEY is (see that
+// constant's own comment for why an effect-based restore of state a write
+// effect also touches on mount is the wrong approach). `selectedBatch`
+// can't be restored this way -- reopening a saved batch needs a fetch --
+// so that half is restored via a plain mount effect further down instead,
+// the same way Data Quality's SCAN_CACHE_KEY restores its own bigger,
+// already-local `result` object.
+function readImportReconcileCache() {
+  try {
+    const raw = sessionStorage.getItem(IMPORT_RECONCILE_CACHE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
 function downloadBlob(text, filename) {
   const blob = new Blob([text], { type: "text/csv;charset=utf-8;" });
   const url = URL.createObjectURL(blob);
@@ -52,11 +82,14 @@ export default function ImportReconcilePage() {
   const [loadingBatches, setLoadingBatches] = useState(true);
   const [batchesError, setBatchesError] = useState("");
 
-  // Upload/preview (before anything is saved to the database).
-  const [fileName, setFileName] = useState("");
+  // Upload/preview (before anything is saved to the database). fileName and
+  // preview are lazy-initialized from IMPORT_RECONCILE_CACHE_KEY (see that
+  // constant's comment) so an uncommitted AI-parsed or CSV preview survives
+  // a same-tab remount instead of being lost with no way to recover it.
+  const [fileName, setFileName] = useState(() => readImportReconcileCache()?.fileName || "");
   const [uploading, setUploading] = useState(false);
   const [uploadError, setUploadError] = useState("");
-  const [preview, setPreview] = useState(null); // { rows, columnMapping, summary }
+  const [preview, setPreview] = useState(() => readImportReconcileCache()?.preview || null); // { rows, columnMapping, summary }
   const [committing, setCommitting] = useState(false);
   const [commitError, setCommitError] = useState("");
 
@@ -106,6 +139,56 @@ export default function ImportReconcilePage() {
   useEffect(() => {
     loadBatches();
   }, [loadBatches]);
+
+  // Restores an open review screen on mount -- the other half of
+  // IMPORT_RECONCILE_CACHE_KEY, the one that needs a fetch (openBatch) so it
+  // can't be a plain useState lazy initializer the way fileName/preview
+  // above are. Only acts when there's no cached preview to restore instead
+  // (a preview always means the batch below it hasn't been saved yet, so it
+  // takes priority -- see the write effect's own priority for why the two
+  // never really coexist in practice). openBatch always picks its own
+  // "first bucket with pending work" default for activeBucket, so the
+  // cached bucket -- if it's still a real tab -- is applied right after,
+  // overriding that default with wherever Larry actually was.
+  useEffect(() => {
+    const cached = readImportReconcileCache();
+    if (!cached?.selectedBatchId || cached.preview) return;
+    openBatch(cached.selectedBatchId).then(() => {
+      if (cached.activeBucket && BUCKET_ORDER.includes(cached.activeBucket)) setActiveBucket(cached.activeBucket);
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Keeps IMPORT_RECONCILE_CACHE_KEY in sync with whichever half of the page
+  // is actually live. Guards on "nothing to restore yet" (mirroring Data
+  // Quality's SCAN_CACHE_KEY write effect) rather than firing unconditionally
+  // on every render: on the very first mount, before the restore effect
+  // above has had a chance to run its async openBatch fetch, selectedBatch
+  // is still null here -- if preview is ALSO empty (nothing was cached for
+  // it either), writing now would clobber a cached selectedBatchId before
+  // it's ever read back. Once either half becomes real (a fresh preview, an
+  // opened batch, or the restore completing), this fires normally.
+  useEffect(() => {
+    if (!preview && !selectedBatch) return;
+    try {
+      sessionStorage.setItem(
+        IMPORT_RECONCILE_CACHE_KEY,
+        JSON.stringify({
+          // Only one half is ever meaningful at a time -- the landing
+          // screen's uncommitted preview, or an opened batch's review
+          // screen -- so the other is always nulled out here rather than
+          // left stale from whichever came before it.
+          preview: selectedBatch ? null : preview,
+          fileName: selectedBatch ? null : fileName,
+          selectedBatchId: selectedBatch?.id ?? null,
+          activeBucket: selectedBatch ? activeBucket : null,
+        })
+      );
+    } catch {
+      // Storage full/unavailable -- this tab just won't survive a
+      // navigation away and back. Not worth surfacing an error for.
+    }
+  }, [preview, selectedBatch, fileName, activeBucket]);
 
   const fetchAllSchools = useCallback(async () => {
     const out = [];
@@ -159,6 +242,15 @@ export default function ImportReconcilePage() {
     setCommitError("");
     setFileName("");
     if (fileInputRef.current) fileInputRef.current.value = "";
+    // Explicit clear rather than waiting for the write effect to catch up --
+    // starting a fresh upload/paste (or successfully committing one, which
+    // also calls this) means whatever was cached before is done with, so
+    // there's nothing to protect a stale copy of.
+    try {
+      sessionStorage.removeItem(IMPORT_RECONCILE_CACHE_KEY);
+    } catch {
+      // Storage unavailable -- nothing to clean up.
+    }
   }
 
   async function handleFileChange(e) {
@@ -371,6 +463,15 @@ export default function ImportReconcilePage() {
     setRows([]);
     setRowError({});
     loadBatches();
+    // Explicit clear -- clicking "Back to Import & Reconcile" is a
+    // deliberate "I'm done with this batch for now" action, so a later
+    // navigation away and back should land on the plain batch list, not
+    // silently reopen the batch Larry just chose to leave.
+    try {
+      sessionStorage.removeItem(IMPORT_RECONCILE_CACHE_KEY);
+    } catch {
+      // Storage unavailable -- nothing to clean up.
+    }
   }
 
   function patchRow(id, patch) {
