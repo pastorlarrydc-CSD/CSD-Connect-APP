@@ -22,7 +22,7 @@ const ALLOWED_FIELDS = [
   "hc_email",
   "hc_cell",
   "hc_office",
-  "x_twitter",
+  "hc_twitter",
 ];
 
 const IMPORT_BATCH_SIZE = 300;
@@ -44,7 +44,7 @@ const HEADER_ALIASES = {
   hc_email: ["hc email", "head coach email", "coach email", "email"],
   hc_cell: ["hc cell", "head coach cell", "coach cell", "cell", "phone cell"],
   hc_office: ["hc office", "head coach office", "coach office", "office"],
-  x_twitter: ["x twitter", "x (twitter)", "twitter", "x"],
+  hc_twitter: ["x twitter", "x (twitter)", "twitter", "x", "hc twitter"],
 };
 
 function normalizeHeaderText(v) {
@@ -259,7 +259,7 @@ export default function BulkAddSchoolsPage() {
           hc_email: trimStr(row.hc_email) || null,
           hc_cell: trimStr(row.hc_cell) || null,
           hc_office: trimStr(row.hc_office) || null,
-          x_twitter: trimStr(row.x_twitter) || null,
+          hc_twitter: trimStr(row.hc_twitter) || null,
           _label: label,
           _city: trimStr(row.city),
           possibleDuplicate: duplicateOf,
