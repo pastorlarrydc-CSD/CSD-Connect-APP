@@ -5,7 +5,7 @@ import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 import { classifySchools, classifySchool, isBlank, hasFullCoachRecord } from "@/lib/dataQuality";
-import { phoneDigits, socialHandleKey, resolveCoachNameAt } from "@/lib/coachHistory";
+import { phoneDigits, socialHandleKey, resolveCoachNameAt, resolveFieldValueAt } from "@/lib/coachHistory";
 import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
 
 const PAGE_SIZE = 1000;
@@ -674,6 +674,29 @@ export default function DataQualityPage() {
   // other card here rather than waiting to be searched for.
   const [duplicateCells, setDuplicateCells] = useState([]);
   const [loadingDuplicateCells, setLoadingDuplicateCells] = useState(true);
+  // Every currently-live hc_cell at an open school, grouped by digits-only
+  // value -- the SAME grouping loadDuplicateCells already builds for itself
+  // (see that function), just kept around unfiltered (including
+  // digit-groups with only ONE school on them right now) instead of
+  // discarded after the 2+-schools filter. The Coach Change Outreach List
+  // below needs exactly this: "does a departed coach's old cell match any
+  // school's CURRENT cell right now," which is true even when only one
+  // other school currently has it -- a case Duplicate Cell Numbers
+  // deliberately doesn't surface, since one school having a number isn't
+  // an integrity problem, but IS exactly what outreach wants to find.
+  const [liveCellsByDigits, setLiveCellsByDigits] = useState(new Map());
+
+  // Coach Change Outreach List -- Larry's ask: when a school's head coach
+  // changes, the OLD coach's cell number is worth keeping around, because
+  // that same person often turns up as the head coach somewhere else --
+  // and if their personal cell traveled with them, it'll show up as
+  // another school's CURRENT live cell. This card surfaces that match (or
+  // just the retained old cell on its own, if no match has shown up yet)
+  // so Larry can copy the number and text the coach himself -- no Twilio
+  // integration, per his own call not to set one up right now.
+  const [outreachCopiedKey, setOutreachCopiedKey] = useState("");
+  const [outreachExporting, setOutreachExporting] = useState(false);
+  const [outreachExportError, setOutreachExportError] = useState("");
 
   // Social Handle Lookup -- same reverse search as Cell Number Lookup
   // above, for a Twitter/X or Facebook handle/URL instead of a phone
@@ -893,7 +916,7 @@ export default function DataQualityPage() {
     setLoadingCoachChanges(true);
     const { data } = await supabase
       .from("school_change_log")
-      .select("id, school_id, field_name, old_value, new_value, source, changed_at, schools(name,city,state,hc_first_name,hc_last_name)")
+      .select("id, school_id, field_name, old_value, new_value, source, changed_at, schools(name,city,state,hc_first_name,hc_last_name,hc_cell)")
       .in("field_name", COACH_CHANGE_TRACKED_FIELDS)
       .order("changed_at", { ascending: false })
       .limit(2000);
@@ -957,6 +980,11 @@ export default function DataQualityPage() {
       .filter(([, schools]) => new Set(schools.map((s) => s.id)).size >= 2)
       .map(([digits, schools]) => ({ digits, schools }));
     setDuplicateCells(dupes);
+    // Kept unfiltered (see liveCellsByDigits above) for the Coach Change
+    // Outreach List's own cross-reference, which cares about a match at
+    // even one other school -- not just the 2+-schools case this card
+    // itself flags as a duplicate.
+    setLiveCellsByDigits(groups);
     setLoadingDuplicateCells(false);
   }, [supabase, canReview]);
 
@@ -1214,6 +1242,62 @@ export default function DataQualityPage() {
   const recentCoachChangeBySchool = new Map();
   coachChanges.forEach((g) => {
     if (!recentCoachChangeBySchool.has(g.school_id)) recentCoachChangeBySchool.set(g.school_id, g);
+  });
+
+  // Coach Change Outreach List -- see liveCellsByDigits/outreachCopiedKey
+  // above. One entry per school's MOST RECENT genuine coach turnover (a
+  // save where hc_first_name or hc_last_name actually changed FROM a real
+  // prior value -- filling in a name that was blank before doesn't count;
+  // that's "entered for the first time," not "the coach changed"), with:
+  //   - the departed coach's name and cell, reconstructed via
+  //     resolveCoachNameAt/resolveFieldValueAt (lib/coachHistory.js) at
+  //     one millisecond BEFORE this save's own changed_at -- so a cell
+  //     that was ALSO updated in this exact same save (e.g. Mark Coach
+  //     Change updating name and cell together) still resolves to the OLD
+  //     cell, not the new one logged a millisecond "later" at the same
+  //     timestamp.
+  //   - the current coach's name and cell, straight off the school's live
+  //     row (g.schools) -- correct as long as nothing's changed since,
+  //     which holds here since this is that school's most recent logged
+  //     change.
+  //   - any OTHER school currently showing that same old cell live right
+  //     now (liveCellsByDigits) -- the strongest signal the departed coach
+  //     actually landed there as head coach.
+  // Entries with no reconstructable old cell at all are skipped -- nothing
+  // to copy or text in that case.
+  const seenOutreachSchool = new Set();
+  const coachChangeOutreach = [];
+  coachChanges.forEach((g) => {
+    if (seenOutreachSchool.has(g.school_id)) return; // only the most recent turnover per school
+    const oldFirst = (g.fields.find((f) => f.field_name === "hc_first_name")?.old_value || "").trim();
+    const newFirst = (g.fields.find((f) => f.field_name === "hc_first_name")?.new_value || "").trim();
+    const oldLast = (g.fields.find((f) => f.field_name === "hc_last_name")?.old_value || "").trim();
+    const newLast = (g.fields.find((f) => f.field_name === "hc_last_name")?.new_value || "").trim();
+    const isRealTurnover =
+      (oldFirst && oldFirst.toLowerCase() !== newFirst.toLowerCase()) || (oldLast && oldLast.toLowerCase() !== newLast.toLowerCase());
+    if (!isRealTurnover) return;
+    seenOutreachSchool.add(g.school_id);
+
+    const rawRows = coachChangeRawBySchool.get(g.school_id) || [];
+    const justBefore = new Date(g.changed_at).getTime() - 1;
+    const departedName = resolveCoachNameAt(rawRows, justBefore, g.schools);
+    const departedCell = resolveFieldValueAt(rawRows, "hc_cell", justBefore, g.schools?.hc_cell);
+    if (!departedCell) return; // nothing to copy/text
+
+    const digits = phoneDigits(departedCell);
+    const elsewhere = digits.length >= 7 ? (liveCellsByDigits.get(digits) || []).filter((s) => s.id !== g.school_id) : [];
+
+    coachChangeOutreach.push({
+      key: `${g.school_id}|${g.changed_at}`,
+      school_id: g.school_id,
+      schools: g.schools,
+      changed_at: g.changed_at,
+      departedName,
+      departedCell,
+      newName: [g.schools?.hc_first_name, g.schools?.hc_last_name].filter(Boolean).join(" ").trim() || null,
+      newCell: g.schools?.hc_cell || "",
+      elsewhere,
+    });
   });
 
   const loadMyUpdates = useCallback(async () => {
@@ -1941,6 +2025,58 @@ export default function DataQualityPage() {
       setCoachChangeExportError(err.message || "Could not export this list.");
     } finally {
       setCoachChangeExporting(false);
+    }
+  }
+
+  // Copies one Coach Change Outreach List cell number to the clipboard --
+  // same navigator.clipboard convention used for the webhook secret on the
+  // Integrations page -- and flips the button to "Copied!" for a couple
+  // seconds so Larry gets feedback on which row he just grabbed before he
+  // switches over to his phone's messaging app to text it.
+  function copyOutreachCell(key, value) {
+    if (!value) return;
+    navigator.clipboard?.writeText(value);
+    setOutreachCopiedKey(key);
+    setTimeout(() => setOutreachCopiedKey((k) => (k === key ? "" : k)), 2000);
+  }
+
+  // Exports the full Coach Change Outreach List (not capped to what's shown
+  // on screen) so Larry can work through it in a spreadsheet instead of
+  // one row at a time here -- same shape as the on-screen card, plus
+  // whichever "elsewhere" school(s) currently show that same cell live.
+  function exportCoachOutreach() {
+    setOutreachExportError("");
+    setOutreachExporting(true);
+    try {
+      const csv = Papa.unparse({
+        fields: [
+          "school_name",
+          "city",
+          "state",
+          "departed_coach",
+          "departed_coach_old_cell",
+          "current_coach",
+          "current_coach_cell",
+          "changed_at",
+          "possibly_now_at",
+        ],
+        data: coachChangeOutreach.map((o) => [
+          o.schools?.name || "",
+          o.schools?.city || "",
+          o.schools?.state || "",
+          o.departedName || "",
+          o.departedCell || "",
+          o.newName || "",
+          o.newCell || "",
+          o.changed_at ? new Date(o.changed_at).toISOString() : "",
+          o.elsewhere.map((s) => `${s.name} (${s.city}, ${s.state})`).join("; "),
+        ]),
+      });
+      downloadBlob(csv, `coach_change_outreach_${new Date().toISOString().slice(0, 10)}.csv`);
+    } catch (err) {
+      setOutreachExportError(err.message || "Could not export this list.");
+    } finally {
+      setOutreachExporting(false);
     }
   }
 
@@ -4567,6 +4703,70 @@ export default function DataQualityPage() {
                 Showing the first 100 of {filteredCoachChanges.length.toLocaleString()} — download the CSV for the full list.
               </div>
             )}
+          </div>
+        )}
+      </div>
+
+      <div className="card" style={{ marginBottom: 14 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+          <div>
+            <h3 style={{ marginBottom: 4 }}>Coach Change Outreach List ({coachChangeOutreach.length})</h3>
+            <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10, maxWidth: 640 }}>
+              Every school's most recent head coach turnover, with the departed coach's old cell number retained so you can copy it and text them directly. When that same number is
+              currently live at another school, it's flagged below — a strong sign that's where they landed as head coach.
+            </p>
+          </div>
+          <button className="btn btn-sm" onClick={exportCoachOutreach} disabled={outreachExporting || coachChangeOutreach.length === 0}>
+            {outreachExporting ? "Exporting…" : "Download CSV"}
+          </button>
+        </div>
+        {outreachExportError && <div className="notice danger" style={{ marginTop: 10 }}>{outreachExportError}</div>}
+        {loadingCoachChanges || loadingDuplicateCells ? (
+          <div className="empty-state" style={{ marginTop: 10 }}>Loading…</div>
+        ) : coachChangeOutreach.length === 0 ? (
+          <div className="empty-state" style={{ marginTop: 10 }}>No coach turnovers with a retained cell number yet.</div>
+        ) : (
+          <div style={{ maxHeight: 360, overflow: "auto", marginTop: 10 }}>
+            {coachChangeOutreach.map((o) => (
+              <div className="log-item" key={o.key} style={{ paddingBottom: 10 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+                  <div style={{ fontSize: 12.5 }}>
+                    <strong>{o.schools?.name}</strong> — {o.schools?.city}, {o.schools?.state}
+                    <div style={{ marginTop: 4 }}>
+                      Departed: <strong>{o.departedName || "Unknown"}</strong>{" "}
+                      <span style={{ color: "#697386" }}>{fmtPhone(o.departedCell)}</span>{" "}
+                      <button
+                        className="btn btn-sm"
+                        style={{ fontSize: 11, padding: "2px 8px" }}
+                        onClick={() => copyOutreachCell(o.key, o.departedCell)}
+                      >
+                        {outreachCopiedKey === o.key ? "Copied!" : "Copy"}
+                      </button>
+                    </div>
+                    <div style={{ marginTop: 2, color: "#697386" }}>
+                      Now: {o.newName || "—"} {o.newCell ? fmtPhone(o.newCell) : "(no cell on file)"}
+                    </div>
+                    {o.elsewhere.length > 0 && (
+                      <div style={{ marginTop: 4, color: "#1e7145" }}>
+                        May now be coaching at:{" "}
+                        {o.elsewhere.map((s, i) => (
+                          <span key={s.id}>
+                            {i > 0 && "; "}
+                            <strong>{s.name}</strong> ({s.city}, {s.state})
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4 }}>
+                    <Link href={`/schools/${o.school_id}`} className="btn btn-sm" target="_blank" rel="noopener noreferrer">Open Profile</Link>
+                    <span style={{ fontSize: 11, color: "#9aa2b1", whiteSpace: "nowrap" }}>
+                      {o.changed_at ? new Date(o.changed_at).toLocaleDateString() : ""}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            ))}
           </div>
         )}
       </div>
