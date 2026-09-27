@@ -28,7 +28,7 @@ const EDIT_FIELDS = [
   ["hc_email", "HC email"],
   ["hc_cell", "HC cell"],
   ["hc_office", "HC office"],
-  ["x_twitter", "X (Twitter)"],
+  ["hc_twitter", "X (Twitter)"],
 ];
 const SELECT_COLUMNS = ["id", ...EDIT_FIELDS.map(([field]) => field)];
 const PAGE_SIZE = 1000;
