@@ -523,7 +523,12 @@ export default function ImportReconcilePage() {
           field_name: f.field,
           old_value: f.old || null,
           new_value: f.new,
-          source: isCoachName ? "Head coach change (manual)" : "Import & Reconcile (CSV)",
+          source:
+            f.kind === "clear"
+              ? "Import & Reconcile (cleared -- stale contact left by a departed coach)"
+              : isCoachName
+              ? "Head coach change (manual)"
+              : "Import & Reconcile (CSV)",
           changed_by: user.id,
         });
       });
@@ -586,7 +591,12 @@ export default function ImportReconcilePage() {
     if (conflictSelections[row.id]) return conflictSelections[row.id];
     const initial = {};
     (row.diff || []).forEach((f) => {
-      initial[f.field] = f.kind === "fill";
+      // "fill" (nothing on file yet) and "clear" (see buildDiff in
+      // lib/importReconcile.js -- a stale personal cell left over from a
+      // departed coach) both default to checked. An "overwrite" of a
+      // field that already had a different value still needs a human to
+      // actively opt in, same as always.
+      initial[f.field] = f.kind === "fill" || f.kind === "clear";
     });
     return initial;
   }
@@ -1109,11 +1119,19 @@ function RowCard({ row, busy, error, selection, onToggleField, onApplyNewInfo, o
                   )}
                   <td>{f.label}</td>
                   <td>{f.old || "—"}</td>
-                  <td style={{ color: f.kind === "overwrite" ? "#b8860b" : "#1e7145", fontWeight: 700 }}>{f.new}</td>
+                  <td style={{ color: f.kind === "overwrite" ? "#b8860b" : f.kind === "clear" ? "#b3261e" : "#1e7145", fontWeight: 700 }}>
+                    {f.kind === "clear" ? "(will be cleared)" : f.new}
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
+          {row.diff.some((f) => f.kind === "clear") && (
+            <div style={{ fontSize: 11.5, color: "#b3261e", marginTop: 6 }}>
+              ⚠️ The coach is changing on this row. This sheet doesn&apos;t give a new value for the field(s) marked &quot;will be cleared&quot; above, so
+              they&apos;re being cleared instead of left pointing at the departed coach — uncheck it if you know this one actually still applies.
+            </div>
+          )}
         </div>
       )}
 
