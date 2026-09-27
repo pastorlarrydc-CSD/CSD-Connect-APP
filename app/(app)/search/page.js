@@ -99,7 +99,7 @@ export default function SearchPage() {
     setDownloading(true);
     try {
       const cols =
-        "id,name,school_type,addr1,addr2,city,county,state,zip,classification,phone,website,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,x_twitter,verification_status,confidence_score,last_verified_at,record_updated,record_last_updated_at";
+        "id,name,school_type,addr1,addr2,city,county,state,zip,classification,phone,website,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,verification_status,confidence_score,last_verified_at,record_updated,record_last_updated_at";
       const rows = [];
       let from = 0;
       for (;;) {
@@ -118,12 +118,12 @@ export default function SearchPage() {
         fields: [
           "school_id", "school_name", "type", "address_1", "address_2", "city", "county", "state", "zip",
           "classification", "phone", "website", "hc_first_name", "hc_last_name", "hc_email", "hc_cell", "hc_office",
-          "x_twitter", "verification_status", "confidence_score", "last_verified_at", "record_updated",
+          "hc_twitter", "verification_status", "confidence_score", "last_verified_at", "record_updated",
           "record_last_updated_at",
         ],
         data: rows.map((r) => [
           r.id, r.name, r.school_type, r.addr1, r.addr2, r.city, r.county, r.state, r.zip, r.classification, r.phone,
-          r.website, r.hc_first_name, r.hc_last_name, r.hc_email, r.hc_cell, r.hc_office, r.x_twitter,
+          r.website, r.hc_first_name, r.hc_last_name, r.hc_email, r.hc_cell, r.hc_office, r.hc_twitter,
           r.verification_status, r.confidence_score, r.last_verified_at, r.record_updated ? "Yes" : "No",
           r.record_last_updated_at || "",
         ]),
