@@ -23,7 +23,7 @@ const EMPTY_FORM = {
   hc_email: "",
   hc_cell: "",
   hc_office: "",
-  x_twitter: "",
+  hc_twitter: "",
 };
 
 export default function AddSchoolPage() {
@@ -103,7 +103,7 @@ export default function AddSchoolPage() {
         hc_email: form.hc_email.trim() || null,
         hc_cell: form.hc_cell.trim() || null,
         hc_office: form.hc_office.trim() || null,
-        x_twitter: form.x_twitter.trim() || null,
+        hc_twitter: form.hc_twitter.trim() || null,
         verification_status: "verified",
         confidence_score: 70,
         last_verified_at: new Date().toISOString(),
@@ -259,7 +259,7 @@ export default function AddSchoolPage() {
           </div>
           <div className="field">
             <label>X (Twitter)</label>
-            <input value={form.x_twitter} onChange={(e) => set("x_twitter", e.target.value)} />
+            <input value={form.hc_twitter} onChange={(e) => set("hc_twitter", e.target.value)} />
           </div>
         </div>
         <div className="grid grid-2" style={{ marginBottom: 16 }}>
