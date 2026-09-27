@@ -6,8 +6,12 @@ import { BULK_PARSE_SYSTEM_PROMPT, BULK_PARSE_MAX_TOKENS, BULK_PARSE_MAX_INPUT_C
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
 // Longer than the single-school lookup's own AI_TIMEOUT_MS (20s, in
 // discover-coach-info/route.js) -- this call can cover several schools'
-// worth of input and output in one pass instead of just one.
-const AI_TIMEOUT_MS = 30000;
+// worth of input and output in one pass instead of just one. Kept a few
+// seconds under maxDuration below (not equal to it) so there's still time
+// left to build and return the JSON error response if the AI call itself
+// hits this ceiling, rather than the whole function getting killed by
+// Vercel first with no response at all.
+const AI_TIMEOUT_MS = 40000;
 export const maxDuration = 45;
 
 // Bulk Paste & Parse -- the AI-structuring step behind Import & Reconcile's
