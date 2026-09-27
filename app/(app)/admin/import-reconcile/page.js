@@ -499,7 +499,21 @@ export default function ImportReconcilePage() {
       // needs_review for (lib/needsReview.js) -- a school landing here via
       // a bounce-recovery CSV shouldn't keep sitting in the Needs Review
       // queue once its fields are actually applied.
-      const update = { verification_status: "verified", last_verified_at: now, ...NEEDS_REVIEW_CLEAR_FIELDS };
+      //
+      // coach_radar_reviewed_at -- same "a human just confirmed this coach
+      // info" signal as the school profile page's Quick Fix save and Mark
+      // Verified button (app/(app)/schools/[id]/page.js), which both set
+      // this too. Without it, a row applied here (whether from an
+      // uploaded CSV or a Bulk Paste & Parse paste -- someone's own
+      // already-done research, reviewed field-by-field before Apply) was
+      // still fair game for tonight's Coach-Change Radar sweep, which
+      // checks the school's OWN WEBSITE, not this database -- so a school
+      // whose site genuinely doesn't list the coach by name would get
+      // flagged again as "not found" the very next run, even though the
+      // data just applied here is accurate. Setting it here excludes the
+      // school from that sweep for COACH_RADAR_REVIEW_EXCLUSION_MONTHS,
+      // exactly like every other manual-verification path already does.
+      const update = { verification_status: "verified", last_verified_at: now, coach_radar_reviewed_at: now, ...NEEDS_REVIEW_CLEAR_FIELDS };
       const logs = [];
       fieldsToApply.forEach((f) => {
         update[f.field] = f.new;
@@ -601,7 +615,11 @@ export default function ImportReconcilePage() {
     setRowError((p) => ({ ...p, [row.id]: null }));
     try {
       const now = new Date().toISOString();
-      const insertRow = { verification_status: "verified", confidence_score: 70, last_verified_at: now, source: "Import & Reconcile (CSV)" };
+      // See the coach_radar_reviewed_at comment in applyRowFields above --
+      // same reasoning applies to a brand-new school added here: it's
+      // already fresh, human-reviewed data, no need for tonight's sweep to
+      // immediately re-check it.
+      const insertRow = { verification_status: "verified", confidence_score: 70, last_verified_at: now, coach_radar_reviewed_at: now, source: "Import & Reconcile (CSV)" };
       ALL_FIELDS.forEach(([field]) => {
         if (field === "school_id") return;
         if (row.mapped_data[field]) insertRow[field] = row.mapped_data[field];
