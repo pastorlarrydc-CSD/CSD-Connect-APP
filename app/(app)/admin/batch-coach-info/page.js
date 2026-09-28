@@ -1222,6 +1222,7 @@ function BatchCoachInfoPageInner() {
     const s = item.school;
     const sug = item.suggestion;
     if (!s || !sug) return { ok: false, error: "Missing school or suggestion." };
+    let flagWarning = null;
     try {
       const update = {};
       const changes = [];
@@ -1296,18 +1297,20 @@ function BatchCoachInfoPageInner() {
         // Import & Reconcile's applyRowFields -- this was the other apply
         // path in the app missing it, which left a school fixed here still
         // sitting in Data Quality's Flagged queue / Today's List forever.
-        await supabase
-          .from("school_flags")
-          .update({ status: "resolved", resolved_by: user.id, resolved_at: new Date().toISOString() })
-          .eq("school_id", s.id)
-          .eq("status", "pending");
+        //
+        // Checked and retried, not fire-and-forget -- see the matching
+        // comment in import-reconcile/page.js's applyRowFields for why:
+        // a silently-swallowed error here used to leave the school fixed
+        // but its flag stuck 'pending' forever with no sign anything had
+        // gone wrong.
+        flagWarning = await resolveSchoolFlagWithRetry(s.id);
       }
       const { error: itemErr } = await supabase
         .from("coach_info_batch_items")
         .update({ review_status: "applied", reviewed_at: new Date().toISOString(), reviewed_by: user.id })
         .eq("id", item.id);
       if (itemErr) throw itemErr;
-      return { ok: true };
+      return { ok: true, flagWarning };
     } catch (err) {
       return { ok: false, error: err.message || "Could not apply this suggestion." };
     }
@@ -1340,6 +1343,7 @@ function BatchCoachInfoPageInner() {
     const s = item.school;
     const originalSug = item.suggestion || {};
     if (!s) return { ok: false, error: "Missing school." };
+    let flagWarning = null;
     try {
       const update = {};
       const changes = [];
@@ -1378,12 +1382,9 @@ function BatchCoachInfoPageInner() {
         // Same school_flags resolve as applySuggestionCore above, same fix
         // -- the CSV round-trip apply is just as much "a human reviewed and
         // confirmed this" as the on-screen button, so it clears the school's
-        // pending flags too.
-        await supabase
-          .from("school_flags")
-          .update({ status: "resolved", resolved_by: user.id, resolved_at: new Date().toISOString() })
-          .eq("school_id", s.id)
-          .eq("status", "pending");
+        // pending flags too. Checked and retried, not fire-and-forget --
+        // see the comment on applySuggestionCore's version of this call.
+        flagWarning = await resolveSchoolFlagWithRetry(s.id);
       }
       // No changes at all (every suggested_* cell was blank or already
       // matched what's on file) -- same as clicking "Skip (no changes)"
@@ -1393,10 +1394,34 @@ function BatchCoachInfoPageInner() {
         .update({ review_status: sawChange ? "applied" : "skipped", reviewed_at: new Date().toISOString(), reviewed_by: user.id })
         .eq("id", item.id);
       if (itemErr) throw itemErr;
-      return { ok: true, changed: sawChange };
+      return { ok: true, changed: sawChange, flagWarning };
     } catch (err) {
       return { ok: false, error: err.message || "Could not apply this row." };
     }
+  }
+
+  // Shared by applySuggestionCore and applySuggestionFromCsv. Resolving a
+  // school's pending school_flags row used to be a bare, unchecked
+  // supabase call in both places -- if it failed (expired/refreshing auth
+  // token, dropped connection, a double-click race) the error was
+  // silently swallowed and the item still got marked "applied" with no
+  // sign anything was wrong, so the flag could sit 'pending' forever with
+  // nobody finding out until it turned up stuck on Today's List. This
+  // checks the result and retries once before giving up, returning a
+  // short warning string (or null on success) instead of throwing, so a
+  // flag hiccup never blocks the actual data fix from being saved.
+  async function resolveSchoolFlagWithRetry(schoolId) {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const { error } = await supabase
+        .from("school_flags")
+        .update({ status: "resolved", resolved_by: user.id, resolved_at: new Date().toISOString() })
+        .eq("school_id", schoolId)
+        .eq("status", "pending");
+      if (!error) return null;
+      if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 600));
+      else return error.message || "Could not clear this school's Data Quality flag.";
+    }
+    return null;
   }
 
   // Reads an uploaded, reviewed CSV (from exportRunCsv below, edited or
@@ -1440,7 +1465,7 @@ function BatchCoachInfoPageInner() {
       });
 
       if (!targets.length) {
-        setCsvImportResult({ applied: 0, noChange: 0, unmatched, alreadyReviewed, failures: [] });
+        setCsvImportResult({ applied: 0, noChange: 0, unmatched, alreadyReviewed, failures: [], flagWarnings: [] });
         return;
       }
 
@@ -1449,12 +1474,14 @@ function BatchCoachInfoPageInner() {
       let applied = 0;
       let noChange = 0;
       const failures = [];
+      const flagWarnings = [];
       await runWithConcurrency(targets, APPLY_CONCURRENCY, async ({ item, effectiveFields }) => {
         const result = await applySuggestionFromCsv(item, effectiveFields);
         if (result.ok) {
           setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: result.changed ? "applied" : "skipped" } : i)));
           if (result.changed) applied++;
           else noChange++;
+          if (result.flagWarning) flagWarnings.push(item.school?.name || `#${item.id}`);
         } else {
           failures.push(`${item.school?.name || `#${item.id}`}: ${result.error}`);
         }
@@ -1462,7 +1489,7 @@ function BatchCoachInfoPageInner() {
         setCsvImportProgress({ done, total: targets.length });
       });
 
-      setCsvImportResult({ applied, noChange, unmatched, alreadyReviewed, failures });
+      setCsvImportResult({ applied, noChange, unmatched, alreadyReviewed, failures, flagWarnings });
       setFocusedIndex(0);
     } catch (err) {
       setCsvImportError(err.message || "Could not read this file.");
@@ -1478,6 +1505,9 @@ function BatchCoachInfoPageInner() {
     const result = await applySuggestionCore(item);
     if (result.ok) {
       setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: "applied" } : i)));
+      if (result.flagWarning) {
+        setReviewError(`Saved -- but couldn't clear this school's Data Quality flag (${result.flagWarning}). It may still show on Today's List; open Data Quality and resolve it there.`);
+      }
     } else {
       setReviewError(result.error);
     }
@@ -1500,10 +1530,12 @@ function BatchCoachInfoPageInner() {
     setBulkProgress({ done: 0, total: targets.length });
     let done = 0;
     const failures = [];
+    const flagWarnings = [];
     await runWithConcurrency(targets, APPLY_CONCURRENCY, async (item) => {
       const result = await applySuggestionCore(item);
       if (result.ok) {
         setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: "applied" } : i)));
+        if (result.flagWarning) flagWarnings.push(item.school?.name || `#${item.id}`);
       } else {
         failures.push(`${item.school?.name || `#${item.id}`}: ${result.error}`);
       }
@@ -1512,12 +1544,21 @@ function BatchCoachInfoPageInner() {
     });
     setBulkApplying(false);
     setFocusedIndex(0);
-    if (failures.length > 0) {
-      setReviewError(
-        `Applied ${targets.length - failures.length} of ${targets.length} high-confidence suggestions. ${failures.length} failed: ${failures.slice(0, 3).join("; ")}${
-          failures.length > 3 ? "…" : ""
-        }`
-      );
+    if (failures.length > 0 || flagWarnings.length > 0) {
+      const parts = [];
+      if (failures.length > 0) {
+        parts.push(
+          `${failures.length} failed: ${failures.slice(0, 3).join("; ")}${failures.length > 3 ? "…" : ""}`
+        );
+      }
+      if (flagWarnings.length > 0) {
+        parts.push(
+          `${flagWarnings.length} saved but couldn't clear their Data Quality flag (${flagWarnings.slice(0, 3).join(", ")}${
+            flagWarnings.length > 3 ? "…" : ""
+          }) -- resolve those in Data Quality directly.`
+        );
+      }
+      setReviewError(`Applied ${targets.length - failures.length} of ${targets.length} high-confidence suggestions. ${parts.join(" ")}`);
     }
   }
 
@@ -2044,6 +2085,12 @@ function BatchCoachInfoPageInner() {
                     <div style={{ marginTop: 4 }}>
                       {csvImportResult.failures.length} failed: {csvImportResult.failures.slice(0, 3).join("; ")}
                       {csvImportResult.failures.length > 3 ? "…" : ""}
+                    </div>
+                  )}
+                  {csvImportResult.flagWarnings?.length > 0 && (
+                    <div style={{ marginTop: 4 }}>
+                      {csvImportResult.flagWarnings.length} saved but couldn&apos;t clear their Data Quality flag: {csvImportResult.flagWarnings.slice(0, 3).join(", ")}
+                      {csvImportResult.flagWarnings.length > 3 ? "…" : ""} -- resolve those in Data Quality directly.
                     </div>
                   )}
                 </div>
