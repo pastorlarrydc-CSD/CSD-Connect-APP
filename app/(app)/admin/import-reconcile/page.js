@@ -1172,6 +1172,44 @@ function RowCard({ row, busy, error, selection, onToggleField, onApplyNewInfo, o
               they&apos;re being cleared instead of left pointing at the departed coach — uncheck it if you know this one actually still applies.
             </div>
           )}
+          {selection &&
+            (() => {
+              // Every "overwrite" field (gold text above -- something already
+              // on file that this sheet disagrees with) starts UNCHECKED,
+              // deliberately -- Larry asked for exactly this backstop when
+              // this tool was built, so a bulk apply can never silently
+              // replace a value already on file without a human choosing to.
+              // But nothing on screen ever said so: the row just shows the
+              // sheet's value in gold next to an empty checkbox, which reads
+              // as "here's what this is" rather than "this won't be saved
+              // unless you check it." That's exactly the bug Larry reported --
+              // he'd paste a corrected email, see it right there in the
+              // preview table, and assume it had gone in, when really it was
+              // sitting unchecked the whole time (this is also the single
+              // biggest source of the 1,600+ name/email mismatches found
+              // across the database -- a coach-name overwrite gets checked
+              // and applied, the email overwrite next to it doesn't).
+              // Naming the unchecked fields explicitly, with a one-click way
+              // to check them all, closes that gap without changing the
+              // underlying safety behavior at all.
+              const uncheckedOverwrites = row.diff.filter((f) => f.kind === "overwrite" && !selection[f.field]);
+              if (!uncheckedOverwrites.length) return null;
+              return (
+                <div style={{ fontSize: 11.5, color: "#b8860b", marginTop: 6 }}>
+                  ⚠️ {uncheckedOverwrites.length} field{uncheckedOverwrites.length > 1 ? "s" : ""} won&apos;t be saved unless checked:{" "}
+                  {uncheckedOverwrites.map((f) => f.label).join(", ")} — the value shown is only what your sheet says, not what&apos;s been applied.{" "}
+                  <button
+                    type="button"
+                    className="btn btn-sm"
+                    style={{ marginLeft: 6, padding: "1px 8px", fontSize: 11 }}
+                    disabled={busy}
+                    onClick={() => uncheckedOverwrites.forEach((f) => onToggleField(f.field))}
+                  >
+                    Check all {uncheckedOverwrites.length}
+                  </button>
+                </div>
+              );
+            })()}
         </div>
       )}
 
