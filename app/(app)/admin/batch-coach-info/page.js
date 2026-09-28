@@ -1287,6 +1287,20 @@ function BatchCoachInfoPageInner() {
           const { error: logErr } = await supabase.from("school_change_log").insert(changes);
           if (logErr) throw logErr;
         }
+        // Also clear any pending "possibly outdated" flags on this school
+        // (school_flags) -- this is very often exactly what sent the school
+        // through Batch Coach-Info Discovery in the first place (the
+        // automated flag's own text says "use AI Coach-Info lookup to fill
+        // in full contact details"), so a reviewer clicking Apply here IS
+        // the human confirmation that flag was waiting on. Same fix as
+        // Import & Reconcile's applyRowFields -- this was the other apply
+        // path in the app missing it, which left a school fixed here still
+        // sitting in Data Quality's Flagged queue / Today's List forever.
+        await supabase
+          .from("school_flags")
+          .update({ status: "resolved", resolved_by: user.id, resolved_at: new Date().toISOString() })
+          .eq("school_id", s.id)
+          .eq("status", "pending");
       }
       const { error: itemErr } = await supabase
         .from("coach_info_batch_items")
@@ -1361,6 +1375,15 @@ function BatchCoachInfoPageInner() {
           const { error: logErr } = await supabase.from("school_change_log").insert(changes);
           if (logErr) throw logErr;
         }
+        // Same school_flags resolve as applySuggestionCore above, same fix
+        // -- the CSV round-trip apply is just as much "a human reviewed and
+        // confirmed this" as the on-screen button, so it clears the school's
+        // pending flags too.
+        await supabase
+          .from("school_flags")
+          .update({ status: "resolved", resolved_by: user.id, resolved_at: new Date().toISOString() })
+          .eq("school_id", s.id)
+          .eq("status", "pending");
       }
       // No changes at all (every suggested_* cell was blank or already
       // matched what's on file) -- same as clicking "Skip (no changes)"
