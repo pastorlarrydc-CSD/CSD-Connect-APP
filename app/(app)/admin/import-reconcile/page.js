@@ -549,16 +549,41 @@ export default function ImportReconcilePage() {
       // didn't, which is why a school fixed here kept reappearing on Today's
       // List forever even after a refresh: the flag itself was never
       // resolved in the database.
-      await supabase
-        .from("school_flags")
-        .update({ status: "resolved", resolved_by: user.id, resolved_at: now })
-        .eq("school_id", row.match_school_id)
-        .eq("status", "pending");
+      //
+      // This call used to be fire-and-forget: if it failed for any reason
+      // (an expired/refreshing auth token, a dropped connection, a race
+      // from clicking Apply twice), the error was silently swallowed --
+      // the row above still got marked "applied" with no sign anything
+      // was wrong, so the flag could stay 'pending' forever with nobody
+      // finding out until it turned up stuck on Today's List (Eastern
+      // Hancock HS, Eastlake HS). Now we check the result, retry once,
+      // and if it still didn't take, say so on the row instead of quietly
+      // pretending it worked.
+      let flagWarning = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const { error: flagErr } = await supabase
+          .from("school_flags")
+          .update({ status: "resolved", resolved_by: user.id, resolved_at: now })
+          .eq("school_id", row.match_school_id)
+          .eq("status", "pending");
+        if (!flagErr) {
+          flagWarning = null;
+          break;
+        }
+        flagWarning = flagErr.message || "Could not clear this school's Data Quality flag.";
+        if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 600));
+      }
 
       const { error: rowErr } = await supabase.from("import_batch_rows").update({ resolution: "applied", resolved_at: now, resolved_by: user.id }).eq("id", row.id);
       if (rowErr) throw rowErr;
 
       patchRow(row.id, { resolution: "applied", resolved_at: now, resolved_by: user.id });
+      if (flagWarning) {
+        setRowError((p) => ({
+          ...p,
+          [row.id]: `Saved -- but couldn't clear its Data Quality flag (${flagWarning}). It may still show on Today's List; open Data Quality and resolve it there.`,
+        }));
+      }
     } catch (err) {
       setRowError((p) => ({ ...p, [row.id]: err.message || "Could not apply this row." }));
     } finally {
