@@ -540,6 +540,21 @@ export default function ImportReconcilePage() {
         if (logErr) throw logErr;
       }
 
+      // Also clear any pending "possibly outdated" flags on this school
+      // (school_flags -- the automated Coach-Change Radar / coach-submitted
+      // queue that drives Data Quality's "Flagged as Possibly Outdated" list
+      // and Today's List). Every other "a human just fixed this" path
+      // already does this (saveEdit/markVerified/bulk-verify in
+      // data-quality/page.js) -- this was the one apply path in the app that
+      // didn't, which is why a school fixed here kept reappearing on Today's
+      // List forever even after a refresh: the flag itself was never
+      // resolved in the database.
+      await supabase
+        .from("school_flags")
+        .update({ status: "resolved", resolved_by: user.id, resolved_at: now })
+        .eq("school_id", row.match_school_id)
+        .eq("status", "pending");
+
       const { error: rowErr } = await supabase.from("import_batch_rows").update({ resolution: "applied", resolved_at: now, resolved_by: user.id }).eq("id", row.id);
       if (rowErr) throw rowErr;
 
