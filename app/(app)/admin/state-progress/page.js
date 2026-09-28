@@ -41,10 +41,80 @@
 //      correct if the dominant gap ever shifts to a different field.
 import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
+import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 
 const PRIORITY_STATES = ["TX", "FL", "GA", "CA", "OH", "IN"];
+
+// Export CSV / Export All States -- pulls the full editable record (not
+// just the gap counts already on screen) for every open, still-incomplete
+// school in a state from /api/admin/state-coverage/export, and downloads
+// it as a CSV built right here. Column order/labels are the single source
+// of truth for what the file looks like; the API route hands back plain
+// field-named JSON rows. Boolean fields render as Yes/No so the file reads
+// the same way whether it's opened in Excel or Sheets.
+const EXPORT_COLUMNS = [
+  ["School ID", "school_id"],
+  ["School Name", "school_name"],
+  ["City", "city"],
+  ["State", "state"],
+  ["Coach First Name", "coach_first_name"],
+  ["Coach Last Name", "coach_last_name"],
+  ["Coach Email", "coach_email"],
+  ["Coach Cell", "coach_cell"],
+  ["Coach Office", "coach_office"],
+  ["Athletics URL", "athletics_url"],
+  ["MaxPreps URL", "maxpreps_url"],
+  ["Coach Twitter", "coach_twitter"],
+  ["Coach Facebook", "coach_facebook"],
+  ["AD Name", "ad_name"],
+  ["AD Email", "ad_email"],
+  ["Needs Coach Name", "needs_coach_name"],
+  ["Needs Email", "needs_email"],
+  ["Needs Cell", "needs_cell"],
+  ["Needs Athletics URL", "needs_athletics_url"],
+  ["Needs MaxPreps URL", "needs_maxpreps_url"],
+  ["Needs Social", "needs_social"],
+  ["Social N/A (Confirmed None)", "social_not_available"],
+  ["Athletics N/A (Confirmed None)", "athletics_not_available"],
+  ["MaxPreps N/A (Confirmed None)", "maxpreps_not_available"],
+  ["Verification Status", "verification_status"],
+  ["Last Verified At", "last_verified_at"],
+  ["Flagged For Review", "needs_review"],
+];
+
+const EXPORT_BOOL_KEYS = new Set([
+  "needs_coach_name",
+  "needs_email",
+  "needs_cell",
+  "needs_athletics_url",
+  "needs_maxpreps_url",
+  "needs_social",
+  "social_not_available",
+  "athletics_not_available",
+  "maxpreps_not_available",
+  "needs_review",
+]);
+
+function buildExportCsv(rows) {
+  return Papa.unparse({
+    fields: EXPORT_COLUMNS.map(([label]) => label),
+    data: rows.map((r) => EXPORT_COLUMNS.map(([, key]) => (EXPORT_BOOL_KEYS.has(key) ? (r[key] ? "Yes" : "No") : r[key] ?? ""))),
+  });
+}
+
+function downloadBlob(csv, filename) {
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
 
 // Each column: which state_data_coverage field it reads, its label, and
 // where "Focus this state" should send you. Coach-Info has two distinct
@@ -184,6 +254,9 @@ export default function StateProgressPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [priorityOnly, setPriorityOnly] = useState(false);
+  const [exportingState, setExportingState] = useState(null); // state code currently exporting, or null
+  const [exportingAll, setExportingAll] = useState(false);
+  const [exportError, setExportError] = useState("");
   // Which column drives the sort -- defaults to Social since that's the
   // one data type still meaningfully incomplete almost everywhere today
   // (coach name/email/athletics/MaxPreps are already ~fully covered from
@@ -223,6 +296,35 @@ export default function StateProgressPage() {
   useEffect(() => {
     if (canReview) loadStates();
   }, [canReview, loadStates]);
+
+  // Pass a state code for a single state's export, or null/omit for every
+  // state combined (the "Export All States" button). Pulls the full
+  // editable record -- not just the gap counts this page already shows --
+  // straight from the same is_closed/needs_* eligibility this dashboard is
+  // built on, so what downloads always matches what's on screen.
+  const runExport = useCallback(
+    async (stateCode) => {
+      setExportError("");
+      if (stateCode) setExportingState(stateCode);
+      else setExportingAll(true);
+      try {
+        const url = stateCode ? `/api/admin/state-coverage/export?state=${encodeURIComponent(stateCode)}` : "/api/admin/state-coverage/export";
+        const res = await authedFetch(url);
+        const json = await res.json();
+        if (!res.ok) throw new Error(json.error || "Could not build this export.");
+        const csv = buildExportCsv(json.rows || []);
+        const today = new Date().toISOString().slice(0, 10);
+        const filename = stateCode ? `${stateCode}_needs_update_${today}.csv` : `csd_state_data_gaps_ALL_STATES_${today}.csv`;
+        downloadBlob(csv, filename);
+      } catch (err) {
+        setExportError(err.message || "Could not build this export.");
+      } finally {
+        if (stateCode) setExportingState(null);
+        else setExportingAll(false);
+      }
+    },
+    [authedFetch]
+  );
 
   if (!canReview) {
     return (
@@ -351,11 +453,22 @@ export default function StateProgressPage() {
       <div className="card" style={{ marginBottom: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
           <h3 style={{ margin: 0 }}>Coverage by state</h3>
-          <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
-            <input type="checkbox" checked={priorityOnly} onChange={(e) => setPriorityOnly(e.target.checked)} />
-            Priority recruiting states only ({PRIORITY_STATES.join(", ")})
-          </label>
+          <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+            <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
+              <input type="checkbox" checked={priorityOnly} onChange={(e) => setPriorityOnly(e.target.checked)} />
+              Priority recruiting states only ({PRIORITY_STATES.join(", ")})
+            </label>
+            <button className="btn btn-sm" onClick={() => runExport(null)} disabled={exportingAll || loading || states.length === 0} title="Full editable record for every open, incomplete school across all states">
+              {exportingAll ? "Exporting all states…" : "Export All States (CSV)"}
+            </button>
+          </div>
         </div>
+
+        {exportError && (
+          <div className="notice danger" style={{ marginBottom: 10 }}>
+            {exportError}
+          </div>
+        )}
 
         {!loading && states.length > 0 && (
           <div style={{ fontSize: 12, color: "#697386", marginBottom: 10 }}>
@@ -398,6 +511,7 @@ export default function StateProgressPage() {
                     Marked Reviewed
                     {sortKey === "reviewed_count" ? " ▾" : ""}
                   </th>
+                  <th style={{ padding: "6px 10px", textAlign: "center", borderLeft: "1px solid #eef0f3" }}>Export</th>
                 </tr>
               </thead>
               <tbody>
@@ -416,6 +530,17 @@ export default function StateProgressPage() {
                       <MetricCell key={m.key} count={s[m.key] || 0} total={s.total_open} state={s.state} metric={m} />
                     ))}
                     <ReviewedCell count={s.reviewed_count || 0} total={s.total_open} recent={s.reviewed_last_7d || 0} prior={s.reviewed_prior_7d || 0} state={s.state} />
+                    <td style={{ padding: "8px 10px", textAlign: "center", borderLeft: "1px solid #eef0f3" }}>
+                      <button
+                        className="btn btn-sm"
+                        style={{ fontSize: 11, padding: "2px 8px" }}
+                        onClick={() => runExport(s.state)}
+                        disabled={exportingState === s.state}
+                        title={`Full editable record for ${s.state}'s open, incomplete schools`}
+                      >
+                        {exportingState === s.state ? "Exporting…" : "Export CSV"}
+                      </button>
+                    </td>
                   </tr>
                 ))}
               </tbody>
