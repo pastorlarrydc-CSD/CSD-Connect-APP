@@ -26,6 +26,29 @@ const BATCH_SIZE = 300;
 // that tool was never meant to guess at.
 const AI_LOOKUP_FIELDS = ["hc_first_name", "hc_last_name", "hc_email", "hc_cell", "hc_office", "hc_twitter", "ad_name", "ad_email"];
 
+// Columns the "Open Profile" quick-edit drawer (see SchoolProfileDrawer
+// below) fetches fresh whenever it opens -- deliberately DIFF_FIELDS plus
+// just enough identity/status context to orient the reviewer (name, state,
+// is_closed, verification_status, last_verified_at, needs_review), not
+// every column on the schools table. The drawer's whole reason for
+// existing is "make quick edits without leaving this screen" -- scoping it
+// to exactly the fields this page already diffs against the sheet keeps it
+// tightly tied to what's actually being reviewed here, rather than
+// reproducing the school profile page's full edit form. Anything outside
+// that scope (social handles, "not available" flags, coach radar history)
+// is still one click away via the drawer's "Open full profile" link.
+const PROFILE_DRAWER_COLUMNS = ["id", "name", "state", "is_closed", "verification_status", "last_verified_at", "needs_review", ...DIFF_FIELDS.map(([f]) => f)].join(",");
+
+// Groups DIFF_FIELDS into the same three sections the school profile page
+// itself uses, purely for the drawer's layout -- DIFF_FIELDS stays the
+// single source of truth for field names/labels (imported above), this
+// just orders them for display.
+const PROFILE_FIELD_GROUPS = [
+  { title: "School info", fields: ["city", "school_type", "addr1", "addr2", "county", "zip", "classification", "phone", "website", "athletics_url", "maxpreps_url"] },
+  { title: "Head coach", fields: ["hc_first_name", "hc_last_name", "hc_email", "hc_cell", "hc_office", "hc_twitter"] },
+  { title: "Athletic director", fields: ["ad_name", "ad_email"] },
+];
+
 // Tab order -- the buckets that need a human decision come first, the
 // read-only/no-action buckets last.
 const BUCKET_ORDER = ["needs_verification", "conflict", "new_info", "new_school", "exact_match", "skipped"];
@@ -122,6 +145,24 @@ export default function ImportReconcilePage() {
   const [bulkError, setBulkError] = useState("");
   const [conflictSelections, setConflictSelections] = useState({}); // { [rowId]: { [field]: bool } }
   const [aiNote, setAiNote] = useState({}); // { [rowId]: "AI added 2 suggested fields..." } -- set by runAiLookup, cleared per-row on its next run
+
+  // "Open Profile" quick-edit drawer -- see openProfile/saveProfileEdit
+  // below. profileDrawer holds which row/school it's open for; null means
+  // closed. Kept as plain component state, not sessionStorage-cached like
+  // the rest of this page's "where was I" state -- it's meant to be a
+  // quick in-and-out edit, not something that needs to survive a
+  // navigation away and back the way an open batch or an uncommitted
+  // preview does.
+  const [profileDrawer, setProfileDrawer] = useState(null); // { rowId, schoolId }
+  const [profileSchool, setProfileSchool] = useState(null); // last-fetched/last-saved school row
+  const [profileValues, setProfileValues] = useState({}); // draft edits, keyed by DIFF_FIELDS field names
+  const [profileLoading, setProfileLoading] = useState(false);
+  const [profileSaving, setProfileSaving] = useState(false);
+  const [profileJustSaved, setProfileJustSaved] = useState(false);
+  const [profileError, setProfileError] = useState("");
+  const [profileAiBusy, setProfileAiBusy] = useState(false);
+  const [profileAiNote, setProfileAiNote] = useState("");
+
   const [verificationRunId, setVerificationRunId] = useState(null);
   // A ref, not just the state above -- state updates aren't visible until
   // the next render, so a tight sequential loop (sendAllAmbiguousToVerification)
@@ -796,6 +837,204 @@ export default function ImportReconcilePage() {
     }
   }
 
+  // ---- "Open Profile" quick-edit drawer ----------------------------------
+  //
+  // Larry's ask: reviewing a row here that needs a real fix (not just
+  // applying/rejecting the sheet's proposed values) meant leaving this
+  // screen entirely -- open the school's profile page in another tab,
+  // find the right fields, edit, save, then come back and re-find your
+  // place in the batch. This opens a slide-over panel right on top of the
+  // parsing screen instead: the row list, active tab, and scroll position
+  // behind it never move, so "quick edits" really are quick.
+  //
+  // Deliberately its own small set of functions rather than reusing Data
+  // Quality's saveEdit -- that function is entangled with page state this
+  // page doesn't have (flaggedQueue, searchResults, coachChangeFrom). Same
+  // underlying write semantics though (verified + last_verified_at +
+  // coach_radar_reviewed_at + NEEDS_REVIEW_CLEAR_FIELDS + a
+  // school_change_log row per changed field + best-effort school_flags
+  // resolution), so a fix made here counts the same as any other manual
+  // verification everywhere else in the app.
+  async function openProfile(row) {
+    if (!row.match_school_id) return;
+    setProfileDrawer({ rowId: row.id, schoolId: row.match_school_id });
+    setProfileSchool(null);
+    setProfileValues({});
+    setProfileError("");
+    setProfileAiNote("");
+    setProfileJustSaved(false);
+    setProfileLoading(true);
+    try {
+      const { data, error } = await supabase.from("schools").select(PROFILE_DRAWER_COLUMNS).eq("id", row.match_school_id).single();
+      if (error) throw error;
+      setProfileSchool(data);
+      const initial = {};
+      DIFF_FIELDS.forEach(([f]) => {
+        initial[f] = data[f] || "";
+      });
+      setProfileValues(initial);
+    } catch (err) {
+      setProfileError(err.message || "Could not load this school.");
+    } finally {
+      setProfileLoading(false);
+    }
+  }
+
+  function closeProfile() {
+    setProfileDrawer(null);
+    setProfileSchool(null);
+    setProfileValues({});
+    setProfileError("");
+    setProfileAiNote("");
+    setProfileJustSaved(false);
+  }
+
+  function updateProfileField(field, value) {
+    setProfileValues((prev) => ({ ...prev, [field]: value }));
+    setProfileJustSaved(false);
+  }
+
+  async function saveProfileEdit() {
+    if (!profileDrawer || !profileSchool) return;
+    setProfileSaving(true);
+    setProfileError("");
+    try {
+      const now = new Date().toISOString();
+      const update = { verification_status: "verified", last_verified_at: now, coach_radar_reviewed_at: now, ...NEEDS_REVIEW_CLEAR_FIELDS };
+      const logs = [];
+      DIFF_FIELDS.forEach(([field]) => {
+        const newVal = trimStr(profileValues[field]) || null;
+        const oldVal = profileSchool[field] || null;
+        if (newVal !== oldVal) {
+          update[field] = newVal;
+          logs.push({
+            school_id: profileSchool.id,
+            field_name: field,
+            old_value: oldVal,
+            new_value: newVal,
+            source: "Import & Reconcile (Quick Edit from parsing screen)",
+            changed_by: user.id,
+          });
+        }
+      });
+
+      if (!logs.length) {
+        // Nothing actually changed -- still worth a visible "Saved" so a
+        // click on Save isn't silently a no-op, but no point writing an
+        // identical row or an empty change-log entry.
+        setProfileJustSaved(true);
+        return;
+      }
+
+      const { error: updErr } = await supabase.from("schools").update(update).eq("id", profileSchool.id);
+      if (updErr) throw updErr;
+      const { error: logErr } = await supabase.from("school_change_log").insert(logs);
+      if (logErr) throw logErr;
+
+      // Same best-effort retry (and same "say so instead of pretending it
+      // worked" rule) as applyRowFields above.
+      let flagWarning = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const { error: flagErr } = await supabase
+          .from("school_flags")
+          .update({ status: "resolved", resolved_by: user.id, resolved_at: now })
+          .eq("school_id", profileSchool.id)
+          .eq("status", "pending");
+        if (!flagErr) {
+          flagWarning = null;
+          break;
+        }
+        flagWarning = flagErr.message || "Could not clear this school's Data Quality flag.";
+        if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 600));
+      }
+
+      const updatedSchool = { ...profileSchool, ...update };
+      setProfileSchool(updatedSchool);
+      setProfileJustSaved(true);
+      setProfileError(flagWarning ? `Saved -- but couldn't clear this school's Data Quality flag (${flagWarning}). It may still show on Today's List.` : "");
+
+      // Re-check this row against the sheet with the freshly-saved school,
+      // right now, without waiting for a reload -- Larry asked for this
+      // specifically. categorizeAgainstSchool is the exact same function
+      // categorizeRow itself calls once a row is matched to a school, so
+      // this row's new bucket/diff is decided the identical way every
+      // other row's already was; a conflict that this edit just resolved
+      // drops off the diff table and the row can move tabs on its own
+      // (e.g. Conflict -> Already up to date).
+      const targetRow = rows.find((r) => r.id === profileDrawer.rowId);
+      if (targetRow) {
+        const recheck = categorizeAgainstSchool(targetRow.mapped_data, updatedSchool);
+        const { error: rowErr } = await supabase.from("import_batch_rows").update({ bucket: recheck.bucket, diff: recheck.diff }).eq("id", targetRow.id);
+        if (!rowErr) {
+          patchRow(targetRow.id, { bucket: recheck.bucket, diff: recheck.diff });
+          // Old checkbox selections were computed against the old diff --
+          // drop them so the conflict bucket (if the row is still there)
+          // recomputes fresh defaults against the new one instead of
+          // mixing stale and new field keys.
+          setConflictSelections((prev) => {
+            if (!(targetRow.id in prev)) return prev;
+            const next = { ...prev };
+            delete next[targetRow.id];
+            return next;
+          });
+        }
+      }
+    } catch (err) {
+      setProfileError(err.message || "Could not save this school.");
+    } finally {
+      setProfileSaving(false);
+    }
+  }
+
+  // Same live route the row-level "Suggest Coach Info (AI)" button and the
+  // school profile page's own button call -- run from inside the drawer so
+  // a reviewer who's already in here to fix something else doesn't have to
+  // back out to the row card to also run AI lookup. Only fills fields
+  // still blank in the DRAFT (profileValues), same "never second-guess a
+  // real value" rule runAiLookup follows.
+  async function runProfileAiLookup() {
+    if (!profileDrawer || !profileSchool) return;
+    setProfileAiBusy(true);
+    setProfileError("");
+    setProfileAiNote("");
+    try {
+      const {
+        data: { session },
+      } = await supabase.auth.getSession();
+      const res = await fetch(`/api/schools/${profileSchool.id}/discover-coach-info`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${session?.access_token}` },
+      });
+      const suggestion = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(suggestion.error || "AI lookup didn't return a result for this school.");
+
+      let filled = 0;
+      setProfileValues((prev) => {
+        const next = { ...prev };
+        AI_LOOKUP_FIELDS.forEach((field) => {
+          if (trimStr(next[field])) return; // already filled in the draft -- not a gap
+          const suggested = trimStr(suggestion[field]);
+          if (!suggested) return;
+          next[field] = suggested;
+          filled += 1;
+        });
+        return next;
+      });
+
+      setProfileAiNote(
+        filled
+          ? `AI filled ${filled} blank field${filled > 1 ? "s" : ""}${suggestion.confidence ? ` (confidence: ${suggestion.confidence})` : ""}${
+              suggestion.hc_email_estimated ? " -- the email is a guessed pattern, worth a quick sanity check" : ""
+            }. Review below, then Save.`
+          : `AI lookup ran but didn't find anything new for a field that's still blank${suggestion.confidence ? ` (confidence: ${suggestion.confidence})` : ""}.`
+      );
+    } catch (err) {
+      setProfileError(err.message || "AI lookup failed for this school.");
+    } finally {
+      setProfileAiBusy(false);
+    }
+  }
+
   // ---- New school bucket -------------------------------------------------
 
   async function addRowAsNewSchool(row) {
@@ -1120,6 +1359,7 @@ export default function ImportReconcilePage() {
                       onPickCandidate={(candidate) => sendToVerification(row, candidate.id)}
                       onMarkNewSchool={() => markRowAsNewSchoolInstead(row)}
                       onRunAiLookup={row.match_school_id ? () => runAiLookup(row) : null}
+                      onOpenProfile={row.match_school_id ? () => openProfile(row) : null}
                     />
                   ))}
                 </div>
@@ -1127,6 +1367,23 @@ export default function ImportReconcilePage() {
             </div>
           </>
         )}
+
+        <SchoolProfileDrawer
+          open={!!profileDrawer}
+          loading={profileLoading}
+          saving={profileSaving}
+          justSaved={profileJustSaved}
+          error={profileError}
+          aiBusy={profileAiBusy}
+          aiNote={profileAiNote}
+          school={profileSchool}
+          values={profileValues}
+          row={profileDrawer ? rows.find((r) => r.id === profileDrawer.rowId) : null}
+          onChange={updateProfileField}
+          onClose={closeProfile}
+          onSave={saveProfileEdit}
+          onRunAi={runProfileAiLookup}
+        />
       </div>
     );
   }
@@ -1249,7 +1506,7 @@ export default function ImportReconcilePage() {
   );
 }
 
-function RowCard({ row, busy, error, aiNote, selection, onToggleField, onApplyNewInfo, onApplyConflict, onSkip, onAddNewSchool, onPickCandidate, onMarkNewSchool, onRunAiLookup }) {
+function RowCard({ row, busy, error, aiNote, selection, onToggleField, onApplyNewInfo, onApplyConflict, onSkip, onAddNewSchool, onPickCandidate, onMarkNewSchool, onRunAiLookup, onOpenProfile }) {
   const resolved = row.resolution !== "pending";
   const m = row.mapped_data || {};
   const locationLabel = [m.city, m.state].filter(Boolean).join(", ");
@@ -1264,6 +1521,17 @@ function RowCard({ row, busy, error, aiNote, selection, onToggleField, onApplyNe
             <span className="badge badge-not-contacted" style={{ marginLeft: 8 }} title="Another row in this same file has the same name + state">
               Duplicate row in file
             </span>
+          )}
+          {onOpenProfile && (
+            <button
+              type="button"
+              className="btn btn-sm"
+              style={{ marginLeft: 8, padding: "1px 8px", fontSize: 11.5 }}
+              onClick={onOpenProfile}
+              title="Open this school's profile right here to make a quick edit, without leaving this screen"
+            >
+              Open Profile ↗
+            </button>
           )}
         </div>
         {resolved && (
@@ -1444,5 +1712,133 @@ function RowCard({ row, busy, error, aiNote, selection, onToggleField, onApplyNe
         </div>
       )}
     </div>
+  );
+}
+
+// Slide-over "Open Profile" quick-edit drawer -- see openProfile/
+// saveProfileEdit/runProfileAiLookup in the page component above for the
+// data side of this. Purely a rendering component: every field's value and
+// every action are handed down as props so the parsing screen underneath
+// it (row list, active tab, scroll position) never has to know this is
+// open, and never re-renders because of anything happening in here except
+// the one row this drawer is editing.
+function SchoolProfileDrawer({ open, loading, saving, justSaved, error, aiBusy, aiNote, school, values, row, onChange, onClose, onSave, onRunAi }) {
+  if (!open) return null;
+
+  const sheet = row?.mapped_data || {};
+  const locationLabel = school ? [school.city, school.state].filter(Boolean).join(", ") : "";
+
+  return (
+    <>
+      <div
+        onClick={onClose}
+        style={{ position: "fixed", inset: 0, background: "rgba(20, 24, 33, 0.35)", zIndex: 999 }}
+      />
+      <div
+        style={{
+          position: "fixed",
+          top: 0,
+          right: 0,
+          bottom: 0,
+          width: "min(480px, 100vw)",
+          background: "#fff",
+          zIndex: 1000,
+          boxShadow: "-6px 0 28px rgba(20, 24, 33, 0.22)",
+          display: "flex",
+          flexDirection: "column",
+        }}
+      >
+        <div style={{ padding: "16px 20px", borderBottom: "1px solid #e3e6eb", display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+          <div>
+            <div style={{ fontSize: 11, color: "#697386", textTransform: "uppercase", letterSpacing: 0.4 }}>Quick Edit</div>
+            <h3 style={{ margin: "2px 0 0" }}>{school ? school.name : "Loading…"}</h3>
+            {locationLabel && <div style={{ fontSize: 12.5, color: "#697386" }}>{locationLabel}</div>}
+            {school && (
+              <div style={{ marginTop: 6, display: "flex", gap: 6, flexWrap: "wrap" }}>
+                <span className={`badge ${school.verification_status === "verified" ? "badge-contacted" : "badge-not-contacted"}`}>
+                  {school.verification_status === "verified" ? "Verified" : school.verification_status || "Not verified"}
+                </span>
+                {school.needs_review && <span className="badge badge-not-contacted">Needs review</span>}
+                {school.is_closed && <span className="badge badge-not-contacted">Closed</span>}
+              </div>
+            )}
+          </div>
+          <button type="button" className="btn btn-sm" onClick={onClose} title="Close (your place in the batch is unchanged)">
+            ✕
+          </button>
+        </div>
+
+        <div style={{ padding: "16px 20px", overflowY: "auto", flex: 1 }}>
+          {loading && <div className="empty-state">Loading this school…</div>}
+
+          {!loading && school && (
+            <>
+              {school.id && (
+                <div style={{ marginBottom: 12 }}>
+                  <Link href={`/schools/${school.id}`} target="_blank" style={{ fontSize: 12.5 }}>
+                    Open full profile (new tab) ↗
+                  </Link>
+                  <span style={{ fontSize: 11.5, color: "#8a94a6" }}> — for social handles, &quot;not available&quot; flags, and coach-radar history</span>
+                </div>
+              )}
+
+              {error && <div className="notice danger" style={{ marginBottom: 10, fontSize: 12.5 }}>{error}</div>}
+              {justSaved && !error && <div className="notice info" style={{ marginBottom: 10, fontSize: 12.5 }}>✓ Saved</div>}
+
+              <div style={{ marginBottom: 12 }}>
+                <button type="button" className="btn btn-sm" disabled={aiBusy} onClick={onRunAi} title="Live web-search + AI lookup for this school's coach/AD info -- fills genuine gaps in the fields below only">
+                  {aiBusy ? "Looking…" : "Suggest Coach Info (AI)"}
+                </button>
+                {aiNote && <div style={{ fontSize: 12, color: "#1c5fb3", marginTop: 6 }}>🤖 {aiNote}</div>}
+              </div>
+
+              {PROFILE_FIELD_GROUPS.map((group) => (
+                <div key={group.title} style={{ marginBottom: 16 }}>
+                  <div style={{ fontSize: 12, fontWeight: 700, color: "#42485a", marginBottom: 6 }}>{group.title}</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                    {group.fields.map((field) => {
+                      const label = (DIFF_FIELDS.find(([f]) => f === field) || [])[1] || field;
+                      const current = values[field] || "";
+                      const sheetVal = trimStr(sheet[field]);
+                      const showHint = sheetVal && sheetVal !== current;
+                      return (
+                        <div className="form-field" key={field} style={{ marginBottom: 0 }}>
+                          <label>{label}</label>
+                          <input value={current} onChange={(e) => onChange(field, e.target.value)} style={{ width: "100%", boxSizing: "border-box" }} />
+                          {showHint && (
+                            <div style={{ fontSize: 11.5, color: "#8a6d3b", marginTop: 3 }}>
+                              Sheet says: {sheetVal}{" "}
+                              <button
+                                type="button"
+                                className="btn btn-sm"
+                                style={{ padding: "0px 6px", fontSize: 10.5, marginLeft: 2 }}
+                                onClick={() => onChange(field, sheetVal)}
+                              >
+                                Use this
+                              </button>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                </div>
+              ))}
+            </>
+          )}
+        </div>
+
+        {!loading && school && (
+          <div style={{ padding: "14px 20px", borderTop: "1px solid #e3e6eb", display: "flex", gap: 8 }}>
+            <button className="btn btn-sm btn-gold" disabled={saving} onClick={onSave}>
+              {saving ? "Saving…" : justSaved ? "Save Again" : "Save & Mark Verified"}
+            </button>
+            <button type="button" className="btn btn-sm" onClick={onClose} disabled={saving}>
+              {justSaved ? "Close" : "Cancel"}
+            </button>
+          </div>
+        )}
+      </div>
+    </>
   );
 }
