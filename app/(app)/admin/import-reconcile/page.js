@@ -12,11 +12,19 @@ import {
   DIFF_FIELDS,
   ALL_FIELDS,
   BUCKET_LABELS,
+  trimStr,
 } from "@/lib/importReconcile";
 import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
 
 const PAGE_SIZE = 1000;
 const BATCH_SIZE = 300;
+
+// Fields the live AI coach-info lookup (see runAiLookup below) is allowed
+// to fill. Deliberately the coach/AD identity fields only -- the same ones
+// the school profile page's own "Suggest Coach Info (AI)" button offers --
+// not the school-identity fields (city, address, classification, etc.)
+// that tool was never meant to guess at.
+const AI_LOOKUP_FIELDS = ["hc_first_name", "hc_last_name", "hc_email", "hc_cell", "hc_office", "hc_twitter", "ad_name", "ad_email"];
 
 // Tab order -- the buckets that need a human decision come first, the
 // read-only/no-action buckets last.
@@ -113,6 +121,7 @@ export default function ImportReconcilePage() {
   const [bulkStatus, setBulkStatus] = useState("");
   const [bulkError, setBulkError] = useState("");
   const [conflictSelections, setConflictSelections] = useState({}); // { [rowId]: { [field]: bool } }
+  const [aiNote, setAiNote] = useState({}); // { [rowId]: "AI added 2 suggested fields..." } -- set by runAiLookup, cleared per-row on its next run
   const [verificationRunId, setVerificationRunId] = useState(null);
   // A ref, not just the state above -- state updates aren't visible until
   // the next render, so a tight sequential loop (sendAllAmbiguousToVerification)
@@ -658,6 +667,135 @@ export default function ImportReconcilePage() {
     await applyRowFields(row, fieldsToApply);
   }
 
+  // ---- AI Coach Info lookup (live, per-row) ------------------------------
+  //
+  // Larry's ask: when a pasted/uploaded row comes up short on coach info
+  // (most often the email -- see e.g. a row whose sheet only offered a
+  // guessed "district profile template" address, which the parser
+  // correctly left out of the diff table entirely rather than show it as
+  // real), he had to leave this review screen, open that school's profile
+  // page, and click its own "Suggest Coach Info (AI)" button one school at
+  // a time. This calls that EXACT SAME live route
+  // (/api/schools/[id]/discover-coach-info -- one web-search-backed
+  // Anthropic call, no DB write of its own) straight from the row's card
+  // here, so working a batch never means leaving this screen.
+  //
+  // Deliberately conservative about what it's allowed to touch: a field
+  // only gets an AI-sourced diff row when NEITHER the sheet nor what's
+  // currently on file has anything there (oldVal blank AND no existing
+  // diff entry for that field already) -- it only fills genuine gaps, it
+  // never second-guesses a value the sheet or the database already
+  // supplies. The school's CURRENT row is fetched fresh here (not
+  // whatever was cached when this batch was originally parsed, which
+  // could be stale by now) so "oldVal blank" reflects reality today.
+  //
+  // Added fields are tagged { source: "ai" } (row.diff is a plain jsonb
+  // array, so this rides along harmlessly for entries buildDiff() itself
+  // produces, which never set it) purely so RowCard can badge them
+  // differently from what the sheet itself supplied.
+  async function runAiLookup(row) {
+    if (!row.match_school_id) return;
+    setRowBusy((p) => ({ ...p, [row.id]: true }));
+    setRowError((p) => ({ ...p, [row.id]: null }));
+    setAiNote((p) => ({ ...p, [row.id]: null }));
+    try {
+      const [schoolRes, sessionRes] = await Promise.all([
+        supabase.from("schools").select(SCHOOL_SELECT_COLUMNS).eq("id", row.match_school_id).single(),
+        supabase.auth.getSession(),
+      ]);
+      if (schoolRes.error) throw schoolRes.error;
+      const school = schoolRes.data;
+
+      const res = await fetch(`/api/schools/${row.match_school_id}/discover-coach-info`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${sessionRes.data?.session?.access_token}` },
+      });
+      const suggestion = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(suggestion.error || "AI lookup didn't return a result for this school.");
+
+      const existingFields = new Set((row.diff || []).map((f) => f.field));
+      const added = [];
+      AI_LOOKUP_FIELDS.forEach((field) => {
+        if (existingFields.has(field)) return; // sheet (or an earlier AI run) already covers this field
+        if (trimStr(school[field])) return; // already on file -- not a gap
+        const suggested = trimStr(suggestion[field]);
+        if (!suggested) return; // AI didn't find anything for this field either
+        const label = (DIFF_FIELDS.find(([f]) => f === field) || [])[1] || field;
+        // hc_email_estimated -- the model flagged this as a GUESSED pattern
+        // (first.last@domain) rather than an email it actually saw written
+        // down somewhere, the exact same "likely district profile template"
+        // problem Larry's own screenshot showed the sheet parser already
+        // declining to surface as real. Worth adding here still (it's a
+        // starting point better than nothing), but tagged so the row makes
+        // clear it's a guess, not a confirmed address, same distinction
+        // normalizeSuggestion already downgrades confidence for.
+        const estimated = field === "hc_email" && suggestion.hc_email_estimated === true;
+        added.push({ field, label, old: "", new: suggested, kind: "fill", source: "ai", confidence: suggestion.confidence, estimated });
+      });
+
+      if (!added.length) {
+        setAiNote((p) => ({ ...p, [row.id]: `AI lookup ran but didn't find anything new here${suggestion.confidence ? ` (confidence: ${suggestion.confidence})` : ""}.` }));
+        return;
+      }
+
+      const newDiff = [...(row.diff || []), ...added];
+      const { error: rowErr } = await supabase.from("import_batch_rows").update({ diff: newDiff }).eq("id", row.id);
+      if (rowErr) throw rowErr;
+      patchRow(row.id, { diff: newDiff });
+
+      // Conflict-bucket rows are checkbox-gated (getSelection/toggleField) --
+      // auto-check the fields AI just added so "Apply selected" picks them
+      // up immediately, same as every other "fill" field already defaults
+      // to checked. new_info-bucket rows have no checkboxes at all
+      // (onApplyNewInfo applies the whole diff unconditionally), so nothing
+      // extra is needed there.
+      if (row.bucket === "conflict") {
+        const current = conflictSelections[row.id] || getSelection(row);
+        const nextSelection = { ...current };
+        added.forEach((f) => {
+          nextSelection[f.field] = true;
+        });
+        setConflictSelections((prev) => ({ ...prev, [row.id]: nextSelection }));
+      }
+
+      setAiNote((p) => ({
+        ...p,
+        [row.id]: `AI added ${added.length} suggested field${added.length > 1 ? "s" : ""} — ${added.map((f) => f.label).join(", ")}${
+          suggestion.confidence ? ` (confidence: ${suggestion.confidence})` : ""
+        }. Review it below, then Apply.`,
+      }));
+    } catch (err) {
+      setRowError((p) => ({ ...p, [row.id]: err.message || "AI lookup failed for this row." }));
+    } finally {
+      setRowBusy((p) => ({ ...p, [row.id]: false }));
+    }
+  }
+
+  // Runs runAiLookup across a whole set of rows sequentially (not in
+  // parallel -- the underlying route is a real web-search + Anthropic call
+  // per school, up to ~20s each, and this app's other sequential bulk
+  // actions above -- applyAllNewInfo, addAllNewSchools -- make the same
+  // choice for the same reason: predictable, one-at-a-time progress beats
+  // racing a pile of slow requests at once). Shares bulkBusy/bulkStatus
+  // with those other bulk actions so two bulk operations can't overlap.
+  async function runAiLookupOnRows(targetRows) {
+    if (!targetRows.length) return;
+    setBulkBusy(true);
+    setBulkError("");
+    try {
+      for (let i = 0; i < targetRows.length; i++) {
+        setBulkStatus(`Running AI lookup on row ${i + 1} of ${targetRows.length}…`);
+        // eslint-disable-next-line no-await-in-loop
+        await runAiLookup(targetRows[i]);
+      }
+    } catch (err) {
+      setBulkError(err.message || "Something went wrong running AI lookup on these rows.");
+    } finally {
+      setBulkBusy(false);
+      setBulkStatus("");
+    }
+  }
+
   // ---- New school bucket -------------------------------------------------
 
   async function addRowAsNewSchool(row) {
@@ -842,6 +980,14 @@ export default function ImportReconcilePage() {
     const bucketRows = rows.filter((r) => r.bucket === activeBucket);
     const pendingInBucket = bucketRows.filter((r) => r.resolution === "pending");
     const totalPending = rows.filter((r) => r.resolution === "pending").length;
+    // Rows this tab's "Run AI on all rows missing email" bulk button will
+    // touch -- matched to a school (so there's somewhere to attach the
+    // lookup) and with no hc_email anywhere in the diff yet, whether
+    // because the sheet never had one or the parser flagged a guessed
+    // address as too unreliable to surface (see runAiLookup's comment).
+    // Cheap client-side filter using only what's already loaded -- the
+    // per-row on-file check still happens fresh inside runAiLookup itself.
+    const missingEmailInBucket = pendingInBucket.filter((r) => r.match_school_id && !(r.diff || []).some((f) => f.field === "hc_email"));
 
     return (
       <div className="view">
@@ -915,6 +1061,24 @@ export default function ImportReconcilePage() {
                 </p>
                 <button className="btn btn-sm btn-gold" onClick={applyAllNewInfo} disabled={bulkBusy}>
                   {bulkBusy ? bulkStatus || "Applying…" : `Apply all ${pendingInBucket.length} rows`}
+                </button>{" "}
+                {missingEmailInBucket.length > 0 && (
+                  <button className="btn btn-sm" onClick={() => runAiLookupOnRows(missingEmailInBucket)} disabled={bulkBusy} title="Runs the live AI coach-info lookup on every row in this tab with no email yet, and drops any real gaps it fills straight into each row's table below">
+                    {bulkBusy ? bulkStatus || "Running…" : `Run AI on ${missingEmailInBucket.length} row${missingEmailInBucket.length > 1 ? "s" : ""} missing email`}
+                  </button>
+                )}
+              </div>
+            )}
+
+            {activeBucket === "conflict" && missingEmailInBucket.length > 0 && (
+              <div className="card" style={{ marginBottom: 14 }}>
+                <p style={{ marginTop: 0, fontSize: 12.5, color: "#697386" }}>
+                  {missingEmailInBucket.length} row{missingEmailInBucket.length > 1 ? "s" : ""} here still {missingEmailInBucket.length > 1 ? "have" : "has"} no coach email on the sheet or on
+                  file. Run the AI lookup on all of them at once instead of opening each school&apos;s profile — anything it finds drops straight into that row&apos;s table below, already
+                  checked, ready for you to review and Apply.
+                </p>
+                <button className="btn btn-sm" onClick={() => runAiLookupOnRows(missingEmailInBucket)} disabled={bulkBusy}>
+                  {bulkBusy ? bulkStatus || "Running…" : `Run AI on ${missingEmailInBucket.length} row${missingEmailInBucket.length > 1 ? "s" : ""} missing email`}
                 </button>
               </div>
             )}
@@ -946,6 +1110,7 @@ export default function ImportReconcilePage() {
                       row={row}
                       busy={!!rowBusy[row.id]}
                       error={rowError[row.id]}
+                      aiNote={aiNote[row.id]}
                       selection={activeBucket === "conflict" ? getSelection(row) : null}
                       onToggleField={(field) => toggleField(row, field)}
                       onApplyNewInfo={() => applyRowFields(row, row.diff || [])}
@@ -954,6 +1119,7 @@ export default function ImportReconcilePage() {
                       onAddNewSchool={() => addRowAsNewSchool(row)}
                       onPickCandidate={(candidate) => sendToVerification(row, candidate.id)}
                       onMarkNewSchool={() => markRowAsNewSchoolInstead(row)}
+                      onRunAiLookup={row.match_school_id ? () => runAiLookup(row) : null}
                     />
                   ))}
                 </div>
@@ -1083,7 +1249,7 @@ export default function ImportReconcilePage() {
   );
 }
 
-function RowCard({ row, busy, error, selection, onToggleField, onApplyNewInfo, onApplyConflict, onSkip, onAddNewSchool, onPickCandidate, onMarkNewSchool }) {
+function RowCard({ row, busy, error, aiNote, selection, onToggleField, onApplyNewInfo, onApplyConflict, onSkip, onAddNewSchool, onPickCandidate, onMarkNewSchool, onRunAiLookup }) {
   const resolved = row.resolution !== "pending";
   const m = row.mapped_data || {};
   const locationLabel = [m.city, m.state].filter(Boolean).join(", ");
@@ -1119,6 +1285,8 @@ function RowCard({ row, busy, error, selection, onToggleField, onApplyNewInfo, o
       )}
 
       {error && <div className="notice danger" style={{ marginTop: 8, fontSize: 12.5 }}>{error}</div>}
+
+      {aiNote && <div style={{ fontSize: 12, color: "#1c5fb3", marginTop: 6 }}>🤖 {aiNote}</div>}
 
       {row.skip_reason && <div style={{ fontSize: 12.5, color: "#a94442", marginTop: 6 }}>{row.skip_reason}</div>}
 
@@ -1161,6 +1329,24 @@ function RowCard({ row, busy, error, selection, onToggleField, onApplyNewInfo, o
                   <td>{f.old || "—"}</td>
                   <td style={{ color: f.kind === "overwrite" ? "#b8860b" : f.kind === "clear" ? "#b3261e" : "#1e7145", fontWeight: 700 }}>
                     {f.kind === "clear" ? "(will be cleared)" : f.new}
+                    {f.source === "ai" && f.estimated && (
+                      <span
+                        className="badge"
+                        style={{ marginLeft: 6, fontSize: 10, fontWeight: 700, color: "#b8860b", background: "#fff4dc" }}
+                        title="The AI didn't find this address written down anywhere -- it's a guessed first.last@domain pattern, not a confirmed email. Worth a quick sanity check before applying."
+                      >
+                        AI guess
+                      </span>
+                    )}
+                    {f.source === "ai" && !f.estimated && (
+                      <span
+                        className="badge"
+                        style={{ marginLeft: 6, fontSize: 10, fontWeight: 700, color: "#1c5fb3", background: "#e7effc" }}
+                        title={`Found by the live AI coach-info lookup, not the original sheet${f.confidence ? ` — confidence: ${f.confidence}` : ""}`}
+                      >
+                        AI{f.confidence ? ` · ${f.confidence}` : ""}
+                      </span>
+                    )}
                   </td>
                 </tr>
               ))}
@@ -1243,6 +1429,11 @@ function RowCard({ row, busy, error, selection, onToggleField, onApplyNewInfo, o
           {row.bucket === "new_school" && (
             <button className="btn btn-sm btn-gold" disabled={busy} onClick={onAddNewSchool}>
               Add as new school
+            </button>
+          )}
+          {onRunAiLookup && (row.bucket === "new_info" || row.bucket === "conflict") && (
+            <button className="btn btn-sm" disabled={busy} onClick={onRunAiLookup} title="Live web-search + AI lookup for this school's coach info -- fills genuine gaps only, never overwrites what the sheet or database already has">
+              {busy ? "Looking…" : "Suggest Coach Info (AI)"}
             </button>
           )}
           {row.bucket !== "needs_verification" && (
