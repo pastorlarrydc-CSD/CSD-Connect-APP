@@ -739,6 +739,20 @@ export default function DataQualityPage() {
   const [recheckExporting, setRecheckExporting] = useState(false);
   const [recheckExportError, setRecheckExportError] = useState("");
 
+  // CSV export state for the five list panels that didn't have a Download
+  // CSV button yet: Flagged as Possibly Outdated, Duplicate Cell Numbers,
+  // Duplicate Social Handles, Marked for Review, and My Recent Updates.
+  const [flaggedExporting, setFlaggedExporting] = useState(false);
+  const [flaggedExportError, setFlaggedExportError] = useState("");
+  const [dupeCellsExporting, setDupeCellsExporting] = useState(false);
+  const [dupeCellsExportError, setDupeCellsExportError] = useState("");
+  const [dupeSocialsExporting, setDupeSocialsExporting] = useState(false);
+  const [dupeSocialsExportError, setDupeSocialsExportError] = useState("");
+  const [reviewMarkedExporting, setReviewMarkedExporting] = useState(false);
+  const [reviewMarkedExportError, setReviewMarkedExportError] = useState("");
+  const [myUpdatesExporting, setMyUpdatesExporting] = useState(false);
+  const [myUpdatesExportError, setMyUpdatesExportError] = useState("");
+
   // Bulk Mark Verified -- for a batch that's already been confirmed some
   // other way (a trusted external roster, a phone-verified list) and just
   // needs marking, with no field changes to make. A much lighter cousin of
@@ -1941,6 +1955,148 @@ export default function DataQualityPage() {
       setRecheckExportError(err.message || "Could not export this list.");
     } finally {
       setRecheckExporting(false);
+    }
+  }
+
+  function exportFlaggedQueue() {
+    setFlaggedExportError("");
+    setFlaggedExporting(true);
+    try {
+      const csv = Papa.unparse({
+        fields: ["school_id", "school_name", "city", "state", "flag_type", "flagged_at", "flagged_by", "reason", "hc_first_name", "hc_last_name", "hc_email", "hc_cell", "confidence_score"],
+        data: flaggedQueue.map((flag) => {
+          const s = flag.schools;
+          return [
+            flag.school_id,
+            s?.name || "",
+            s?.city || "",
+            s?.state || "",
+            isAutomatedFlag(flag.reason) ? "Automated (Coach-Change Radar)" : "Manual flag",
+            flag.created_at ? new Date(flag.created_at).toISOString() : "",
+            flag.colleges?.name || "HS coach account",
+            flag.reason || "",
+            s?.hc_first_name || "",
+            s?.hc_last_name || "",
+            s?.hc_email || "",
+            s?.hc_cell || "",
+            s?.confidence_score ?? 0,
+          ];
+        }),
+      });
+      downloadBlob(csv, `flagged_possibly_outdated_${new Date().toISOString().slice(0, 10)}.csv`);
+    } catch (err) {
+      setFlaggedExportError(err.message || "Could not export this list.");
+    } finally {
+      setFlaggedExporting(false);
+    }
+  }
+
+  function exportDuplicateCells() {
+    setDupeCellsExportError("");
+    setDupeCellsExporting(true);
+    try {
+      const csv = Papa.unparse({
+        fields: ["cell_number", "school_id", "school_name", "city", "state", "hc_first_name", "hc_last_name"],
+        data: duplicateCells.flatMap((d) =>
+          d.schools.map((s) => [
+            fmtPhone(d.digits) || d.digits,
+            s.id,
+            s.name || "",
+            s.city || "",
+            s.state || "",
+            s.hc_first_name || "",
+            s.hc_last_name || "",
+          ])
+        ),
+      });
+      downloadBlob(csv, `duplicate_cell_numbers_${new Date().toISOString().slice(0, 10)}.csv`);
+    } catch (err) {
+      setDupeCellsExportError(err.message || "Could not export this list.");
+    } finally {
+      setDupeCellsExporting(false);
+    }
+  }
+
+  function exportDuplicateSocials() {
+    setDupeSocialsExportError("");
+    setDupeSocialsExporting(true);
+    try {
+      const csv = Papa.unparse({
+        fields: ["handle", "platform", "school_id", "school_name", "city", "state", "hc_first_name", "hc_last_name"],
+        data: duplicateSocials.flatMap((d) =>
+          d.schools.map((s) => [
+            d.value,
+            d.platform,
+            s.id,
+            s.name || "",
+            s.city || "",
+            s.state || "",
+            s.hc_first_name || "",
+            s.hc_last_name || "",
+          ])
+        ),
+      });
+      downloadBlob(csv, `duplicate_social_handles_${new Date().toISOString().slice(0, 10)}.csv`);
+    } catch (err) {
+      setDupeSocialsExportError(err.message || "Could not export this list.");
+    } finally {
+      setDupeSocialsExporting(false);
+    }
+  }
+
+  function exportReviewMarked() {
+    setReviewMarkedExportError("");
+    setReviewMarkedExporting(true);
+    try {
+      const csv = Papa.unparse({
+        fields: ["school_id", "school_name", "city", "state", "marked_at", "note", "hc_first_name", "hc_last_name", "hc_email", "hc_cell", "confidence_score"],
+        data: reviewMarked.map((s) => [
+          s.id,
+          s.name || "",
+          s.city || "",
+          s.state || "",
+          s.needs_review_marked_at ? new Date(s.needs_review_marked_at).toISOString() : "",
+          s.needs_review_note || "",
+          s.hc_first_name || "",
+          s.hc_last_name || "",
+          s.hc_email || "",
+          s.hc_cell || "",
+          s.confidence_score ?? 0,
+        ]),
+      });
+      downloadBlob(csv, `marked_for_review_${new Date().toISOString().slice(0, 10)}.csv`);
+    } catch (err) {
+      setReviewMarkedExportError(err.message || "Could not export this list.");
+    } finally {
+      setReviewMarkedExporting(false);
+    }
+  }
+
+  function exportMyUpdates() {
+    setMyUpdatesExportError("");
+    setMyUpdatesExporting(true);
+    try {
+      const csv = Papa.unparse({
+        fields: ["school_id", "school_name", "city", "state", "field", "old_value", "new_value", "source", "changed_at"],
+        data: myUpdates.flatMap((g) =>
+          g.fields.map((f) => [
+            g.school_id,
+            g.schools?.name || "",
+            g.schools?.city || "",
+            g.schools?.state || "",
+            COACH_CHANGE_FIELD_LABELS[f.field_name] || f.field_name,
+            f.old_value || "",
+            f.new_value || "",
+            COACH_CHANGE_SOURCE_META[g.source]?.label || g.source || "",
+            g.changed_at ? new Date(g.changed_at).toISOString() : "",
+          ])
+        ),
+      });
+      downloadBlob(csv, `my_recent_updates_${new Date().toISOString().slice(0, 10)}.csv`);
+    } catch (err) {
+      setMyUpdatesExportError(err.message || "Could not export this list.");
+    } finally {
+      setMyUpdatesExporting(false);
     }
   }
 
@@ -4565,7 +4721,11 @@ export default function DataQualityPage() {
               Every field you&apos;ve personally changed on a school, dated, from anywhere in the app — Quick Fix, Mark Coach Change, a batch-review Apply, a bulk upload, or editing a profile directly. Click &quot;Mark done&quot; once you&apos;re satisfied with an update to clear it from this list — the record and its history stay exactly as they are.
             </p>
           </div>
+          <button className="btn btn-sm" onClick={exportMyUpdates} disabled={myUpdatesExporting || myUpdates.length === 0}>
+            {myUpdatesExporting ? "Exporting…" : "Download CSV"}
+          </button>
         </div>
+        {myUpdatesExportError && <div className="notice danger" style={{ marginTop: 10 }}>{myUpdatesExportError}</div>}
         {dismissUpdateError && <div className="notice danger" style={{ marginTop: 10 }}>{dismissUpdateError}</div>}
         {loadingMyUpdates ? (
           <div className="empty-state" style={{ marginTop: 10 }}>Loading…</div>
@@ -4823,11 +4983,19 @@ export default function DataQualityPage() {
       </div>
 
       <div className="card" style={{ marginBottom: 14 }}>
-        <h3 style={{ marginBottom: 4 }}>Duplicate Cell Numbers ({duplicateCells.length})</h3>
-        <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
-          The same number currently listed as the live cell at two or more schools right now — usually a coach who moved and the old school's record was never updated, occasionally a
-          shared department line saved into the cell field by mistake.
-        </p>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+          <div>
+            <h3 style={{ marginBottom: 4 }}>Duplicate Cell Numbers ({duplicateCells.length})</h3>
+            <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
+              The same number currently listed as the live cell at two or more schools right now — usually a coach who moved and the old school's record was never updated, occasionally a
+              shared department line saved into the cell field by mistake.
+            </p>
+          </div>
+          <button className="btn btn-sm" onClick={exportDuplicateCells} disabled={dupeCellsExporting || duplicateCells.length === 0}>
+            {dupeCellsExporting ? "Exporting…" : "Download CSV"}
+          </button>
+        </div>
+        {dupeCellsExportError && <div className="notice danger" style={{ marginBottom: 10 }}>{dupeCellsExportError}</div>}
         {loadingDuplicateCells ? (
           <div className="empty-state">Loading…</div>
         ) : duplicateCells.length === 0 ? (
@@ -4903,10 +5071,18 @@ export default function DataQualityPage() {
       </div>
 
       <div className="card" style={{ marginBottom: 14 }}>
-        <h3 style={{ marginBottom: 4 }}>Duplicate Social Handles ({duplicateSocials.length})</h3>
-        <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
-          The same Twitter/X or Facebook handle currently listed as live at two or more schools right now — usually a coach who moved and the old school's record was never updated.
-        </p>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+          <div>
+            <h3 style={{ marginBottom: 4 }}>Duplicate Social Handles ({duplicateSocials.length})</h3>
+            <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
+              The same Twitter/X or Facebook handle currently listed as live at two or more schools right now — usually a coach who moved and the old school's record was never updated.
+            </p>
+          </div>
+          <button className="btn btn-sm" onClick={exportDuplicateSocials} disabled={dupeSocialsExporting || duplicateSocials.length === 0}>
+            {dupeSocialsExporting ? "Exporting…" : "Download CSV"}
+          </button>
+        </div>
+        {dupeSocialsExportError && <div className="notice danger" style={{ marginBottom: 10 }}>{dupeSocialsExportError}</div>}
         {loadingDuplicateSocials ? (
           <div className="empty-state">Loading…</div>
         ) : duplicateSocials.length === 0 ? (
@@ -5162,7 +5338,11 @@ export default function DataQualityPage() {
               Schools a reviewer bookmarked to come back to — an uncertain AI suggestion, a link that might belong to the wrong person, anything worth a second look. Not automated; these only show up here because someone clicked "Mark for Review." Most recently marked first.
             </p>
           </div>
+          <button className="btn btn-sm" onClick={exportReviewMarked} disabled={reviewMarkedExporting || reviewMarked.length === 0}>
+            {reviewMarkedExporting ? "Exporting…" : "Download CSV"}
+          </button>
         </div>
+        {reviewMarkedExportError && <div className="notice danger" style={{ marginBottom: 10 }}>{reviewMarkedExportError}</div>}
         {markReviewError && <div className="notice danger" style={{ marginBottom: 10 }}>{markReviewError}</div>}
         {loadingReviewMarked ? (
           <div className="empty-state">Loading…</div>
@@ -5398,10 +5578,18 @@ export default function DataQualityPage() {
       </div>
 
       <div className="card" style={{ marginBottom: 14 }}>
-        <h3 style={{ marginBottom: 4 }}>Flagged as Possibly Outdated ({flaggedQueue.length})</h3>
-        <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
-          Reported by coaches browsing the database, or raised automatically by Coach-Change Radar — surfaces here immediately, no scan needed.
-        </p>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 8 }}>
+          <div>
+            <h3 style={{ marginBottom: 4 }}>Flagged as Possibly Outdated ({flaggedQueue.length})</h3>
+            <p style={{ fontSize: 12.5, color: "#697386", marginTop: -2, marginBottom: 10 }}>
+              Reported by coaches browsing the database, or raised automatically by Coach-Change Radar — surfaces here immediately, no scan needed.
+            </p>
+          </div>
+          <button className="btn btn-sm" onClick={exportFlaggedQueue} disabled={flaggedExporting || flaggedQueue.length === 0}>
+            {flaggedExporting ? "Exporting…" : "Download CSV"}
+          </button>
+        </div>
+        {flaggedExportError && <div className="notice danger" style={{ marginBottom: 10 }}>{flaggedExportError}</div>}
         {flagActionError && <div className="notice danger" style={{ marginBottom: 10 }}>{flagActionError}</div>}
         {loadingFlags ? (
           <div className="empty-state">Loading…</div>
