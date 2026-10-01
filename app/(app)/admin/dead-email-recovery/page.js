@@ -4,6 +4,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
+import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
 
 // Dead Email Recovery -- built alongside the needs_review-clearing fix
 // (lib/needsReview.js) after Larry asked which of Run #34's 110
@@ -40,6 +41,8 @@ export default function DeadEmailRecoveryPage() {
   const [selected, setSelected] = useState(() => new Set());
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState("");
+  const [confirming, setConfirming] = useState(false);
+  const [confirmError, setConfirmError] = useState("");
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -141,6 +144,70 @@ export default function DeadEmailRecoveryPage() {
     }
   }
 
+  // For the stuck-but-actually-fine case Larry described: he manually opens a
+  // dead-email record, re-checks the address (school site, call, etc.), and
+  // finds the exact same email is still the right one -- there's no better
+  // option to switch to. Simply clearing needs_review would make the badge
+  // disappear but leaves no trace that a human ever looked, and the row would
+  // vanish from "stuck" tracking (ever_touched_by_coach_info is batch-based,
+  // not review-based) only if we removed the bounce record itself -- which we
+  // deliberately do NOT do, since the system should keep remembering this
+  // address has a history of hard-bouncing (for sender-reputation reasons,
+  // and so a future automated pass doesn't blindly re-trust it). Instead this
+  // logs a no-op school_change_log entry (old value == new value) as a durable
+  // "a human re-checked this on <date> and confirmed it" record, clears the
+  // needs_review bookmark via NEEDS_REVIEW_CLEAR_FIELDS, and stamps
+  // manually_confirmed_at/by on the underlying bounce event so the "Confirmed
+  // current" badge below can distinguish this from a never-checked row.
+  async function confirmSelectedCurrent() {
+    const selectedRows = rows.filter((r) => selected.has(r.school_id));
+    if (selectedRows.length === 0) return;
+    setConfirming(true);
+    setConfirmError("");
+    try {
+      const nowIso = new Date().toISOString();
+      const today = nowIso.slice(0, 10);
+
+      const logRows = selectedRows.map((r) => ({
+        school_id: r.school_id,
+        field_name: "hc_email",
+        old_value: r.hc_email,
+        new_value: r.hc_email,
+        source: `Manually re-checked by Larry DeVooght -- confirmed still the correct/current address, no better option found (Claude, ${today})`,
+        changed_by: null,
+      }));
+      const { error: logErr } = await supabase.from("school_change_log").insert(logRows);
+      if (logErr) throw logErr;
+
+      const schoolIds = selectedRows.map((r) => r.school_id);
+      const { error: schoolErr } = await supabase
+        .from("schools")
+        .update({ ...NEEDS_REVIEW_CLEAR_FIELDS })
+        .in("id", schoolIds);
+      if (schoolErr) throw schoolErr;
+
+      const eventIds = selectedRows.map((r) => r.event_id).filter(Boolean);
+      if (eventIds.length > 0) {
+        const { error: bounceErr } = await supabase
+          .from("email_bounce_events")
+          .update({ manually_confirmed_at: nowIso, manually_confirmed_by: user.id })
+          .in("id", eventIds);
+        if (bounceErr) throw bounceErr;
+      }
+
+      setSelected((prev) => {
+        const next = new Set(prev);
+        schoolIds.forEach((id) => next.delete(id));
+        return next;
+      });
+      await load();
+    } catch (err) {
+      setConfirmError(err.message || "Could not save the manual confirmation for the selected schools.");
+    } finally {
+      setConfirming(false);
+    }
+  }
+
   if (!canReview) {
     return (
       <div className="view">
@@ -168,6 +235,7 @@ export default function DeadEmailRecoveryPage() {
 
       {error && <div className="notice danger" style={{ marginBottom: 14 }}>{error}</div>}
       {sendError && <div className="notice danger" style={{ marginBottom: 14 }}>{sendError}</div>}
+      {confirmError && <div className="notice danger" style={{ marginBottom: 14 }}>{confirmError}</div>}
 
       {!loading && (
         <div className="card" style={{ marginBottom: 14, fontSize: 12.5, color: "#697386" }}>
@@ -188,9 +256,14 @@ export default function DeadEmailRecoveryPage() {
             <input type="checkbox" checked={onlyStuck} onChange={(e) => setOnlyStuck(e.target.checked)} />
             Only show schools stuck after already going through Coach-Info once
           </label>
-          <button className="btn btn-sm btn-gold" onClick={sendSelectedForRetry} disabled={sending || selected.size === 0}>
-            {sending ? "Starting…" : `Send ${selected.size} selected to Coach-Info for another AI pass`}
-          </button>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button className="btn btn-sm" onClick={confirmSelectedCurrent} disabled={confirming || selected.size === 0} title="Use this when you've personally re-checked these schools and the same email is still the best one on file -- keeps the bounce history, just clears the stuck flag.">
+              {confirming ? "Saving…" : `Confirm ${selected.size} selected -- same address, no better option found`}
+            </button>
+            <button className="btn btn-sm btn-gold" onClick={sendSelectedForRetry} disabled={sending || selected.size === 0}>
+              {sending ? "Starting…" : `Send ${selected.size} selected to Coach-Info for another AI pass`}
+            </button>
+          </div>
         </div>
       </div>
 
@@ -245,6 +318,15 @@ export default function DeadEmailRecoveryPage() {
                   {r.needs_review && (
                     <span className="badge" style={{ marginLeft: 6, color: "#8a6100", background: "#fff4dc" }} title={r.needs_review_note || "Marked for review"}>
                       Needs review
+                    </span>
+                  )}
+                  {r.manually_confirmed_at && (
+                    <span
+                      className="badge"
+                      style={{ marginLeft: 6, color: "#1a7f4b", background: "#e6f6ee" }}
+                      title={`A reviewer manually re-checked this address on ${new Date(r.manually_confirmed_at).toLocaleDateString()} and confirmed it's still the correct/current one on file.`}
+                    >
+                      Confirmed current
                     </span>
                   )}
                 </td>
