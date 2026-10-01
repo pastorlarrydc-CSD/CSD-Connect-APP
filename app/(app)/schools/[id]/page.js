@@ -4,6 +4,7 @@ import { useParams, useRouter } from "next/navigation";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 import { resolveCoachNameAt } from "@/lib/coachHistory";
+import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
 
 function fmtPhone(v) {
   if (!v) return "";
@@ -16,6 +17,13 @@ function withProtocol(v) {
   const trimmed = v.trim();
   if (!trimmed) return null;
   return /^https?:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`;
+}
+
+// Case-insensitive/trimmed match -- same normalization the dead_email_schools
+// view uses (lower(trim(...))) to decide whether a school's current hc_email
+// still equals its latest hard-bounce address.
+function normEmail(v) {
+  return (v || "").trim().toLowerCase();
 }
 
 // Find MaxPreps page / Find athletics page / Suggest Coach Info (AI) / Find
@@ -1118,6 +1126,57 @@ export default function SchoolProfilePage() {
           changed_by: user.id,
         });
       }
+      // Dead Email Recovery tie-in: if this school currently has an open
+      // hard-bounce on hc_email (i.e. it's sitting in the dead_email_schools
+      // view right now), check whether this save is the "I looked and it's
+      // still the right address" case rather than a real fix. Larry's own
+      // description of his workflow is opening a record from Dead Email
+      // Recovery, running Suggest Coach Info (AI), and saving right here --
+      // so this save is the natural place to record that confirmation
+      // instead of making him go back to that page and click Confirm
+      // separately. Mirrors confirmSelectedCurrent in
+      // app/(app)/admin/dead-email-recovery/page.js exactly: stamp
+      // manually_confirmed_at/by on the bounce event, clear needs_review via
+      // NEEDS_REVIEW_CLEAR_FIELDS, keep the bounce record itself intact. A
+      // save that actually changes hc_email to something new needs none of
+      // this -- the dead_email_schools view already drops a school the
+      // moment its current hc_email no longer matches the bounced one, and
+      // the ordinary school_change_log entry above (from the STAFF_EDIT_FIELDS
+      // loop) already documents that fix.
+      const oldHcEmail = school.hc_email || null;
+      const effectiveNewHcEmail = Object.prototype.hasOwnProperty.call(update, "hc_email") ? update.hc_email : oldHcEmail;
+      let bounceConfirm = null;
+      try {
+        const { data: latestBounce } = await supabase
+          .from("email_bounce_events")
+          .select("id, bounced_email")
+          .eq("school_id", id)
+          .eq("email_field", "hc_email")
+          .order("detected_at", { ascending: false })
+          .limit(1)
+          .maybeSingle();
+        if (latestBounce && normEmail(latestBounce.bounced_email) === normEmail(oldHcEmail) && normEmail(effectiveNewHcEmail) === normEmail(latestBounce.bounced_email)) {
+          bounceConfirm = latestBounce;
+          Object.assign(update, NEEDS_REVIEW_CLEAR_FIELDS);
+          if (!Object.prototype.hasOwnProperty.call(update, "hc_email")) {
+            // No plain field-diff entry will be written for hc_email since it
+            // didn't change -- add the same no-op confirmation log entry
+            // Dead Email Recovery's own Confirm button writes, so this still
+            // leaves a durable record that a human re-checked it here.
+            changes.push({
+              school_id: id,
+              field_name: "hc_email",
+              old_value: oldHcEmail,
+              new_value: oldHcEmail,
+              source: `School profile (quick fix) -- confirmed same address, no better option found (Claude, ${nowIso.slice(0, 10)})`,
+              changed_by: user.id,
+            });
+          }
+        }
+      } catch (bounceErr) {
+        console.error("Could not check email_bounce_events for Dead Email Recovery tie-in", bounceErr);
+      }
+
       // confidence_score isn't set here -- the schools table recomputes it
       // itself on every write via trg_set_school_confidence_score.
       const { error } = await supabase.from("schools").update(update).eq("id", id);
@@ -1125,6 +1184,13 @@ export default function SchoolProfilePage() {
       if (changes.length) {
         const { error: logError } = await supabase.from("school_change_log").insert(changes);
         if (logError) throw logError;
+      }
+      if (bounceConfirm) {
+        const { error: bounceUpdateErr } = await supabase
+          .from("email_bounce_events")
+          .update({ manually_confirmed_at: nowIso, manually_confirmed_by: user.id })
+          .eq("id", bounceConfirm.id);
+        if (bounceUpdateErr) console.error("Could not stamp manually_confirmed_at/by on the bounce event", bounceUpdateErr);
       }
       await logManualVerification({ ...school, ...update });
       await resolveAllPendingFlags();
