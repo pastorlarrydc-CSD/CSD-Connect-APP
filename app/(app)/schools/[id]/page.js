@@ -1089,6 +1089,54 @@ export default function SchoolProfilePage() {
     setSocialSuggestions((prev) => ({ ...prev, [field === "hc_twitter" ? "twitter" : "facebook"]: [] }));
   }
 
+  // Shared by saveStaffEdit AND markVerified below -- the Dead Email
+  // Recovery tie-in. Larry's own framing was "when I look at the record and
+  // save/verify," which covers both of this page's confirm actions, not
+  // just the Quick Fix Save button -- a first pass only wired this into
+  // saveStaffEdit and missed Mark Verified, which is the button he actually
+  // used testing it live (confirmed via school_recheck_log/school_change_log
+  // timestamps on Albany HS, CA: logManualVerification ran but no
+  // school_change_log entry landed, meaning the save path never touched it).
+  // Checks whether this school currently has an open hard-bounce on
+  // hc_email (i.e. it's sitting in the dead_email_schools view right now)
+  // and whether the email being saved/verified is still that exact bounced
+  // address -- the "I looked and it's still the right address" case, not a
+  // real fix. Returns the matching email_bounce_events row so the caller
+  // can stamp it, or null. A save that actually changes hc_email to
+  // something new needs none of this -- the dead_email_schools view already
+  // drops a school the moment its current hc_email no longer matches the
+  // bounced one.
+  async function findConfirmableBounce(oldHcEmail, newHcEmail) {
+    try {
+      const { data: latestBounce } = await supabase
+        .from("email_bounce_events")
+        .select("id, bounced_email")
+        .eq("school_id", id)
+        .eq("email_field", "hc_email")
+        .order("detected_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (latestBounce && normEmail(latestBounce.bounced_email) === normEmail(oldHcEmail) && normEmail(newHcEmail) === normEmail(latestBounce.bounced_email)) {
+        return latestBounce;
+      }
+      return null;
+    } catch (err) {
+      console.error("Could not check email_bounce_events for Dead Email Recovery tie-in", err);
+      return null;
+    }
+  }
+
+  // Stamps manually_confirmed_at/by on the bounce row findConfirmableBounce
+  // matched, after the schools write that confirmed it has landed.
+  async function stampBounceConfirmed(bounceRow, nowIso) {
+    if (!bounceRow) return;
+    const { error } = await supabase
+      .from("email_bounce_events")
+      .update({ manually_confirmed_at: nowIso, manually_confirmed_by: user.id })
+      .eq("id", bounceRow.id);
+    if (error) console.error("Could not stamp manually_confirmed_at/by on the bounce event", error);
+  }
+
   async function saveStaffEdit(e) {
     e.preventDefault();
     setStaffSaveError("");
@@ -1126,55 +1174,26 @@ export default function SchoolProfilePage() {
           changed_by: user.id,
         });
       }
-      // Dead Email Recovery tie-in: if this school currently has an open
-      // hard-bounce on hc_email (i.e. it's sitting in the dead_email_schools
-      // view right now), check whether this save is the "I looked and it's
-      // still the right address" case rather than a real fix. Larry's own
-      // description of his workflow is opening a record from Dead Email
-      // Recovery, running Suggest Coach Info (AI), and saving right here --
-      // so this save is the natural place to record that confirmation
-      // instead of making him go back to that page and click Confirm
-      // separately. Mirrors confirmSelectedCurrent in
-      // app/(app)/admin/dead-email-recovery/page.js exactly: stamp
-      // manually_confirmed_at/by on the bounce event, clear needs_review via
-      // NEEDS_REVIEW_CLEAR_FIELDS, keep the bounce record itself intact. A
-      // save that actually changes hc_email to something new needs none of
-      // this -- the dead_email_schools view already drops a school the
-      // moment its current hc_email no longer matches the bounced one, and
-      // the ordinary school_change_log entry above (from the STAFF_EDIT_FIELDS
-      // loop) already documents that fix.
+      // Dead Email Recovery tie-in -- see findConfirmableBounce above.
       const oldHcEmail = school.hc_email || null;
       const effectiveNewHcEmail = Object.prototype.hasOwnProperty.call(update, "hc_email") ? update.hc_email : oldHcEmail;
-      let bounceConfirm = null;
-      try {
-        const { data: latestBounce } = await supabase
-          .from("email_bounce_events")
-          .select("id, bounced_email")
-          .eq("school_id", id)
-          .eq("email_field", "hc_email")
-          .order("detected_at", { ascending: false })
-          .limit(1)
-          .maybeSingle();
-        if (latestBounce && normEmail(latestBounce.bounced_email) === normEmail(oldHcEmail) && normEmail(effectiveNewHcEmail) === normEmail(latestBounce.bounced_email)) {
-          bounceConfirm = latestBounce;
-          Object.assign(update, NEEDS_REVIEW_CLEAR_FIELDS);
-          if (!Object.prototype.hasOwnProperty.call(update, "hc_email")) {
-            // No plain field-diff entry will be written for hc_email since it
-            // didn't change -- add the same no-op confirmation log entry
-            // Dead Email Recovery's own Confirm button writes, so this still
-            // leaves a durable record that a human re-checked it here.
-            changes.push({
-              school_id: id,
-              field_name: "hc_email",
-              old_value: oldHcEmail,
-              new_value: oldHcEmail,
-              source: `School profile (quick fix) -- confirmed same address, no better option found (Claude, ${nowIso.slice(0, 10)})`,
-              changed_by: user.id,
-            });
-          }
+      const bounceConfirm = await findConfirmableBounce(oldHcEmail, effectiveNewHcEmail);
+      if (bounceConfirm) {
+        Object.assign(update, NEEDS_REVIEW_CLEAR_FIELDS);
+        if (!Object.prototype.hasOwnProperty.call(update, "hc_email")) {
+          // No plain field-diff entry will be written for hc_email since it
+          // didn't change -- add the same no-op confirmation log entry
+          // Dead Email Recovery's own Confirm button writes, so this still
+          // leaves a durable record that a human re-checked it here.
+          changes.push({
+            school_id: id,
+            field_name: "hc_email",
+            old_value: oldHcEmail,
+            new_value: oldHcEmail,
+            source: `School profile (quick fix) -- confirmed same address, no better option found (Claude, ${nowIso.slice(0, 10)})`,
+            changed_by: user.id,
+          });
         }
-      } catch (bounceErr) {
-        console.error("Could not check email_bounce_events for Dead Email Recovery tie-in", bounceErr);
       }
 
       // confidence_score isn't set here -- the schools table recomputes it
@@ -1185,13 +1204,7 @@ export default function SchoolProfilePage() {
         const { error: logError } = await supabase.from("school_change_log").insert(changes);
         if (logError) throw logError;
       }
-      if (bounceConfirm) {
-        const { error: bounceUpdateErr } = await supabase
-          .from("email_bounce_events")
-          .update({ manually_confirmed_at: nowIso, manually_confirmed_by: user.id })
-          .eq("id", bounceConfirm.id);
-        if (bounceUpdateErr) console.error("Could not stamp manually_confirmed_at/by on the bounce event", bounceUpdateErr);
-      }
+      await stampBounceConfirmed(bounceConfirm, nowIso);
       await logManualVerification({ ...school, ...update });
       await resolveAllPendingFlags();
       setStaffEditing(false);
@@ -1210,8 +1223,28 @@ export default function SchoolProfilePage() {
     try {
       const nowIso = new Date().toISOString();
       const update = { verification_status: "verified", last_verified_at: nowIso, coach_radar_reviewed_at: nowIso };
+      // Dead Email Recovery tie-in -- see findConfirmableBounce above. Mark
+      // Verified never changes hc_email itself (unlike Quick Fix Save), so a
+      // school with an open bounce still present here is always the "same
+      // address, no better option found" case: Larry opened the stuck
+      // record, looked, and this is him saying it's still right.
+      const oldHcEmail = school.hc_email || null;
+      const bounceConfirm = await findConfirmableBounce(oldHcEmail, oldHcEmail);
+      if (bounceConfirm) Object.assign(update, NEEDS_REVIEW_CLEAR_FIELDS);
       const { error } = await supabase.from("schools").update(update).eq("id", id);
       if (error) throw error;
+      if (bounceConfirm) {
+        const { error: logError } = await supabase.from("school_change_log").insert({
+          school_id: id,
+          field_name: "hc_email",
+          old_value: oldHcEmail,
+          new_value: oldHcEmail,
+          source: `School profile (Mark Verified) -- confirmed same address, no better option found (Claude, ${nowIso.slice(0, 10)})`,
+          changed_by: user.id,
+        });
+        if (logError) console.error("Could not log the Dead Email Recovery confirmation", logError);
+      }
+      await stampBounceConfirmed(bounceConfirm, nowIso);
       await logManualVerification({ ...school, ...update });
       await resolveAllPendingFlags();
       load();
