@@ -19,6 +19,14 @@ import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
 const PAGE_SIZE = 1000;
 const BATCH_SIZE = 300;
 
+// Case-insensitive/trimmed match -- same normalization the dead_email_schools
+// view uses (lower(trim(...))) to decide whether a school's current hc_email
+// still equals its latest hard-bounce address. Mirrors the identical helper
+// in app/(app)/schools/[id]/page.js.
+function normEmail(v) {
+  return (v || "").trim().toLowerCase();
+}
+
 // Fields the live AI coach-info lookup (see runAiLookup below) is allowed
 // to fill. Deliberately the coach/AD identity fields only -- the same ones
 // the school profile page's own "Suggest Coach Info (AI)" button offers --
@@ -539,6 +547,52 @@ export default function ImportReconcilePage() {
 
   // ---- Field-level apply (new_info + conflict rows) --------------------
 
+  // Dead Email Recovery tie-in, same semantics as the school profile page's
+  // findConfirmableBounce/stampBounceConfirmed (app/(app)/schools/[id]/
+  // page.js) -- Larry asked for Import & Reconcile to close the same loop:
+  // a row reviewed and applied/saved here, for a school that's currently
+  // sitting in Dead Email Recovery (dead_email_schools view -- current
+  // hc_email still matches its latest hard bounce), should record that a
+  // human looked at it. If the email ending up on file is a genuinely new
+  // address, nothing extra is needed -- the view already drops that school
+  // on its own the moment hc_email no longer matches the bounce, and the
+  // ordinary school_change_log entry already documents the fix. If the
+  // email ending up on file is STILL the bounced one (reviewed and
+  // confirmed, not changed), this stamps manually_confirmed_at/by so Dead
+  // Email Recovery shows it as checked instead of leaving it looking
+  // never-touched. oldHcEmail/newHcEmail must both be the live, current
+  // on-file value as of right before the write -- this tool's `row.diff`
+  // only carries fields that differ from the sheet, so a fresh read is
+  // needed to know the current value for a field that ISN'T in the diff.
+  async function findConfirmableBounce(schoolId, oldHcEmail, newHcEmail) {
+    try {
+      const { data: latestBounce } = await supabase
+        .from("email_bounce_events")
+        .select("id, bounced_email")
+        .eq("school_id", schoolId)
+        .eq("email_field", "hc_email")
+        .order("detected_at", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (latestBounce && normEmail(latestBounce.bounced_email) === normEmail(oldHcEmail) && normEmail(newHcEmail) === normEmail(latestBounce.bounced_email)) {
+        return latestBounce;
+      }
+      return null;
+    } catch (err) {
+      console.error("Could not check email_bounce_events for Dead Email Recovery tie-in", err);
+      return null;
+    }
+  }
+
+  async function stampBounceConfirmed(bounceRow, nowIso) {
+    if (!bounceRow) return;
+    const { error } = await supabase
+      .from("email_bounce_events")
+      .update({ manually_confirmed_at: nowIso, manually_confirmed_by: user.id })
+      .eq("id", bounceRow.id);
+    if (error) console.error("Could not stamp manually_confirmed_at/by on the bounce event", error);
+  }
+
   async function applyRowFields(row, fieldsToApply) {
     setRowBusy((p) => ({ ...p, [row.id]: true }));
     setRowError((p) => ({ ...p, [row.id]: null }));
@@ -583,12 +637,39 @@ export default function ImportReconcilePage() {
         });
       });
 
+      // Dead Email Recovery tie-in -- see findConfirmableBounce above. A
+      // fresh read of the live hc_email, since row.diff only carries fields
+      // that differ from the sheet -- if hc_email isn't in fieldsToApply,
+      // it's unchanged, and we need the real current value (not a possibly
+      // stale one from whenever this row was first categorized) to know
+      // whether it still matches the bounce.
+      const hcEmailChange = fieldsToApply.find((f) => f.field === "hc_email");
+      let bounceConfirm = null;
+      if (hcEmailChange) {
+        bounceConfirm = await findConfirmableBounce(row.match_school_id, hcEmailChange.old || null, hcEmailChange.new);
+      } else {
+        const { data: currentRow } = await supabase.from("schools").select("hc_email").eq("id", row.match_school_id).maybeSingle();
+        const currentHcEmail = currentRow?.hc_email || null;
+        bounceConfirm = await findConfirmableBounce(row.match_school_id, currentHcEmail, currentHcEmail);
+        if (bounceConfirm) {
+          logs.push({
+            school_id: row.match_school_id,
+            field_name: "hc_email",
+            old_value: currentHcEmail,
+            new_value: currentHcEmail,
+            source: `Import & Reconcile (CSV) -- confirmed same address, no better option found (Claude, ${now.slice(0, 10)})`,
+            changed_by: user.id,
+          });
+        }
+      }
+
       const { error: updErr } = await supabase.from("schools").update(update).eq("id", row.match_school_id);
       if (updErr) throw updErr;
       if (logs.length) {
         const { error: logErr } = await supabase.from("school_change_log").insert(logs);
         if (logErr) throw logErr;
       }
+      await stampBounceConfirmed(bounceConfirm, now);
 
       // Also clear any pending "possibly outdated" flags on this school
       // (school_flags -- the automated Coach-Change Radar / coach-submitted
@@ -918,10 +999,32 @@ export default function ImportReconcilePage() {
         }
       });
 
+      // Dead Email Recovery tie-in -- see findConfirmableBounce above.
+      // profileSchool was fetched fresh when this drawer opened, so its
+      // hc_email is the live current value -- safe to use directly, unlike
+      // applyRowFields above (which only has row.diff to go on). A school
+      // with an open bounce on hc_email, where the value ending up on file
+      // is still that bounced address, means this Save is the "I looked and
+      // it's still right" case.
+      const oldHcEmail = profileSchool.hc_email || null;
+      const effectiveNewHcEmail = Object.prototype.hasOwnProperty.call(update, "hc_email") ? update.hc_email : oldHcEmail;
+      const bounceConfirm = await findConfirmableBounce(profileSchool.id, oldHcEmail, effectiveNewHcEmail);
+      if (bounceConfirm && !Object.prototype.hasOwnProperty.call(update, "hc_email")) {
+        logs.push({
+          school_id: profileSchool.id,
+          field_name: "hc_email",
+          old_value: oldHcEmail,
+          new_value: oldHcEmail,
+          source: `Import & Reconcile (Quick Edit from parsing screen) -- confirmed same address, no better option found (Claude, ${now.slice(0, 10)})`,
+          changed_by: user.id,
+        });
+      }
+
       if (!logs.length) {
-        // Nothing actually changed -- still worth a visible "Saved" so a
-        // click on Save isn't silently a no-op, but no point writing an
-        // identical row or an empty change-log entry.
+        // Nothing actually changed and there's no bounce to confirm either
+        // -- still worth a visible "Saved" so a click on Save isn't
+        // silently a no-op, but no point writing an identical row or an
+        // empty change-log entry.
         setProfileJustSaved(true);
         return;
       }
@@ -930,6 +1033,7 @@ export default function ImportReconcilePage() {
       if (updErr) throw updErr;
       const { error: logErr } = await supabase.from("school_change_log").insert(logs);
       if (logErr) throw logErr;
+      await stampBounceConfirmed(bounceConfirm, now);
 
       // Same best-effort retry (and same "say so instead of pretending it
       // worked" rule) as applyRowFields above.
