@@ -1711,6 +1711,92 @@ function BatchCoachInfoPageInner() {
     }
   }
 
+  // "Confirmed -- same address, no better option found": the bounce-recovery
+  // counterpart to confirmNoDataAvailableCore above, for the opposite finding
+  // -- the AI DID look, but came back with nothing better than what's already
+  // on file (that's exactly what lands an item in noChangesPendingItems).
+  // Larry's own words describing this: he opens a dead-email record, re-checks
+  // it, and finds "the same email is listed... nothing is changing." Plain
+  // Skip (bulkSkipNoChanges) only touches coach_info_batch_items, so it leaves
+  // the school stuck exactly where Dead Email Recovery found it: needs_review
+  // still set, and the underlying email_bounce_events row still looking
+  // never-rechecked. This instead writes the same no-op school_change_log
+  // confirmation Dead Email Recovery's confirmSelectedCurrent writes, clears
+  // needs_review via NEEDS_REVIEW_CLEAR_FIELDS, and stamps
+  // manually_confirmed_at/by on the school's bounce event(s) -- matched by
+  // school_id the same way startRun above marks bounce events "reviewed" for
+  // this mode, since items here don't carry a specific event_id. Deliberately
+  // scoped to candidate_mode "bounce_recovery" only -- for every other mode,
+  // "no changes" just means the coach was already right, there's no bounce
+  // history to reconcile.
+  async function confirmBounceNoChangeCore(item) {
+    try {
+      const s = item.school;
+      if (!s) return { ok: false, error: "Missing school." };
+      const nowIso = new Date().toISOString();
+      const { error: logErr } = await supabase.from("school_change_log").insert({
+        school_id: s.id,
+        field_name: "hc_email",
+        old_value: s.hc_email || null,
+        new_value: s.hc_email || null,
+        source: `Batch Coach-Info review (bounce recovery) -- confirmed same address, no better option found (Claude, ${nowIso.slice(0, 10)})`,
+        changed_by: user.id,
+      });
+      if (logErr) throw logErr;
+      const { error: schoolErr } = await supabase
+        .from("schools")
+        .update({ ...NEEDS_REVIEW_CLEAR_FIELDS })
+        .eq("id", s.id);
+      if (schoolErr) throw schoolErr;
+      const { error: bounceErr } = await supabase
+        .from("email_bounce_events")
+        .update({ manually_confirmed_at: nowIso, manually_confirmed_by: user.id })
+        .eq("school_id", s.id)
+        .eq("email_field", "hc_email");
+      if (bounceErr) throw bounceErr;
+      const { error: itemErr } = await supabase
+        .from("coach_info_batch_items")
+        .update({ review_status: "skipped", reviewed_at: nowIso, reviewed_by: user.id })
+        .eq("id", item.id);
+      if (itemErr) throw itemErr;
+      return { ok: true };
+    } catch (err) {
+      return { ok: false, error: err.message || "Could not confirm this school." };
+    }
+  }
+
+  async function confirmBounceNoChange(item) {
+    setApplyingId(item.id);
+    setReviewError("");
+    const result = await confirmBounceNoChangeCore(item);
+    if (result.ok) {
+      setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: "skipped" } : i)));
+    } else {
+      setReviewError(result.error);
+    }
+    setApplyingId(null);
+  }
+
+  async function bulkConfirmBounceNoChange() {
+    const targets = noChangesPendingItems;
+    if (!targets.length) return;
+    setBulkSkipping(true);
+    setReviewError("");
+    const failures = [];
+    await runWithConcurrency(targets, APPLY_CONCURRENCY, async (item) => {
+      const result = await confirmBounceNoChangeCore(item);
+      if (result.ok) {
+        setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: "skipped" } : i)));
+      } else {
+        failures.push(`${item.school?.name || `#${item.id}`}: ${result.error}`);
+      }
+    });
+    setBulkSkipping(false);
+    if (failures.length > 0) {
+      setReviewError(`Confirmed ${targets.length - failures.length} of ${targets.length}. ${failures.length} failed: ${failures.slice(0, 3).join("; ")}${failures.length > 3 ? "…" : ""}`);
+    }
+  }
+
   // Downloads exactly what's currently on screen (visibleRows -- same
   // search box + confidence filter + "Show already-reviewed" the table
   // itself uses) as a CSV: one current/suggested pair per field so it's
@@ -2164,13 +2250,28 @@ function BatchCoachInfoPageInner() {
                     borderRadius: 8,
                   }}
                 >
-                  <span style={{ fontSize: 12.5 }}>
-                    <strong>{noChangesPendingCount}</strong> have <strong>nothing to apply</strong> -- the coach was confirmed but no new email, phone, or social turned up anywhere.
-                    Skipping never writes to a school's record, so these are safe to clear in one click too.
-                  </span>
-                  <button className="btn btn-sm" onClick={bulkSkipNoChanges} disabled={bulkApplying || bulkSkipping}>
-                    {bulkSkipping ? "Skipping…" : `Skip All — No Changes Suggested (${noChangesPendingCount})`}
-                  </button>
+                  {selectedRun?.candidate_mode === "bounce_recovery" ? (
+                    <>
+                      <span style={{ fontSize: 12.5 }}>
+                        <strong>{noChangesPendingCount}</strong> came back with <strong>nothing better</strong> than the address already on file -- the AI looked but didn't find a
+                        replacement. If you've separately confirmed this is still the right email, Confirm logs that check and clears the stuck flag without erasing the bounce
+                        history. Plain Skip leaves it exactly as stuck as it is now.
+                      </span>
+                      <button className="btn btn-sm" onClick={bulkConfirmBounceNoChange} disabled={bulkApplying || bulkSkipping}>
+                        {bulkSkipping ? "Confirming…" : `Confirm All — Same Address, No Better Option Found (${noChangesPendingCount})`}
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <span style={{ fontSize: 12.5 }}>
+                        <strong>{noChangesPendingCount}</strong> have <strong>nothing to apply</strong> -- the coach was confirmed but no new email, phone, or social turned up anywhere.
+                        Skipping never writes to a school's record, so these are safe to clear in one click too.
+                      </span>
+                      <button className="btn btn-sm" onClick={bulkSkipNoChanges} disabled={bulkApplying || bulkSkipping}>
+                        {bulkSkipping ? "Skipping…" : `Skip All — No Changes Suggested (${noChangesPendingCount})`}
+                      </button>
+                    </>
+                  )}
                 </div>
               )}
 
