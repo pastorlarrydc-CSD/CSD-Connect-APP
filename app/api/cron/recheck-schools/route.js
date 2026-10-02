@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
 import { checkSchoolCoach, checkEmailDeliverability } from "@/lib/schoolRecheck";
+import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
 
 export const maxDuration = 60;
 
@@ -15,14 +16,22 @@ export const maxDuration = 60;
 // `Authorization: Bearer <CRON_SECRET>` using the CRON_SECRET environment
 // variable, and this route rejects anything that doesn't match.
 //
-// Deliberately conservative, same as the manual route: never edits any of
-// a school's own fields (name, coach info, URLs, verification_status,
-// etc.) -- that stays entirely human-driven. Every check is logged to
+// Deliberately conservative, same as the manual route: never edits any of a
+// school's own CONTENT fields (name, coach info, URLs, etc.) -- that stays
+// entirely human-driven, same as before. Every check is logged to
 // school_recheck_log so the data is there to review (attributed to CSD's
 // own sysadmin account, since there's no human to credit an automated
-// check to). The one exception is confidence_score, which is a derived
-// number the database recomputes on its own -- see the note near the
-// bottom of the worker loop.
+// check to). confidence_score is a derived number the database recomputes
+// on its own -- see the note near the bottom of the worker loop.
+//
+// As of the auto-verify change below, this is no longer the ONLY exception:
+// a full-confidence "confirmed" result (see the "Auto-verify" note further
+// down) can now also write verification_status, last_verified_at, and
+// coach_radar_reviewed_at -- but never anything about WHO the coach is or
+// HOW to reach them, only whether the record already on file has been
+// independently corroborated. Every such write is logged to
+// school_change_log exactly like a human edit would be, just attributed to
+// this sweep instead of a person.
 //
 // Two independent accuracy checks run per school, in parallel: the coach
 // name check above (now cross-referencing the first name too, when one's
@@ -65,6 +74,33 @@ export const maxDuration = 60;
 // bonus, and one sitting on an unresolved flag gets marked down, until
 // this sweep -- or a human -- resolves it.
 //
+// Auto-verify, added so this sweep also shrinks the unverified backlog
+// instead of only maintaining already-verified records -- see
+// claude/verification-backlog-speedup-ideas.md idea #6 ("Let Coach-Change
+// Radar audit the backlog, not just the already-verified"). When a school
+// comes back with a FULL "confirmed" match (the coach's first AND last name
+// found together on the athletics site or school website -- never on a
+// "confirmed_weak" or MaxPreps-only "confirmed_maxpreps" result, both of
+// which stay exactly as conservative as before) AND its email deliverability
+// check came back clean, that's a real independent corroboration of the
+// on-file record, not just "nobody has clicked verify yet." A school that's
+// currently unverified gets promoted to verification_status = "verified"
+// automatically, logged to school_change_log (attributed to this sweep, not
+// to a human) exactly like every other write this app makes, and dropped
+// out of the needs_review queue via NEEDS_REVIEW_CLEAR_FIELDS. A school
+// that's already verified just gets its coach_radar_reviewed_at clock reset
+// on a clean re-confirmation, so a long-correct record stops re-queuing
+// itself every night forever (nothing before this change ever set that
+// column outside of a human action) and the nightly budget reaches new/
+// never-checked schools faster instead of re-walking settled ones.
+//
+// Deliberately NOT done on a weak or MaxPreps-only match, and NOT done when
+// the email check failed -- those cases keep working exactly as before
+// (logged, and routed to a human via the existing flag logic), since a
+// partial match or a broken email address is still a real question mark
+// that a human should look at, not something this sweep should silently
+// wave through.
+
 // Processes up to BATCH_SIZE candidates per run, but stops picking up new
 // work once TIME_BUDGET_MS has elapsed so it always finishes comfortably
 // within maxDuration -- whatever doesn't get to this run just rises to the
@@ -106,7 +142,7 @@ export async function GET(req) {
 
   const { data: candidates, error: candErr } = await supabase
     .from("school_recheck_priority")
-    .select("school_id, website, hc_first_name, hc_last_name, hc_email, maxpreps_url, athletics_url")
+    .select("school_id, website, hc_first_name, hc_last_name, hc_email, maxpreps_url, athletics_url, verification_status")
     // Primary sort is staleness (never-checked schools first). Almost all
     // never-checked schools tie on that (last_checked_at is NULL for all of
     // them), so a second tiebreaker matters: prefer schools that have an
@@ -132,6 +168,8 @@ export async function GET(req) {
   let weakFlagsOpened = 0;
   let emailFlagsOpened = 0;
   let confidenceUpdated = 0;
+  let autoVerified = 0;
+  let radarClockRefreshed = 0;
   let cursor = 0;
 
   async function worker() {
@@ -231,6 +269,39 @@ export async function GET(req) {
             weakFlagsOpened++;
           }
         }
+      } else if (result === "confirmed") {
+        // Full-confidence match (first AND last name both confirmed) --
+        // see the "Auto-verify" note near the top of this file. Gated on
+        // the email check also being clean, checked below once emailCheck
+        // is available.
+        if (emailCheck.ok || emailCheck.skipped) {
+          const nowIso = new Date().toISOString();
+          if (c.verification_status !== "verified") {
+            const update = {
+              verification_status: "verified",
+              last_verified_at: nowIso,
+              coach_radar_reviewed_at: nowIso,
+              ...NEEDS_REVIEW_CLEAR_FIELDS,
+            };
+            const { error: verifyErr } = await supabase.from("schools").update(update).eq("id", c.school_id);
+            if (!verifyErr) {
+              await supabase.from("school_change_log").insert({
+                school_id: c.school_id,
+                field_name: "verification_status",
+                old_value: c.verification_status || "not_verified",
+                new_value: "verified",
+                source: `Automated nightly Coach-Change Radar sweep -- head coach "${[c.hc_first_name, c.hc_last_name].filter(Boolean).join(" ")}" independently confirmed on ${detail.includes("athletics site") ? "the athletics site" : "the school website"} (Claude, ${nowIso.slice(0, 10)})`,
+                changed_by: SYSTEM_USER_ID,
+              });
+              autoVerified++;
+            } else {
+              console.error("cron recheck: auto-verify update failed", c.school_id, verifyErr);
+            }
+          } else {
+            const { error: refreshErr } = await supabase.from("schools").update({ coach_radar_reviewed_at: nowIso }).eq("id", c.school_id);
+            if (!refreshErr) radarClockRefreshed++;
+          }
+        }
       }
 
       // Email deliverability doesn't need a miss-streak -- a malformed
@@ -285,6 +356,8 @@ export async function GET(req) {
     weak_flags_opened: weakFlagsOpened,
     email_flags_opened: emailFlagsOpened,
     confidence_scores_updated: confidenceUpdated,
+    auto_verified: autoVerified,
+    radar_clock_refreshed: radarClockRefreshed,
     summary,
   };
   console.log("cron recheck-schools:", JSON.stringify(result));
