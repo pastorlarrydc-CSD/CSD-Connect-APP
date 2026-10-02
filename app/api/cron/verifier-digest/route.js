@@ -26,6 +26,13 @@ export const maxDuration = 60;
 // more than a digest that only shows up on bad days, since the latter
 // trains people to stop trusting it's actually still running.
 //
+// Also surfaces last night's auto-verify count -- schools the sweep
+// itself promoted straight to verified on a clean, full-confidence
+// coach-name match (see the "Auto-verify" note in
+// app/api/cron/recheck-schools/route.js) -- as its own headline line, so
+// that number is visible every morning without opening Data Quality or
+// running a query.
+//
 // Invoked by Vercel Cron (see vercel.json), scheduled after
 // coach-alert-digest so recheck-schools, coach-news-check, and the flags
 // either of those opened have all already landed by send time. Same
@@ -62,12 +69,25 @@ function escapeHtml(v) {
   return String(v ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }
 
-function buildEmail({ totalChecked, remainingByResult, flagRows }) {
+function buildEmail({ totalChecked, remainingByResult, flagRows, autoVerifiedCount }) {
   const totalRemaining = Object.values(remainingByResult).reduce((sum, n) => sum + n, 0);
   const subject =
     totalRemaining > 0
       ? `Coach-Change Radar: ${totalRemaining} school${totalRemaining === 1 ? "" : "s"} need a look this morning`
       : "Coach-Change Radar: all caught up";
+
+  // Headline line for the new auto-verify behavior (see the "Auto-verify"
+  // note in app/api/cron/recheck-schools/route.js) -- surfaced above the
+  // fold since a school auto-verifying overnight is the one outcome from
+  // this sweep that needs ZERO follow-up from whoever opens this email, and
+  // is exactly the number Larry asked to see here without having to go
+  // look it up.
+  const autoVerifiedHtml =
+    autoVerifiedCount > 0
+      ? `<p style="margin:14px 0;padding:10px 14px;background:#e6f6ee;border-radius:6px;color:#1a7f4b;font-weight:600;">
+           ✓ ${autoVerifiedCount} school${autoVerifiedCount === 1 ? "" : "s"} auto-verified overnight -- clean coach-name match on the school's own site, no review needed.
+         </p>`
+      : "";
 
   const bucketRowsHtml = RESULT_ORDER.filter((key) => remainingByResult[key])
     .map(
@@ -100,6 +120,7 @@ function buildEmail({ totalChecked, remainingByResult, flagRows }) {
       ${totalChecked} school${totalChecked === 1 ? "" : "s"} checked last night.
       ${totalRemaining > 0 ? `${totalRemaining} still need${totalRemaining === 1 ? "s" : ""} your attention.` : "Nothing left to handle from last night's run."}
     </p>
+    ${autoVerifiedHtml}
     ${
       bucketRowsHtml
         ? `<table style="width:100%;border-collapse:collapse;font-size:14px;">
@@ -184,6 +205,22 @@ export async function GET(req) {
         reason: f.reason,
       }));
 
+    // Count last night's auto-verifies -- school_change_log rows the
+    // recheck-schools sweep itself writes (see the "Auto-verify" note in
+    // app/api/cron/recheck-schools/route.js) when a school gets promoted
+    // to verified on a clean, full-confidence coach-name match. { count:
+    // "exact", head: true } asks Postgres for just the row count, no rows
+    // returned -- this number can get large over time and nothing here
+    // needs the actual rows.
+    const { count: autoVerifiedCount, error: autoVerifiedErr } = await supabase
+      .from("school_change_log")
+      .select("id", { count: "exact", head: true })
+      .eq("field_name", "verification_status")
+      .eq("new_value", "verified")
+      .ilike("source", "Automated nightly Coach-Change Radar sweep%")
+      .gte("changed_at", since);
+    if (autoVerifiedErr) throw autoVerifiedErr;
+
     const { data: recipientProfiles, error: profilesErr } = await supabase.from("profiles").select("id").in("role", ["sysadmin", "verifier"]);
     if (profilesErr) throw profilesErr;
 
@@ -196,7 +233,7 @@ export async function GET(req) {
       return NextResponse.json({ error: "No sysadmin/verifier email addresses found -- nothing to send to." }, { status: 500 });
     }
 
-    const { subject, html } = buildEmail({ totalChecked: radarRows.length, remainingByResult, flagRows });
+    const { subject, html } = buildEmail({ totalChecked: radarRows.length, remainingByResult, flagRows, autoVerifiedCount: autoVerifiedCount || 0 });
 
     const sendRes = await fetch("https://api.resend.com/emails", {
       method: "POST",
@@ -208,7 +245,14 @@ export async function GET(req) {
       throw new Error(`Resend error ${sendRes.status} — ${detail.slice(0, 300)}`);
     }
 
-    return NextResponse.json({ sent: true, to: emails, totalChecked: radarRows.length, remainingByResult, newFlags: flagRows.length });
+    return NextResponse.json({
+      sent: true,
+      to: emails,
+      totalChecked: radarRows.length,
+      remainingByResult,
+      newFlags: flagRows.length,
+      autoVerified: autoVerifiedCount || 0,
+    });
   } catch (err) {
     console.error("verifier-digest error", err);
     return NextResponse.json({ error: err.message || "Digest run failed." }, { status: 500 });
