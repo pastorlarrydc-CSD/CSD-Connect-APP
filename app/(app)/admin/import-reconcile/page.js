@@ -338,6 +338,7 @@ export default function ImportReconcilePage() {
   const fileInputRef = useRef(null);
 
   const [batches, setBatches] = useState([]);
+  const [batchProgress, setBatchProgress] = useState({}); // { [batchId]: row from import_batch_progress }
   const [loadingBatches, setLoadingBatches] = useState(true);
   const [batchesError, setBatchesError] = useState("");
 
@@ -387,6 +388,9 @@ export default function ImportReconcilePage() {
   const [undoBusy, setUndoBusy] = useState(false);
   const [undoArmed, setUndoArmed] = useState(false);
   const [undoNote, setUndoNote] = useState(null); // { kind: "info" | "danger", text }
+  // "Send leftover rows to Needs Review" (two-step confirm, like undo).
+  const [leftoverArmed, setLeftoverArmed] = useState(false);
+  const [leftoverBusy, setLeftoverBusy] = useState(false);
   const [bulkStatus, setBulkStatus] = useState("");
   const [bulkError, setBulkError] = useState("");
   const [conflictSelections, setConflictSelections] = useState({}); // { [rowId]: { [field]: bool } }
@@ -438,6 +442,13 @@ export default function ImportReconcilePage() {
       const { data, error } = await supabase.from("import_batches").select("*").order("created_at", { ascending: false }).limit(50);
       if (error) throw error;
       setBatches(data || []);
+      // Per-batch progress (how many rows are still pending) -- best effort,
+      // the list works fine without it.
+      const ids = (data || []).map((b) => b.id);
+      if (ids.length) {
+        const { data: prog } = await supabase.from("import_batch_progress").select("*").in("batch_id", ids);
+        setBatchProgress(Object.fromEntries((prog || []).map((p) => [p.batch_id, p])));
+      }
     } catch (err) {
       setBatchesError(err.message || "Could not load import batches.");
     } finally {
@@ -865,6 +876,7 @@ export default function ImportReconcilePage() {
     setRowError({});
     setFlowOn(false);
     setFlowHint("");
+    setLeftoverArmed(false);
     setTagFilter("all");
     setStateFilter("all");
     setChangeFilter("all");
@@ -1128,6 +1140,116 @@ export default function ImportReconcilePage() {
     } finally {
       setRowBusy((p) => ({ ...p, [row.id]: false }));
     }
+  }
+
+  // ---- Wrap-up: leftover rows -> Needs Review, results report -------------
+
+  const OUTCOME_LABELS = {
+    applied: "Applied",
+    skipped: "Skipped",
+    sent_to_verification: "Sent to AI verification",
+    sent_to_review: "Sent to Needs Review",
+    pending: "Still pending",
+  };
+
+  // Rows nobody got to: still pending, matched to a school, with proposed
+  // changes. Each school is put on the Needs Review list (unless it's
+  // already on it) with a note saying what the sheet proposed, so the work
+  // isn't lost when the batch is closed. Nothing is written to the coach
+  // data itself -- this only sets the review flag.
+  async function sendLeftoversToNeedsReview() {
+    const targets = rows.filter((r) => r.resolution === "pending" && r.match_school_id && (r.bucket === "new_info" || r.bucket === "conflict"));
+    if (!targets.length || !selectedBatch) return;
+    setLeftoverArmed(false);
+    setLeftoverBusy(true);
+    const tally = { flagged: 0, already: 0, error: 0 };
+    let cursor = 0;
+    const stamp = new Date().toISOString();
+    const day = stamp.slice(0, 10);
+    async function worker() {
+      for (;;) {
+        const i = cursor;
+        cursor += 1;
+        if (i >= targets.length) return;
+        const row = targets[i];
+        try {
+          // eslint-disable-next-line no-await-in-loop
+          const { data: sch, error: schErr } = await supabase.from("schools").select("id,needs_review").eq("id", row.match_school_id).single();
+          if (schErr) throw schErr;
+          if (sch.needs_review) {
+            tally.already += 1;
+          } else {
+            const summary = (row.diff || [])
+              .map((f) => `${f.label}: ${f.old || "blank"} -> ${f.kind === "clear" ? "(clear)" : f.new}`)
+              .join("; ")
+              .slice(0, 400);
+            const note = `${day} Import & Reconcile "${selectedBatch.file_name}" proposed: ${summary}. Not applied -- left unreviewed. Please confirm before changing.`;
+            // eslint-disable-next-line no-await-in-loop
+            const { error: upErr } = await supabase
+              .from("schools")
+              .update({ needs_review: true, needs_review_note: note, needs_review_marked_at: stamp, needs_review_marked_by: user.id })
+              .eq("id", row.match_school_id);
+            if (upErr) throw upErr;
+            tally.flagged += 1;
+          }
+          // eslint-disable-next-line no-await-in-loop
+          const { error: rowErr } = await supabase.from("import_batch_rows").update({ resolution: "sent_to_review", resolved_at: stamp, resolved_by: user.id }).eq("id", row.id);
+          if (rowErr) throw rowErr;
+          patchRow(row.id, { resolution: "sent_to_review", resolved_at: stamp, resolved_by: user.id });
+        } catch (err) {
+          tally.error += 1;
+          setRowError((p) => ({ ...p, [row.id]: err.message || "Could not send this row to Needs Review." }));
+        }
+        setUndoNote({ kind: "info", text: `Sending to Needs Review… ${tally.flagged + tally.already + tally.error} of ${targets.length}` });
+      }
+    }
+    await Promise.all([worker(), worker(), worker(), worker()]);
+    const bits = [`${tally.flagged} school${tally.flagged === 1 ? "" : "s"} added to Needs Review`];
+    if (tally.already) bits.push(`${tally.already} already on the list`);
+    if (tally.error) bits.push(`${tally.error} failed (still pending)`);
+    setUndoNote({ kind: tally.error ? "danger" : "info", text: `Done: ${bits.join(", ")}. New schools and unmatched rows can't be flagged this way and were left pending.` });
+    setLeftoverBusy(false);
+  }
+
+  // CSV of what happened to every row in this batch -- for records or for
+  // sending back to whoever supplied the sheet.
+  function downloadResultsReport() {
+    if (!selectedBatch) return;
+    const labelOf = (field) => (DIFF_FIELDS.find(([f]) => f === field) || [])[1] || field;
+    const safe = (v) => {
+      const t = v == null ? "" : String(v);
+      return /^[=@+-]/.test(t) && !/^[+-]?[\d\s().-]+$/.test(t) ? `'${t}` : t;
+    };
+    const data = rows.map((r) => {
+      const m = r.mapped_data || {};
+      let proposed = "";
+      if (r.diff && r.diff.length) {
+        proposed = r.diff.map((f) => `${f.label}: ${f.old || "blank"} -> ${f.kind === "clear" ? "(clear)" : f.new}`).join("; ");
+      } else if (r.bucket === "new_school") {
+        proposed = DIFF_FIELDS.filter(([f]) => m[f]).map(([f, label]) => `${label}: ${m[f]}`).join("; ");
+      }
+      let applied = "";
+      if (r.resolution === "applied") {
+        if (r.bucket === "new_school") applied = "New school added";
+        else if (r.undo_snapshot && Array.isArray(r.undo_snapshot.fields)) applied = r.undo_snapshot.fields.map(labelOf).join(", ");
+        else applied = "(see the school's change history)";
+      }
+      return [
+        r.row_index,
+        r.label || m.name || "",
+        m.state || "",
+        BUCKET_LABELS[r.bucket] || r.bucket,
+        OUTCOME_LABELS[r.resolution] || r.resolution,
+        r.match_school_id || "",
+        r.match_confidence || "",
+        proposed,
+        applied,
+        r.resolved_at ? new Date(r.resolved_at).toLocaleString() : "",
+      ].map(safe);
+    });
+    const csv = Papa.unparse({ fields: ["Row", "School", "State", "Sheet bucket", "Outcome", "Matched school ID", "Matched by", "Proposed changes", "Fields applied", "Resolved at"], data });
+    const base = String(selectedBatch.file_name || `batch-${selectedBatch.id}`).replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").slice(0, 40) || `batch-${selectedBatch.id}`;
+    downloadBlob("\ufeff" + csv, `import-results-${base}.csv`);
   }
 
   // ---- Undo ---------------------------------------------------------------
@@ -2072,6 +2194,12 @@ export default function ImportReconcilePage() {
     const missingEmailInBucket = pendingInBucket.filter((r) => r.match_school_id && !(r.diff || []).some((f) => f.field === "hc_email"));
 
     const undoableCount = rows.filter((r) => r.resolution === "applied" && r.bucket !== "new_school" && r.match_school_id).length;
+    const outcomeCounts = { applied: 0, skipped: 0, sent_to_verification: 0, sent_to_review: 0, pending: 0 };
+    rows.forEach((r) => {
+      if (r.resolution in outcomeCounts) outcomeCounts[r.resolution] += 1;
+    });
+    const leftoverCount = rows.filter((r) => r.resolution === "pending" && r.match_school_id && (r.bucket === "new_info" || r.bucket === "conflict")).length;
+    const donePct = rows.length ? Math.round(((rows.length - outcomeCounts.pending) / rows.length) * 100) : 0;
 
     // Traffic-light counts for the open tab (before the filter is applied).
     const tagCounts = { green: 0, yellow: 0, red: 0, checking: 0 };
@@ -2107,6 +2235,30 @@ export default function ImportReconcilePage() {
             </p>
           </div>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+            <button className="btn btn-sm" onClick={downloadResultsReport} title="Download a CSV of what happened to every row in this batch">
+              Download results (CSV)
+            </button>
+            {leftoverCount > 0 &&
+              (leftoverArmed ? (
+                <>
+                  <span style={{ fontSize: 12.5, color: "#7a5a00" }}>Add {leftoverCount} unreviewed school{leftoverCount === 1 ? "" : "s"} to Needs Review?</span>
+                  <button className="btn btn-sm btn-gold" onClick={sendLeftoversToNeedsReview} disabled={leftoverBusy}>
+                    Yes, send them
+                  </button>
+                  <button className="btn btn-sm" onClick={() => setLeftoverArmed(false)} disabled={leftoverBusy}>
+                    Cancel
+                  </button>
+                </>
+              ) : (
+                <button
+                  className="btn btn-sm"
+                  onClick={() => setLeftoverArmed(true)}
+                  disabled={leftoverBusy || bulkBusy || undoBusy}
+                  title="Puts every still-pending matched row's school on the Needs Review list, with a note of what the sheet proposed. Nothing is applied to the coach data."
+                >
+                  {leftoverBusy ? "Sending…" : `Send ${leftoverCount} leftover row${leftoverCount === 1 ? "" : "s"} to Needs Review`}
+                </button>
+              ))}
             {undoableCount > 0 &&
               (undoArmed ? (
                 <>
@@ -2133,6 +2285,15 @@ export default function ImportReconcilePage() {
                 Close this batch
               </button>
             )}
+          </div>
+        </div>
+        <div style={{ marginBottom: 12 }}>
+          <div style={{ height: 8, borderRadius: 4, background: "#e6e9ef", overflow: "hidden" }}>
+            <div style={{ width: `${donePct}%`, height: "100%", background: "#2e9e5b" }} />
+          </div>
+          <div style={{ fontSize: 12, color: "#697386", marginTop: 4 }}>
+            {donePct}% done — {outcomeCounts.applied} applied · {outcomeCounts.skipped} skipped · {outcomeCounts.sent_to_verification} sent to AI · {outcomeCounts.sent_to_review} sent to Needs Review ·{" "}
+            {outcomeCounts.pending} pending
           </div>
         </div>
         {undoNote && (
@@ -2562,7 +2723,7 @@ export default function ImportReconcilePage() {
               <thead>
                 <tr>
                   <th>File</th>
-                  <th>Rows</th>
+                  <th>Progress</th>
                   <th>Source</th>
                   <th>Status</th>
                   <th>Uploaded</th>
@@ -2573,13 +2734,30 @@ export default function ImportReconcilePage() {
                 {batches.map((b) => (
                   <tr key={b.id}>
                     <td>{b.file_name}</td>
-                    <td>{b.row_count}</td>
+                    <td>
+                      {(() => {
+                        const p = batchProgress[b.id];
+                        if (!p) return b.row_count;
+                        const done = p.total_rows - p.pending_rows;
+                        const pct = p.total_rows ? Math.round((done / p.total_rows) * 100) : 0;
+                        return (
+                          <div style={{ minWidth: 130 }}>
+                            <div style={{ fontSize: 12.5 }}>
+                              {p.pending_rows === 0 ? `All ${p.total_rows} done` : `${done} of ${p.total_rows} done · ${p.pending_rows} pending`}
+                            </div>
+                            <div style={{ height: 5, borderRadius: 3, background: "#e6e9ef", marginTop: 3, overflow: "hidden" }}>
+                              <div style={{ width: `${pct}%`, height: "100%", background: "#2e9e5b" }} />
+                            </div>
+                          </div>
+                        );
+                      })()}
+                    </td>
                     <td>{trustInfo(b.source_trust).short}</td>
                     <td>{b.status === "done" ? "Closed" : "Reviewing"}</td>
                     <td>{new Date(b.created_at).toLocaleString()}</td>
                     <td>
                       <button className="btn btn-sm btn-primary" onClick={() => openBatch(b.id)}>
-                        Open
+                        {b.status !== "done" && (batchProgress[b.id]?.pending_rows || 0) > 0 ? "Resume" : "Open"}
                       </button>
                     </td>
                   </tr>
@@ -2644,7 +2822,7 @@ function RowCard({ row, tag, busy, error, aiNote, guard, selection, onToggleFiel
         </div>
         {resolved && (
           <span style={{ fontSize: 12, color: "#697386" }}>
-            {row.resolution === "applied" ? "Applied" : row.resolution === "sent_to_verification" ? "Sent to AI verification" : "Skipped"}
+            {row.resolution === "applied" ? "Applied" : row.resolution === "sent_to_verification" ? "Sent to AI verification" : row.resolution === "sent_to_review" ? "Sent to Needs Review" : "Skipped"}
             {onUndo && (
               <button
                 type="button"
