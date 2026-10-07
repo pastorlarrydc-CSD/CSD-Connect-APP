@@ -115,7 +115,18 @@ export async function GET(req) {
       if (runsErr) throw runsErr;
       (runs || []).forEach((r) => runStatus.set(r.id, { status: r.status, collected_at: r.collected_at, created_at: r.created_at, candidate_mode: r.candidate_mode }));
     }
-    const schoolsWithAi = schoolRows.map((s) => {
+    // school_review_status doesn't carry the athletics/website URLs, so they
+    // are read from schools here -- the Needs Review page shows an "Athletics
+    // site" link on every row so a reviewer can pull up the staff page.
+    const siteBySchool = new Map();
+    for (let i = 0; i < schoolRows.length; i += 200) {
+      const chunk = schoolRows.slice(i, i + 200).map((s) => s.id);
+      const { data: sites, error: sitesErr } = await admin.from("schools").select("id,athletics_url,website").in("id", chunk);
+      if (sitesErr) throw sitesErr;
+      (sites || []).forEach((r) => siteBySchool.set(r.id, { athletics_url: r.athletics_url || null, website: r.website || null }));
+    }
+    const schoolsWithAi = schoolRows.map((row) => {
+      const s = { ...row, ...(siteBySchool.get(row.id) || { athletics_url: null, website: null }) };
       const it = aiBySchool.get(s.id);
       if (!it) return { ...s, ai_check: null };
       // Only re_verify runs count (see AI_TRUSTED_MODE) -- results from
