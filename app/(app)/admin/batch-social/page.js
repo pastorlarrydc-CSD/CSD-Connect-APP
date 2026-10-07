@@ -44,7 +44,7 @@ const FETCH_CONCURRENCY = 8; // matches the weekly automated cron's own concurre
 const APPLY_CONCURRENCY = 5; // applying is just a DB write, no web fetch/AI call, so higher concurrency than FETCH_CONCURRENCY is safe -- matches batch-athletics/batch-coach-info
 
 const ITEM_SELECT =
-  "id,batch_run_id,school_id,fetch_status,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,hc_first_name,hc_last_name,hc_twitter,hc_facebook,verification_status,last_verified_at)";
+  "id,batch_run_id,school_id,fetch_status,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,hc_first_name,hc_last_name,hc_twitter,hc_facebook,verification_status,last_verified_at,needs_review)";
 
 async function runWithConcurrency(items, limit, worker) {
   let next = 0;
@@ -1216,7 +1216,10 @@ function BatchSocialPageInner() {
       const wasNotAvailable = !!s.social_not_available;
       const { error: updateErr } = await supabase
         .from("schools")
-        .update({ verification_status: "verified", last_verified_at: new Date().toISOString(), social_not_available: true })
+        // A school flagged for Needs Review (e.g. coach changed, email not
+        // confirmed) is not stamped "verified" by an unrelated no-data
+        // confirmation -- the not-available flag is still recorded.
+        .update(s.needs_review ? { social_not_available: true } : { verification_status: "verified", last_verified_at: new Date().toISOString(), social_not_available: true })
         .eq("id", s.id);
       if (updateErr) throw updateErr;
       const logRows = [
