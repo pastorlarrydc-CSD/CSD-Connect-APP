@@ -14,6 +14,7 @@ import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
 import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
 import { compareSuggestion, isFreshAiCheck, AI_TRUSTED_MODE } from "@/lib/needsReviewAi";
+import { staleEmailInfo } from "@/lib/needsReviewEdit";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
 
@@ -48,7 +49,7 @@ export async function POST(req) {
     const admin = getSupabaseAdminClient();
     const { data: school, error: fetchErr } = await admin
       .from("schools")
-      .select("id, hc_first_name, hc_last_name, hc_email, hc_cell, hc_office")
+      .select("id, hc_first_name, hc_last_name, hc_email, hc_cell, hc_office, needs_review_note")
       .eq("id", schoolId)
       .maybeSingle();
     if (fetchErr || !school) {
@@ -63,6 +64,19 @@ export async function POST(req) {
     // phrases school_verification_meta uses for paste-match / independent.
     let confirmSource = "Needs-Review dashboard - confirmed accurate, no change needed";
     const aiItemId = Number(body.ai_item_id) || null;
+    // A plain "confirmed accurate" can't clear a school whose flag says the
+    // coach changed and whose email still contains the previous coach's
+    // surname -- that is exactly the mismatched name/email pair the flag was
+    // raised for. The reviewer fixes the email (Edit on the queue) first.
+    // (An AI check that matched the on-file coach AND email at high
+    // confidence is different: the email was seen on the school's own site.)
+    const stale = !aiItemId ? staleEmailInfo(school) : null;
+    if (stale) {
+      return NextResponse.json(
+        { error: `The email on file (${school.hc_email}) still looks like the previous coach's (${stale.priorLast}). Use Edit to enter or confirm the current coach's email first.` },
+        { status: 409 }
+      );
+    }
     if (aiItemId) {
       const { data: aiItem } = await admin
         .from("coach_info_batch_items")
