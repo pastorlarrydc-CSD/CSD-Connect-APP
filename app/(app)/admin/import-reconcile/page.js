@@ -187,6 +187,10 @@ export default function ImportReconcilePage() {
   const [rowBusy, setRowBusy] = useState({}); // { [rowId]: true } while an action is in flight
   const [rowError, setRowError] = useState({}); // { [rowId]: message }
   const [bulkBusy, setBulkBusy] = useState(false);
+  // Undo (whole batch): armed = the "are you sure" step is showing.
+  const [undoBusy, setUndoBusy] = useState(false);
+  const [undoArmed, setUndoArmed] = useState(false);
+  const [undoNote, setUndoNote] = useState(null); // { kind: "info" | "danger", text }
   const [bulkStatus, setBulkStatus] = useState("");
   const [bulkError, setBulkError] = useState("");
   const [conflictSelections, setConflictSelections] = useState({}); // { [rowId]: { [field]: bool } }
@@ -738,6 +742,26 @@ export default function ImportReconcilePage() {
         }
       }
 
+      // Undo snapshot: what these columns held a moment ago (and which
+      // Data Quality flags are about to be resolved), saved on the row so the
+      // whole batch can be put back later. Best-effort -- a row without one
+      // can still be undone from the change log (see undoAppliedRow).
+      let undoSnapshot = null;
+      try {
+        const cols = Object.keys(update);
+        const { data: beforeRow } = await supabase.from("schools").select(cols.join(",")).eq("id", row.match_school_id).maybeSingle();
+        let flagIds = [];
+        if (trust.trusted) {
+          const { data: pendingFlags } = await supabase.from("school_flags").select("id").eq("school_id", row.match_school_id).eq("status", "pending");
+          flagIds = (pendingFlags || []).map((x) => x.id);
+        }
+        if (beforeRow) {
+          undoSnapshot = { v: 1, fields: fieldsToApply.map((f) => f.field), before: beforeRow, wrote: Object.fromEntries(cols.map((c) => [c, update[c]])), flags: flagIds };
+        }
+      } catch (_) {
+        undoSnapshot = null;
+      }
+
       const { error: updErr } = await supabase.from("schools").update(update).eq("id", row.match_school_id);
       if (updErr) throw updErr;
       if (logs.length) {
@@ -780,10 +804,10 @@ export default function ImportReconcilePage() {
         if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 600));
       }
 
-      const { error: rowErr } = await supabase.from("import_batch_rows").update({ resolution: "applied", resolved_at: now, resolved_by: user.id }).eq("id", row.id);
+      const { error: rowErr } = await supabase.from("import_batch_rows").update({ resolution: "applied", resolved_at: now, resolved_by: user.id, undo_snapshot: undoSnapshot }).eq("id", row.id);
       if (rowErr) throw rowErr;
 
-      patchRow(row.id, { resolution: "applied", resolved_at: now, resolved_by: user.id });
+      patchRow(row.id, { resolution: "applied", resolved_at: now, resolved_by: user.id, undo_snapshot: undoSnapshot });
       // Keep the safety-check index current so the NEXT row sees that this
       // school now owns these values.
       if (schoolIndexRef.current) {
@@ -815,6 +839,135 @@ export default function ImportReconcilePage() {
     } finally {
       setRowBusy((p) => ({ ...p, [row.id]: false }));
     }
+  }
+
+  // ---- Undo ---------------------------------------------------------------
+
+  const undoNorm = (v) => String(v == null ? "" : v).trim();
+
+  // Puts ONE applied row's school back the way it was before the apply.
+  // Safe by design: a school that someone has edited since is left alone
+  // (reported, not overwritten), and every restore is logged in
+  // school_change_log. Returns { status: "restored" | "changed_since" |
+  // "cannot" | "error", note }.
+  async function undoAppliedRow(row) {
+    try {
+      if (row.resolution !== "applied" || !row.match_school_id) return { status: "cannot", note: "This row isn't applied." };
+      if (row.bucket === "new_school") {
+        return { status: "cannot", note: "This row added a brand-new school. Undo doesn't remove schools -- if it was a mistake, fix or close it on the school's own page." };
+      }
+      const schoolId = row.match_school_id;
+      const snap = row.undo_snapshot && row.undo_snapshot.before && row.undo_snapshot.wrote ? row.undo_snapshot : null;
+      let restore = {};
+      let undoLogs = [];
+      let limited = false;
+
+      if (snap) {
+        const fields = snap.fields || [];
+        const { data: cur, error: curErr } = await supabase.from("schools").select(fields.join(",") || "id").eq("id", schoolId).maybeSingle();
+        if (curErr || !cur) throw curErr || new Error("School not found.");
+        const moved = fields.filter((f) => undoNorm(cur[f]) !== undoNorm(snap.wrote[f]));
+        if (moved.length) return { status: "changed_since", note: `Edited since this batch applied (${moved.join(", ")}) -- left as it is now.` };
+        restore = { ...snap.before };
+        fields.forEach((f) => {
+          if (undoNorm(snap.before[f]) !== undoNorm(snap.wrote[f])) {
+            undoLogs.push({ school_id: schoolId, field_name: f, old_value: snap.wrote[f] || null, new_value: snap.before[f] || null, source: "Import & Reconcile - batch undo", changed_by: user.id });
+          }
+        });
+      } else {
+        // Applied before undo existed: rebuild from the change log. Only the
+        // data fields come back -- verification stamps can't be known, so
+        // they're left as they are.
+        limited = true;
+        if (!row.resolved_at) return { status: "cannot", note: "No record of when this row was applied." };
+        const t = new Date(row.resolved_at).getTime();
+        const { data: logRows, error: logQErr } = await supabase
+          .from("school_change_log")
+          .select("field_name,old_value,new_value,source,changed_at")
+          .eq("school_id", schoolId)
+          .eq("changed_by", row.resolved_by)
+          .gte("changed_at", new Date(t - 90000).toISOString())
+          .lte("changed_at", new Date(t + 90000).toISOString())
+          .order("changed_at", { ascending: true });
+        if (logQErr) throw logQErr;
+        const mine = (logRows || []).filter((l) => /Import & Reconcile/.test(l.source || "") || /^Head coach change \(manual\)/.test(l.source || ""));
+        const byField = new Map();
+        mine.forEach((l) => {
+          if (undoNorm(l.old_value) === undoNorm(l.new_value)) return; // a "confirmed same" entry, nothing to undo
+          const e = byField.get(l.field_name);
+          if (!e) byField.set(l.field_name, { first: l.old_value, last: l.new_value });
+          else e.last = l.new_value;
+        });
+        if (!byField.size) return { status: "cannot", note: "No saved record of what this row changed, so it can't be undone." };
+        const fields = [...byField.keys()];
+        const { data: cur, error: curErr } = await supabase.from("schools").select(fields.join(",")).eq("id", schoolId).maybeSingle();
+        if (curErr || !cur) throw curErr || new Error("School not found.");
+        const moved = fields.filter((f) => undoNorm(cur[f]) !== undoNorm(byField.get(f).last));
+        if (moved.length) return { status: "changed_since", note: `Edited since this batch applied (${moved.join(", ")}) -- left as it is now.` };
+        fields.forEach((f) => {
+          const e = byField.get(f);
+          restore[f] = e.first == null || e.first === "" ? null : e.first;
+          undoLogs.push({ school_id: schoolId, field_name: f, old_value: e.last || null, new_value: e.first || null, source: "Import & Reconcile - batch undo (from change log)", changed_by: user.id });
+        });
+      }
+
+      const { error: updErr } = await supabase.from("schools").update(restore).eq("id", schoolId);
+      if (updErr) throw updErr;
+      if (undoLogs.length) {
+        const { error: logErr } = await supabase.from("school_change_log").insert(undoLogs);
+        if (logErr) throw logErr;
+      }
+      // Re-open the Data Quality flags this apply resolved (best effort).
+      if (snap && Array.isArray(snap.flags) && snap.flags.length) {
+        const { error: flagErr } = await supabase.from("school_flags").update({ status: "pending", resolved_by: null, resolved_at: null }).in("id", snap.flags).eq("status", "resolved");
+        if (flagErr) console.error("Could not re-open flags during undo", flagErr);
+      }
+      const { error: rowErr } = await supabase.from("import_batch_rows").update({ resolution: "pending", resolved_at: null, resolved_by: null, undo_snapshot: null }).eq("id", row.id);
+      if (rowErr) throw rowErr;
+      patchRow(row.id, { resolution: "pending", resolved_at: null, resolved_by: null, undo_snapshot: null });
+      if (schoolIndexRef.current) {
+        indexUpdateSchool(schoolIndexRef.current, schoolId, restore);
+        setIndexVersion((v) => v + 1);
+      }
+      return { status: "restored", note: limited ? "Restored from the change log (verification stamps left as they are)." : "Restored." };
+    } catch (err) {
+      return { status: "error", note: err.message || "Could not undo this row." };
+    }
+  }
+
+  async function undoOneRow(row) {
+    setRowBusy((p) => ({ ...p, [row.id]: true }));
+    setRowError((p) => ({ ...p, [row.id]: null }));
+    const result = await undoAppliedRow(row);
+    if (result.status !== "restored") setRowError((p) => ({ ...p, [row.id]: result.note }));
+    setRowBusy((p) => ({ ...p, [row.id]: false }));
+  }
+
+  async function undoWholeBatch() {
+    const targets = rows.filter((r) => r.resolution === "applied" && r.bucket !== "new_school" && r.match_school_id);
+    if (!targets.length) return;
+    setUndoBusy(true);
+    setUndoArmed(false);
+    setUndoNote(null);
+    const tally = { restored: 0, changed_since: 0, cannot: 0, error: 0 };
+    let next = 0;
+    async function worker() {
+      while (next < targets.length) {
+        const row = targets[next++];
+        // eslint-disable-next-line no-await-in-loop
+        const r = await undoAppliedRow(row);
+        tally[r.status] = (tally[r.status] || 0) + 1;
+        if (r.status !== "restored") setRowError((p) => ({ ...p, [row.id]: r.note }));
+        setUndoNote({ kind: "info", text: `Undoing… ${tally.restored + tally.changed_since + tally.cannot + tally.error} of ${targets.length}` });
+      }
+    }
+    await Promise.all([worker(), worker(), worker()]);
+    const bits = [`${tally.restored} put back`];
+    if (tally.changed_since) bits.push(`${tally.changed_since} left alone because someone edited them since`);
+    if (tally.cannot) bits.push(`${tally.cannot} couldn't be undone`);
+    if (tally.error) bits.push(`${tally.error} failed`);
+    setUndoNote({ kind: tally.error || tally.cannot ? "danger" : "info", text: `Undo finished: ${bits.join(", ")}. Restored rows are back to Pending so you can review them again. Rows that added a new school are never undone here.` });
+    setUndoBusy(false);
   }
 
   // "Apply all" only touches rows with NO safety warning -- a row whose email
@@ -1490,6 +1643,8 @@ export default function ImportReconcilePage() {
     // per-row on-file check still happens fresh inside runAiLookup itself.
     const missingEmailInBucket = pendingInBucket.filter((r) => r.match_school_id && !(r.diff || []).some((f) => f.field === "hc_email"));
 
+    const undoableCount = rows.filter((r) => r.resolution === "applied" && r.bucket !== "new_school" && r.match_school_id).length;
+
     return (
       <div className="view">
         <button className="btn btn-sm" style={{ marginBottom: 12 }} onClick={closeReview}>
@@ -1503,12 +1658,40 @@ export default function ImportReconcilePage() {
               {selectedBatch.status === "done" ? " · Closed" : ""}
             </p>
           </div>
-          {selectedBatch.status !== "done" && (
-            <button className="btn btn-sm btn-primary" onClick={markCloseBatch} disabled={loadingRows}>
-              Close this batch
-            </button>
-          )}
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+            {undoableCount > 0 &&
+              (undoArmed ? (
+                <>
+                  <span style={{ fontSize: 12.5, color: "#b3261e" }}>Put {undoableCount} applied row{undoableCount === 1 ? "" : "s"} back the way they were?</span>
+                  <button className="btn btn-sm" style={{ background: "#b3261e", color: "#fff", borderColor: "#b3261e" }} onClick={undoWholeBatch} disabled={undoBusy}>
+                    Yes, undo them
+                  </button>
+                  <button className="btn btn-sm" onClick={() => setUndoArmed(false)} disabled={undoBusy}>
+                    Cancel
+                  </button>
+                </>
+              ) : (
+                <button
+                  className="btn btn-sm"
+                  onClick={() => setUndoArmed(true)}
+                  disabled={undoBusy || bulkBusy}
+                  title="Restores every school this batch changed to how it was before -- skipping any school someone has edited since. Logged in each school's history."
+                >
+                  {undoBusy ? "Undoing…" : `Undo ${undoableCount} applied row${undoableCount === 1 ? "" : "s"}`}
+                </button>
+              ))}
+            {selectedBatch.status !== "done" && (
+              <button className="btn btn-sm btn-primary" onClick={markCloseBatch} disabled={loadingRows}>
+                Close this batch
+              </button>
+            )}
+          </div>
         </div>
+        {undoNote && (
+          <div className={`notice ${undoNote.kind === "danger" ? "danger" : "info"}`} style={{ marginBottom: 12 }}>
+            {undoNote.text}
+          </div>
+        )}
 
         {!batchTrust.trusted && (
           <div className="notice danger" style={{ marginBottom: 12 }}>
@@ -1658,6 +1841,7 @@ export default function ImportReconcilePage() {
                       onMarkNewSchool={() => markRowAsNewSchoolInstead(row)}
                       onRunAiLookup={row.match_school_id ? () => runAiLookup(row) : null}
                       onOpenProfile={row.match_school_id ? () => openProfile(row) : null}
+                      onUndo={row.resolution === "applied" && row.bucket !== "new_school" && row.match_school_id ? () => undoOneRow(row) : null}
                     />
                   ))}
                 </div>
@@ -1820,7 +2004,7 @@ export default function ImportReconcilePage() {
   );
 }
 
-function RowCard({ row, busy, error, aiNote, guard, selection, onToggleField, onApplyNewInfo, onApplyConflict, onSkip, onAddNewSchool, onPickCandidate, onMarkNewSchool, onRunAiLookup, onOpenProfile }) {
+function RowCard({ row, busy, error, aiNote, guard, selection, onToggleField, onApplyNewInfo, onApplyConflict, onSkip, onAddNewSchool, onPickCandidate, onMarkNewSchool, onRunAiLookup, onOpenProfile, onUndo }) {
   const resolved = row.resolution !== "pending";
   const m = row.mapped_data || {};
   const locationLabel = [m.city, m.state].filter(Boolean).join(", ");
@@ -1851,6 +2035,18 @@ function RowCard({ row, busy, error, aiNote, guard, selection, onToggleField, on
         {resolved && (
           <span style={{ fontSize: 12, color: "#697386" }}>
             {row.resolution === "applied" ? "Applied" : row.resolution === "sent_to_verification" ? "Sent to AI verification" : "Skipped"}
+            {onUndo && (
+              <button
+                type="button"
+                className="btn btn-sm"
+                style={{ marginLeft: 8, padding: "1px 8px", fontSize: 11.5 }}
+                disabled={busy}
+                onClick={onUndo}
+                title="Put this school back the way it was before this row was applied"
+              >
+                {busy ? "…" : "Undo"}
+              </button>
+            )}
           </span>
         )}
       </div>
