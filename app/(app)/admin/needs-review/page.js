@@ -198,6 +198,15 @@ function NeedsReviewPageInner() {
   const loadState = useCallback(
     async (state) => {
       setSelectedState(state);
+      // Keep the state in the address bar, so a reload or the Back button lands
+      // right back in this queue instead of the state picker.
+      try {
+        const u = new URL(window.location.href);
+        if (u.searchParams.get("state") !== state) {
+          u.searchParams.set("state", state);
+          window.history.replaceState(window.history.state, "", u.toString());
+        }
+      } catch {}
       setReasonFilter("all");
       setAiNote(null);
       setEditDrafts({});
@@ -210,6 +219,17 @@ function NeedsReviewPageInner() {
         const json = await res.json();
         if (!res.ok) throw new Error(json.error || "Could not load this state's queue.");
         setSchools(json.schools || []);
+        // Put back edits that were open and unsaved when the page last went away
+        // (accidental reload, browser restart of the tab, etc.).
+        try {
+          const saved = JSON.parse(window.sessionStorage.getItem(`needsReviewDrafts:${state}`) || "{}");
+          const here = new Set((json.schools || []).map((x) => x.id));
+          const keep = {};
+          Object.keys(saved).forEach((id) => {
+            if (here.has(id) || here.has(Number(id))) keep[id] = saved[id];
+          });
+          if (Object.keys(keep).length) setEditDrafts(keep);
+        } catch {}
         setTotalInQueue(json.total_in_queue ?? (json.schools || []).length);
         setReviewedToday(json.reviewed_today || 0);
       } catch (err) {
@@ -222,9 +242,21 @@ function NeedsReviewPageInner() {
   );
 
   useEffect(() => {
-    if (canReview && stateFromUrl) loadState(stateFromUrl.toUpperCase());
+    // Skip when the queue for this state is already on screen (loadState itself
+    // writes ?state= into the address bar) -- reloading would wipe open edits.
+    if (canReview && stateFromUrl && stateFromUrl.toUpperCase() !== selectedState) loadState(stateFromUrl.toUpperCase());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canReview, stateFromUrl]);
+
+  // Save open edit drafts for this browser tab only, so nothing typed is lost.
+  useEffect(() => {
+    if (!selectedState || loadingSchools) return;
+    try {
+      const key = `needsReviewDrafts:${selectedState}`;
+      if (Object.keys(editDrafts).length) window.sessionStorage.setItem(key, JSON.stringify(editDrafts));
+      else window.sessionStorage.removeItem(key);
+    } catch {}
+  }, [editDrafts, selectedState, loadingSchools]);
 
   // A school just left the queue (confirmed, or saved and cleared): drop its
   // row, any open editor, and move the state's counters.
@@ -634,7 +666,7 @@ function NeedsReviewPageInner() {
                 </span>
               )}
             </div>
-            <button className="btn btn-sm" onClick={() => setSelectedState(null)}>
+            <button className="btn btn-sm" onClick={() => { setSelectedState(null); try { window.history.replaceState(window.history.state, "", window.location.pathname); } catch {} }}>
               ← All states
             </button>
           </div>
@@ -770,7 +802,7 @@ function NeedsReviewPageInner() {
                   return [
                   <tr key={s.id}>
                     <td>
-                      <Link href={`/schools/${s.id}`}>{s.name}</Link>
+                      <Link href={`/schools/${s.id}`} target="_blank" rel="noopener noreferrer" title="Opens in a new tab so this queue stays open">{s.name}</Link>
                       <div style={{ fontSize: 11.5, color: "#697386" }}>{s.city}</div>
                       <div style={{ marginTop: 3 }}>
                         <SchoolSiteLink school={s} />
