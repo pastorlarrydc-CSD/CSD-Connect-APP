@@ -2,6 +2,7 @@ import { NextResponse } from "next/server";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
 import { checkSchoolCoach, checkEmailDeliverability } from "@/lib/schoolRecheck";
 import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
+import { emailFit } from "@/lib/coachEmailFit";
 
 export const maxDuration = 60;
 
@@ -94,6 +95,16 @@ export const maxDuration = 60;
 // column outside of a human action) and the nightly budget reaches new/
 // never-checked schools faster instead of re-walking settled ones.
 //
+// ...and NOT done when the record is sitting in Needs Review, or when the
+// email on file looks like it belongs to someone else (a personal-looking
+// address that doesn't contain the coach's last name -- lib/coachEmailFit.js
+// emailFit = "unknown"). The check above proves the COACH is still listed on
+// the school's site; it says nothing about whether the email on file is that
+// coach's. Roosevelt High (CA) was verified here on Oct 6 2026 with a new
+// head coach (McCoy) still carrying the previous coach's address
+// (Branstetter), and its Needs Review flag would have been cleared with it.
+// Such schools are left exactly as they are, for a human.
+//
 // Deliberately NOT done on a weak or MaxPreps-only match, and NOT done when
 // the email check failed -- those cases keep working exactly as before
 // (logged, and routed to a human via the existing flag logic), since a
@@ -169,6 +180,7 @@ export async function GET(req) {
   let emailFlagsOpened = 0;
   let confidenceUpdated = 0;
   let autoVerified = 0;
+  let autoVerifyHeld = 0;
   let radarClockRefreshed = 0;
   let cursor = 0;
 
@@ -276,7 +288,18 @@ export async function GET(req) {
         // is available.
         if (emailCheck.ok || emailCheck.skipped) {
           const nowIso = new Date().toISOString();
+          // Held for a human: flagged for Needs Review, or an email that doesn't
+          // look like this coach's (see the note near the top of this file).
+          let heldForHuman = false;
           if (c.verification_status !== "verified") {
+            const { data: live } = await supabase.from("schools").select("needs_review").eq("id", c.school_id).maybeSingle();
+            const fit = emailFit(c.hc_email, { first: c.hc_first_name, last: c.hc_last_name }, null);
+            heldForHuman = Boolean(live && live.needs_review) || fit === "unknown";
+            if (heldForHuman) autoVerifyHeld++;
+          }
+          if (heldForHuman) {
+            // leave the record untouched
+          } else if (c.verification_status !== "verified") {
             const update = {
               verification_status: "verified",
               last_verified_at: nowIso,
@@ -357,6 +380,7 @@ export async function GET(req) {
     email_flags_opened: emailFlagsOpened,
     confidence_scores_updated: confidenceUpdated,
     auto_verified: autoVerified,
+    auto_verify_held_for_human: autoVerifyHeld,
     radar_clock_refreshed: radarClockRefreshed,
     summary,
   };
