@@ -23,6 +23,7 @@
 import { NextResponse } from "next/server";
 import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
+import { compareSuggestion, isFreshAiCheck, AI_TRUSTED_MODE } from "@/lib/needsReviewAi";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
 const PRIORITY_STATES = ["TX", "FL", "GA", "CA", "OH", "IN"];
@@ -88,6 +89,53 @@ export async function GET(req) {
       .limit(QUEUE_LIMIT);
     if (error) throw error;
 
+    // AI-check result per school: the most recent Batch Coach-Info item for
+    // each school in this queue (queued from this page, or from any other run
+    // that happened to include it), read against the school's CURRENT on-file
+    // coach by compareSuggestion (lib/needsReviewAi.js). Chunked because a
+    // state's queue can be several hundred schools.
+    const aiBySchool = new Map();
+    const schoolRows = data || [];
+    for (let i = 0; i < schoolRows.length; i += 200) {
+      const chunk = schoolRows.slice(i, i + 200).map((s) => s.id);
+      const { data: items, error: itemsErr } = await admin
+        .from("coach_info_batch_items")
+        .select("id,school_id,batch_run_id,fetch_status,suggestion,suggestion_error,review_status")
+        .in("school_id", chunk)
+        .order("id", { ascending: false });
+      if (itemsErr) throw itemsErr;
+      (items || []).forEach((it) => {
+        if (!aiBySchool.has(it.school_id)) aiBySchool.set(it.school_id, it); // newest first, keep the first seen
+      });
+    }
+    const runIds = [...new Set([...aiBySchool.values()].map((it) => it.batch_run_id))];
+    const runStatus = new Map();
+    for (let i = 0; i < runIds.length; i += 200) {
+      const { data: runs, error: runsErr } = await admin.from("coach_info_batch_runs").select("id,status,collected_at,created_at,candidate_mode").in("id", runIds.slice(i, i + 200));
+      if (runsErr) throw runsErr;
+      (runs || []).forEach((r) => runStatus.set(r.id, { status: r.status, collected_at: r.collected_at, created_at: r.created_at, candidate_mode: r.candidate_mode }));
+    }
+    const schoolsWithAi = schoolRows.map((s) => {
+      const it = aiBySchool.get(s.id);
+      if (!it) return { ...s, ai_check: null };
+      // Only re_verify runs count (see AI_TRUSTED_MODE) -- results from
+      // other run types are ignored here, so those schools show as not yet
+      // AI-checked and can be queued fresh.
+      if (runStatus.get(it.batch_run_id)?.candidate_mode !== AI_TRUSTED_MODE) return { ...s, ai_check: null };
+      if (!it.suggestion && !it.suggestion_error) {
+        // Queued/fetching/submitted but no answer yet -- unless the run was
+        // queued long ago and never went anywhere, in which case treat the
+        // school as not checked so it can be queued again.
+        const queuedAt = runStatus.get(it.batch_run_id)?.created_at;
+        if (queuedAt && Date.now() - new Date(queuedAt).getTime() > 14 * 24 * 60 * 60 * 1000) return { ...s, ai_check: null };
+        return { ...s, ai_check: { status: "pending", run_id: it.batch_run_id, run_status: runStatus.get(it.batch_run_id)?.status || null, item_id: it.id, confirmable: false } };
+      }
+      // An old result (see AI_CHECK_MAX_AGE_DAYS) is treated as never checked.
+      if (!isFreshAiCheck(runStatus.get(it.batch_run_id)?.collected_at)) return { ...s, ai_check: null };
+      const cmp = compareSuggestion(s, it.suggestion);
+      return { ...s, ai_check: { ...cmp, run_id: it.batch_run_id, item_id: it.id } };
+    });
+
     // A same-day counter for the queue screen itself -- a positive "X
     // confirmed today" recap right where the work is happening, not just in
     // the state-picker list one click back.
@@ -101,7 +149,7 @@ export async function GET(req) {
       .gte("coach_radar_reviewed_at", startOfToday.toISOString());
     if (countErr) throw countErr;
 
-    return NextResponse.json({ state, schools: data, total_in_queue: count ?? data.length, reviewed_today: reviewedTodayCount || 0 });
+    return NextResponse.json({ state, schools: schoolsWithAi, total_in_queue: count ?? data.length, reviewed_today: reviewedTodayCount || 0 });
   } catch (err) {
     console.error("needs-review GET error", err);
     return NextResponse.json({ error: "Could not load the Needs Review queue. Please try again." }, { status: 500 });
