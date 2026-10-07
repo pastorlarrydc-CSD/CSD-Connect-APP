@@ -6,6 +6,7 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
+import { EDIT_FIELDS, EDIT_LABELS, linkableUrl, staleEmailInfo } from "@/lib/needsReviewEdit";
 
 // Same six states Batch Coach-Info Discovery treats as priority recruiting
 // states (kept as a local const there too, so mirroring that here).
@@ -27,6 +28,10 @@ const REASON_ORDER = ["paste", "unchecked", "flagged", "never"];
 // Most schools one click will queue for an AI web check. Keeps a single run
 // (and its search + AI cost) small enough to sanity-check before doing more.
 const AI_SEND_CAP = 100;
+// Most rows "Edit all shown" opens at once.
+const EDIT_ALL_CAP = 40;
+// Rows saved at the same time by "Save all changed".
+const SAVE_CONCURRENCY = 3;
 
 // What the AI web check (a Batch Coach-Info run queued from this page, or any
 // other run that included the school) found, read against the school's
@@ -74,6 +79,21 @@ function AiCheckCell({ ai }) {
     );
   }
   return <span style={{ fontSize: 12, color: "#697386" }}>AI found nothing usable</span>;
+}
+
+// The school's own athletics site (falling back to its general website) as a
+// new-tab link, so the staff page can be pulled up and the coach's email
+// confirmed without leaving the queue.
+function SchoolSiteLink({ school }) {
+  const ath = linkableUrl(school?.athletics_url);
+  const web = ath ? null : linkableUrl(school?.website);
+  const href = ath || web;
+  if (!href) return <div style={{ color: "#9aa1ab", fontStyle: "italic", fontSize: 11.5 }}>No athletics URL on file</div>;
+  return (
+    <a href={href} target="_blank" rel="noopener noreferrer" title={href} style={{ color: "#0b5fff", fontWeight: 600, fontSize: 12, textDecoration: "underline" }}>
+      {ath ? "Athletics site ↗" : "School website ↗ (no athletics URL)"}
+    </a>
+  );
 }
 
 function reasonOf(s) {
@@ -128,6 +148,14 @@ function NeedsReviewPageInner() {
   const [aiBusy, setAiBusy] = useState(false);
   const [aiNote, setAiNote] = useState(null); // { kind: "info" | "danger", text, runId? }
   const [confirmingId, setConfirmingId] = useState(null);
+  // Quick Fix: any number of rows can be open at once. editDrafts is a
+  // {schoolId: {field: value, __clearEmail}} map (a row is open exactly when it
+  // has an entry); editErrors / rowNotes are per-row messages.
+  const [editDrafts, setEditDrafts] = useState({});
+  const [editErrors, setEditErrors] = useState({});
+  const [rowNotes, setRowNotes] = useState({});
+  const [savingIds, setSavingIds] = useState({});
+  const [saveAllProgress, setSaveAllProgress] = useState(null); // { done, total }
   const [priorityOnly, setPriorityOnly] = useState(true);
   const [error, setError] = useState("");
 
@@ -171,6 +199,9 @@ function NeedsReviewPageInner() {
       setSelectedState(state);
       setReasonFilter("all");
       setAiNote(null);
+      setEditDrafts({});
+      setEditErrors({});
+      setRowNotes({});
       setLoadingSchools(true);
       setError("");
       try {
@@ -194,6 +225,30 @@ function NeedsReviewPageInner() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canReview, stateFromUrl]);
 
+  // A school just left the queue (confirmed, or saved and cleared): drop its
+  // row, any open editor, and move the state's counters.
+  const dropClearedSchool = (schoolId) => {
+    setSchools((prev) => prev.filter((s) => s.id !== schoolId));
+    setEditDrafts((prev) => {
+      const { [schoolId]: _drop, ...rest } = prev;
+      return rest;
+    });
+    setTotalInQueue((prev) => Math.max(0, prev - 1));
+    setReviewedToday((prev) => prev + 1);
+    setStates((prev) =>
+      prev.map((s) =>
+        s.state === selectedState
+          ? {
+              ...s,
+              ever_reviewed: s.ever_reviewed + 1,
+              never_reviewed: s.never_reviewed - 1,
+              pct_reviewed: ((100 * (s.ever_reviewed + 1)) / s.total_schools).toFixed(1),
+            }
+          : s
+      )
+    );
+  };
+
   // aiItemId (optional): confirm because the AI web check matched -- the
   // server re-checks that and logs it as an AI lookup, not a human confirm.
   // Returns true on success so the bulk "Confirm AI-matched" loop can stop
@@ -210,21 +265,7 @@ function NeedsReviewPageInner() {
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "Could not save this confirmation.");
 
-      setSchools((prev) => prev.filter((s) => s.id !== schoolId));
-      setTotalInQueue((prev) => Math.max(0, prev - 1));
-      setReviewedToday((prev) => prev + 1);
-      setStates((prev) =>
-        prev.map((s) =>
-          s.state === selectedState
-            ? {
-                ...s,
-                ever_reviewed: s.ever_reviewed + 1,
-                never_reviewed: s.never_reviewed - 1,
-                pct_reviewed: ((100 * (s.ever_reviewed + 1)) / s.total_schools).toFixed(1),
-              }
-            : s
-        )
-      );
+      dropClearedSchool(schoolId);
       return true;
     } catch (err) {
       setError(err.message);
@@ -293,6 +334,135 @@ function NeedsReviewPageInner() {
     setAiBusy(false);
   };
 
+  // ---- Quick Fix (multi-row) -------------------------------------------
+  // Opens with each field showing what's on file, EXCEPT an email that still
+  // looks like the previous coach's: that one starts empty (the on-file value
+  // stays visible as the placeholder) so a stale address isn't carried
+  // forward by habit.
+  const draftFromSchool = (s) => {
+    const draft = {};
+    EDIT_FIELDS.forEach((f) => {
+      draft[f] = (s[f] || "").toString();
+    });
+    if (staleEmailInfo(s)) draft.hc_email = "";
+    return draft;
+  };
+  const isEditing = (s) => Object.prototype.hasOwnProperty.call(editDrafts, s.id);
+  // "Changed" = a field, or the remove-email box, differs from how the editor
+  // opened. Save all only writes changed rows, so opening 40 editors and
+  // pressing Save all can't quietly confirm 40 schools nobody looked at.
+  const isDirty = (s) => {
+    const d = editDrafts[s.id];
+    if (!d) return false;
+    if (d.__clearEmail) return true;
+    const base = draftFromSchool(s);
+    return EDIT_FIELDS.some((f) => (d[f] || "").trim() !== (base[f] || "").trim());
+  };
+  const toggleEdit = (s) => {
+    if (isEditing(s)) {
+      closeEdit(s.id);
+      return;
+    }
+    setEditDrafts((prev) => ({ ...prev, [s.id]: draftFromSchool(s) }));
+    setEditErrors((prev) => {
+      const { [s.id]: _drop, ...rest } = prev;
+      return rest;
+    });
+  };
+  const closeEdit = (id) => {
+    setEditDrafts((prev) => {
+      const { [id]: _drop, ...rest } = prev;
+      return rest;
+    });
+    setEditErrors((prev) => {
+      const { [id]: _drop, ...rest } = prev;
+      return rest;
+    });
+  };
+  const updateDraft = (id, field, value) => setEditDrafts((prev) => ({ ...prev, [id]: { ...(prev[id] || {}), [field]: value } }));
+  const openEditAllShown = () => {
+    const targets = shownSchools.slice(0, EDIT_ALL_CAP);
+    setEditDrafts((prev) => {
+      const next = { ...prev };
+      targets.forEach((s) => {
+        if (!Object.prototype.hasOwnProperty.call(next, s.id)) next[s.id] = draftFromSchool(s);
+      });
+      return next;
+    });
+  };
+  const closeAllEdits = () => {
+    setEditDrafts({});
+    setEditErrors({});
+  };
+
+  // Saves one school through /api/admin/needs-review/save. A save that
+  // clears the school drops it from the queue; one the server holds back
+  // (a previous coach's email still on the record, a changed coach with no
+  // confirmed email, an email removed with nothing replacing it) is saved,
+  // stays in the queue still flagged, and shows why.
+  const saveRow = async (s) => {
+    const d = editDrafts[s.id] || {};
+    setSavingIds((prev) => ({ ...prev, [s.id]: true }));
+    setEditErrors((prev) => {
+      const { [s.id]: _drop, ...rest } = prev;
+      return rest;
+    });
+    try {
+      const fields = {};
+      EDIT_FIELDS.forEach((f) => {
+        const v = (d[f] || "").trim();
+        if (v) fields[f] = v;
+      });
+      const res = await authedFetch("/api/admin/needs-review/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ school_id: s.id, fields, clear_email: Boolean(d.__clearEmail) }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || "Could not save this school.");
+      if (json.cleared) {
+        dropClearedSchool(s.id);
+        return true;
+      }
+      setSchools((prev) => prev.map((x) => (x.id === s.id ? { ...x, ...json.school, flagged_needs_review: true, needs_review_note: x.flagged_needs_review ? x.needs_review_note : json.reason } : x)));
+      setRowNotes((prev) => ({ ...prev, [s.id]: `Saved, but still flagged: ${json.reason}` }));
+      closeEdit(s.id);
+      return true;
+    } catch (err) {
+      setEditErrors((prev) => ({ ...prev, [s.id]: err.message || "Could not save this school." }));
+      return false;
+    } finally {
+      setSavingIds((prev) => {
+        const { [s.id]: _drop, ...rest } = prev;
+        return rest;
+      });
+    }
+  };
+
+  const saveAllChanged = async () => {
+    const targets = shownSchools.filter((s) => isEditing(s) && isDirty(s));
+    if (!targets.length) return;
+    setError("");
+    setSaveAllProgress({ done: 0, total: targets.length });
+    let done = 0;
+    let failed = 0;
+    let next = 0;
+    const worker = async () => {
+      while (next < targets.length) {
+        const s = targets[next];
+        next += 1;
+        // eslint-disable-next-line no-await-in-loop
+        const ok = await saveRow(s);
+        if (!ok) failed += 1;
+        done += 1;
+        setSaveAllProgress({ done, total: targets.length });
+      }
+    };
+    await Promise.all(Array.from({ length: Math.min(SAVE_CONCURRENCY, targets.length) }, worker));
+    setSaveAllProgress(null);
+    if (failed > 0) setError(`Saved ${targets.length - failed} of ${targets.length} edited schools. The ${failed} that failed are still open with their error.`);
+  };
+
   if (!canReview) {
     return (
       <div className="view">
@@ -326,6 +496,8 @@ function NeedsReviewPageInner() {
   // What the two AI buttons act on: whatever the current filter is showing.
   const aiSendable = shownSchools.filter((s) => !s.ai_check);
   const aiConfirmable = shownSchools.filter((s) => s.ai_check?.confirmable);
+  const openEditCount = shownSchools.filter(isEditing).length;
+  const dirtyEditCount = shownSchools.filter((s) => isEditing(s) && isDirty(s)).length;
 
   return (
     <div className="view">
@@ -503,6 +675,45 @@ function NeedsReviewPageInner() {
                 {aiNote.text}
               </div>
             )}
+            <div
+              style={{
+                position: "sticky",
+                top: 0,
+                zIndex: 5,
+                display: "flex",
+                alignItems: "center",
+                flexWrap: "wrap",
+                gap: 8,
+                marginBottom: 8,
+                padding: "8px 10px",
+                background: openEditCount > 0 ? "#eef4fb" : "#f8fafc",
+                border: `1px solid ${openEditCount > 0 ? "#cfe0f2" : "#e3e6ea"}`,
+                borderRadius: 8,
+                fontSize: 12.5,
+              }}
+            >
+              <button className="btn btn-sm" disabled={shownSchools.length === 0 || !!saveAllProgress} onClick={openEditAllShown}>
+                Edit all shown ({Math.min(shownSchools.length, EDIT_ALL_CAP)})
+              </button>
+              {openEditCount > 0 ? (
+                <>
+                  <span>
+                    <strong>{openEditCount}</strong> open · <strong>{dirtyEditCount}</strong> changed
+                  </span>
+                  <button className="btn btn-gold btn-sm" disabled={!!saveAllProgress || dirtyEditCount === 0} onClick={saveAllChanged}>
+                    {saveAllProgress ? `Saving ${saveAllProgress.done} of ${saveAllProgress.total}…` : `Save all changed (${dirtyEditCount})`}
+                  </button>
+                  <button className="btn btn-sm" disabled={!!saveAllProgress} onClick={closeAllEdits}>
+                    Close all
+                  </button>
+                  <span style={{ color: "#9aa1ab", fontSize: 11.5 }}>
+                    A save counts as your review: the school is marked verified and leaves the queue, unless its email still looks like the previous coach&apos;s. Save all only writes rows you changed.
+                  </span>
+                </>
+              ) : (
+                <span style={{ color: "#9aa1ab", fontSize: 11.5 }}>Open Quick Fix on several schools, check each on its athletics site, then save them all at once.</span>
+              )}
+            </div>
             <table>
               <thead>
                 <tr>
@@ -517,11 +728,19 @@ function NeedsReviewPageInner() {
                 </tr>
               </thead>
               <tbody>
-                {shownSchools.map((s) => (
+                {shownSchools.map((s) => {
+                  const stale = staleEmailInfo(s);
+                  const draft = editDrafts[s.id] || {};
+                  const editing = isEditing(s);
+                  const saving = !!savingIds[s.id];
+                  return [
                   <tr key={s.id}>
                     <td>
                       <Link href={`/schools/${s.id}`}>{s.name}</Link>
                       <div style={{ fontSize: 11.5, color: "#697386" }}>{s.city}</div>
+                      <div style={{ marginTop: 3 }}>
+                        <SchoolSiteLink school={s} />
+                      </div>
                       {s.flagged_needs_review && s.needs_review_note && (
                         <div style={{ fontSize: 11.5, color: "#8a6d3b", fontStyle: "italic", marginTop: 2, maxWidth: 340 }}>{s.needs_review_note}</div>
                       )}
@@ -533,7 +752,12 @@ function NeedsReviewPageInner() {
                         <span style={{ color: "#a2a9b6" }}>—</span>
                       )}
                     </td>
-                    <td>{s.hc_email || <span style={{ color: "#a2a9b6" }}>—</span>}</td>
+                    <td>
+                      {s.hc_email || <span style={{ color: "#a2a9b6" }}>—</span>}
+                      {stale && (
+                        <div style={{ fontSize: 11.5, color: "#b3261e", fontWeight: 600, maxWidth: 220 }}>⚠ Looks like the previous coach&apos;s email ({stale.priorLast})</div>
+                      )}
+                    </td>
                     <td>{s.hc_cell || <span style={{ color: "#a2a9b6" }}>—</span>}</td>
                     <td>{s.hc_office || <span style={{ color: "#a2a9b6" }}>—</span>}</td>
                     <td>
@@ -550,15 +774,76 @@ function NeedsReviewPageInner() {
                     <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
                       <button
                         className="btn btn-sm"
+                        style={editing ? { background: "#0b5fff", borderColor: "#0b5fff", color: "#fff", marginRight: 6 } : { marginRight: 6 }}
+                        onClick={() => toggleEdit(s)}
+                        disabled={saving || !!saveAllProgress}
+                        title="Fix the coach name, email or phones right here, then save"
+                      >
+                        {editing ? "Editing…" : "Edit"}
+                      </button>
+                      <button
+                        className="btn btn-sm"
                         style={{ background: "#1e7145", color: "#fff", borderColor: "#1e7145" }}
                         onClick={() => confirmAccurate(s.id)}
-                        disabled={confirmingId === s.id}
+                        disabled={confirmingId === s.id || saving}
+                        title={stale ? "The email on file still looks like the previous coach's — open Edit to fix it first" : undefined}
                       >
                         {confirmingId === s.id ? "Saving…" : "Confirmed accurate"}
                       </button>
                     </td>
-                  </tr>
-                ))}
+                  </tr>,
+                  rowNotes[s.id] && !editing && (
+                    <tr key={`note-${s.id}`}>
+                      <td colSpan={8} style={{ fontSize: 12, color: "#8a6d3b", paddingTop: 0 }}>
+                        {rowNotes[s.id]}
+                      </td>
+                    </tr>
+                  ),
+                  editing && (
+                    <tr key={`edit-${s.id}`} style={{ background: "#f8fafc" }}>
+                      <td colSpan={8} style={{ padding: "10px 8px 14px" }}>
+                        <div style={{ fontSize: 11.5, fontWeight: 600, color: "#697386", marginBottom: 8, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                          <span>Quick Fix — {s.name}</span>
+                          <SchoolSiteLink school={s} />
+                        </div>
+                        <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(190px, 1fr))", gap: 8 }}>
+                          {EDIT_FIELDS.map((f) => (
+                            <label key={f} style={{ fontSize: 11.5, color: "#697386" }}>
+                              {EDIT_LABELS[f]}
+                              <input
+                                value={draft[f] || ""}
+                                onChange={(e) => updateDraft(s.id, f, e.target.value)}
+                                style={{ width: "100%", marginTop: 2, fontSize: 12.5 }}
+                                placeholder={s[f] || ""}
+                              />
+                            </label>
+                          ))}
+                        </div>
+                        {stale && (
+                          <label style={{ display: "block", marginTop: 8, fontSize: 12, color: "#8a6100" }}>
+                            <input type="checkbox" checked={Boolean(draft.__clearEmail)} onChange={(e) => updateDraft(s.id, "__clearEmail", e.target.checked)} style={{ marginRight: 6 }} />
+                            Remove the previous coach&apos;s email ({s.hc_email}) — it contains {stale.priorLast}. Type the current coach&apos;s email in the Email box to replace it, or tick this to clear it.
+                          </label>
+                        )}
+                        {editErrors[s.id] && (
+                          <div className="notice danger" style={{ marginTop: 8, fontSize: 12.5 }}>
+                            {editErrors[s.id]}
+                          </div>
+                        )}
+                        <div style={{ display: "flex", gap: 6, marginTop: 10, alignItems: "center", flexWrap: "wrap" }}>
+                          <button className="btn btn-gold btn-sm" disabled={saving || !!saveAllProgress} onClick={() => saveRow(s)}>
+                            {saving ? "Saving…" : "Save & confirm this row"}
+                          </button>
+                          <button className="btn btn-sm" disabled={saving || !!saveAllProgress} onClick={() => closeEdit(s.id)}>
+                            Cancel
+                          </button>
+                          <span style={{ fontSize: 11, color: "#9aa1ab" }}>Blank fields are left as they are.</span>
+                        </div>
+                      </td>
+                    </tr>
+                  ),
+                  ];
+                })}
               </tbody>
             </table>
             {shownSchools.length === 0 && <div className="empty-state">No schools match this filter.</div>}
