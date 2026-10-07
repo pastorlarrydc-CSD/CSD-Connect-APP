@@ -95,6 +95,11 @@ export async function GET(req) {
     // coach by compareSuggestion (lib/needsReviewAi.js). Chunked because a
     // state's queue can be several hundred schools.
     const aiBySchool = new Map();
+    // Newest item per school that actually carries an AI result, from ANY run
+    // type -- feeds the "AI found" panel in Quick Fix. Unlike ai_check (which
+    // only trusts re_verify runs, because it can auto-confirm), these are only
+    // ever offered to a reviewer to look at and click, so any mode may show.
+    const sugBySchool = new Map();
     const schoolRows = data || [];
     for (let i = 0; i < schoolRows.length; i += 200) {
       const chunk = schoolRows.slice(i, i + 200).map((s) => s.id);
@@ -106,9 +111,11 @@ export async function GET(req) {
       if (itemsErr) throw itemsErr;
       (items || []).forEach((it) => {
         if (!aiBySchool.has(it.school_id)) aiBySchool.set(it.school_id, it); // newest first, keep the first seen
+        const sg = it.suggestion;
+        if (sg && !sugBySchool.has(it.school_id) && (sg.hc_first_name || sg.hc_last_name || sg.hc_email || sg.hc_office || sg.hc_cell)) sugBySchool.set(it.school_id, it);
       });
     }
-    const runIds = [...new Set([...aiBySchool.values()].map((it) => it.batch_run_id))];
+    const runIds = [...new Set([...aiBySchool.values(), ...sugBySchool.values()].map((it) => it.batch_run_id))];
     const runStatus = new Map();
     for (let i = 0; i < runIds.length; i += 200) {
       const { data: runs, error: runsErr } = await admin.from("coach_info_batch_runs").select("id,status,collected_at,created_at,candidate_mode").in("id", runIds.slice(i, i + 200));
@@ -125,6 +132,30 @@ export async function GET(req) {
       if (sitesErr) throw sitesErr;
       (sites || []).forEach((r) => siteBySchool.set(r.id, { athletics_url: r.athletics_url || null, website: r.website || null }));
     }
+    // What the AI found for a school, trimmed to what Quick Fix shows. Null when
+    // there is no result, or it is older than AI_CHECK_MAX_AGE_DAYS.
+    const aiSuggestionFor = (schoolId) => {
+      const it = sugBySchool.get(schoolId);
+      if (!it) return null;
+      const run = runStatus.get(it.batch_run_id);
+      if (!isFreshAiCheck(run?.collected_at)) return null;
+      const sg = it.suggestion;
+      const text = (v) => String(v == null ? "" : v).trim();
+      return {
+        item_id: it.id,
+        run_id: it.batch_run_id,
+        mode: run?.candidate_mode || null,
+        confidence: sg.confidence || null,
+        hc_first_name: text(sg.hc_first_name),
+        hc_last_name: text(sg.hc_last_name),
+        hc_email: text(sg.hc_email),
+        hc_email_estimated: Boolean(sg.hc_email_estimated),
+        hc_office: text(sg.hc_office),
+        hc_cell: text(sg.hc_cell),
+        source: text(sg.source).slice(0, 80),
+        notes: text(sg.notes).slice(0, 600),
+      };
+    };
     const schoolsWithAi = schoolRows.map((row) => {
       const s = { ...row, ...(siteBySchool.get(row.id) || { athletics_url: null, website: null }) };
       const it = aiBySchool.get(s.id);
@@ -147,6 +178,8 @@ export async function GET(req) {
       return { ...s, ai_check: { ...cmp, run_id: it.batch_run_id, item_id: it.id } };
     });
 
+    const schoolsOut = schoolsWithAi.map((s) => ({ ...s, ai_suggestion: aiSuggestionFor(s.id) }));
+
     // A same-day counter for the queue screen itself -- a positive "X
     // confirmed today" recap right where the work is happening, not just in
     // the state-picker list one click back.
@@ -160,7 +193,7 @@ export async function GET(req) {
       .gte("coach_radar_reviewed_at", startOfToday.toISOString());
     if (countErr) throw countErr;
 
-    return NextResponse.json({ state, schools: schoolsWithAi, total_in_queue: count ?? data.length, reviewed_today: reviewedTodayCount || 0 });
+    return NextResponse.json({ state, schools: schoolsOut, total_in_queue: count ?? data.length, reviewed_today: reviewedTodayCount || 0 });
   } catch (err) {
     console.error("needs-review GET error", err);
     return NextResponse.json({ error: "Could not load the Needs Review queue. Please try again." }, { status: 500 });
