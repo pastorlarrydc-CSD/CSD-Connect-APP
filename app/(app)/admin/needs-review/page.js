@@ -11,6 +11,27 @@ import { useAuth } from "@/lib/auth-context";
 // states (kept as a local const there too, so mirroring that here).
 const PRIORITY_STATES = ["TX", "FL", "GA", "CA", "OH", "IN"];
 
+// Why a school is in the queue. A school flagged with needs_review = true
+// carries a needs_review_note saying why; the two notes this tool writes
+// itself are recognized by their wording so they get their own filter.
+// Everything else flagged by hand is "flagged"; a school with no flag that
+// simply never had its coach fields re-checked is "never".
+const REASONS = {
+  paste: { label: "Paste-match", color: "#8a4b00", bg: "#fff1de" },
+  unchecked: { label: "Unchecked sheet", color: "#a02b8f", bg: "#f9e8f6" },
+  flagged: { label: "Flagged", color: "#b3261e", bg: "#fdeeed" },
+  never: { label: "Never checked", color: "#697386", bg: "#eef0f3" },
+};
+const REASON_ORDER = ["paste", "unchecked", "flagged", "never"];
+
+function reasonOf(s) {
+  if (!s.flagged_needs_review) return "never";
+  const note = s.needs_review_note || "";
+  if (/comparing a pasted list/i.test(note)) return "paste";
+  if (/unchecked sheet/i.test(note)) return "unchecked";
+  return "flagged";
+}
+
 function pctColor(pct) {
   if (pct >= 50) return "#1e7145"; // var(--green)
   if (pct >= 20) return "#b8860b"; // var(--amber)
@@ -48,6 +69,9 @@ function NeedsReviewPageInner() {
   const [schools, setSchools] = useState([]);
   const [loadingSchools, setLoadingSchools] = useState(false);
   const [reviewedToday, setReviewedToday] = useState(0);
+  const [totalInQueue, setTotalInQueue] = useState(0);
+  // "all" | "flagged" (every flagged school) | one of REASON_ORDER
+  const [reasonFilter, setReasonFilter] = useState("all");
   const [confirmingId, setConfirmingId] = useState(null);
   const [priorityOnly, setPriorityOnly] = useState(true);
   const [error, setError] = useState("");
@@ -90,6 +114,7 @@ function NeedsReviewPageInner() {
   const loadState = useCallback(
     async (state) => {
       setSelectedState(state);
+      setReasonFilter("all");
       setLoadingSchools(true);
       setError("");
       try {
@@ -97,6 +122,7 @@ function NeedsReviewPageInner() {
         const json = await res.json();
         if (!res.ok) throw new Error(json.error || "Could not load this state's queue.");
         setSchools(json.schools || []);
+        setTotalInQueue(json.total_in_queue ?? (json.schools || []).length);
         setReviewedToday(json.reviewed_today || 0);
       } catch (err) {
         setError(err.message);
@@ -125,6 +151,7 @@ function NeedsReviewPageInner() {
       if (!res.ok) throw new Error(json.error || "Could not save this confirmation.");
 
       setSchools((prev) => prev.filter((s) => s.id !== schoolId));
+      setTotalInQueue((prev) => Math.max(0, prev - 1));
       setReviewedToday((prev) => prev + 1);
       setStates((prev) =>
         prev.map((s) =>
@@ -159,6 +186,17 @@ function NeedsReviewPageInner() {
   const totalRemaining = visibleStates.reduce((sum, s) => sum + (s.never_reviewed || 0), 0);
   const selectedStateSummary = selectedState ? states.find((s) => s.state === selectedState) : null;
   const remainingInSelectedState = selectedStateSummary ? selectedStateSummary.never_reviewed : schools.length;
+  // Per-reason counts and the filtered list for the queue table.
+  const reasonCounts = { paste: 0, unchecked: 0, flagged: 0, never: 0 };
+  schools.forEach((s) => {
+    reasonCounts[reasonOf(s)] += 1;
+  });
+  const flaggedCount = reasonCounts.paste + reasonCounts.unchecked + reasonCounts.flagged;
+  const shownSchools = schools.filter((s) => {
+    if (reasonFilter === "all") return true;
+    if (reasonFilter === "flagged") return reasonOf(s) !== "never";
+    return reasonOf(s) === reasonFilter;
+  });
 
   return (
     <div className="view">
@@ -169,8 +207,8 @@ function NeedsReviewPageInner() {
         <div>
           <h1>Needs Review</h1>
           <p>
-            Which schools have never had their coach name, email, cell, or office phone specifically re-checked
-            since import — by state, oldest/never-checked first.
+            Schools that need a second look, by state: ones someone flagged for review (with the reason shown) come first, then schools whose
+            coach name, email, cell, or office phone has never been specifically re-checked since import.
           </p>
         </div>
       </div>
@@ -277,6 +315,33 @@ function NeedsReviewPageInner() {
               )}
             </div>
           ) : (
+            <>
+            {totalInQueue > schools.length && (
+              <div className="notice danger" style={{ marginBottom: 10, fontSize: 12.5 }}>
+                Showing the first {schools.length.toLocaleString()} of {totalInQueue.toLocaleString()} schools in this state&apos;s queue (flagged ones first). Confirm some and reload to
+                bring the rest up.
+              </div>
+            )}
+            <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10, alignItems: "center" }}>
+              <button className={`btn btn-sm ${reasonFilter === "all" ? "btn-gold" : ""}`} onClick={() => setReasonFilter("all")}>
+                All ({schools.length})
+              </button>
+              {flaggedCount > 0 && (
+                <button className={`btn btn-sm ${reasonFilter === "flagged" ? "btn-gold" : ""}`} onClick={() => setReasonFilter("flagged")}>
+                  All flagged ({flaggedCount})
+                </button>
+              )}
+              {REASON_ORDER.filter((r) => reasonCounts[r] > 0).map((r) => (
+                <button key={r} className={`btn btn-sm ${reasonFilter === r ? "btn-gold" : ""}`} onClick={() => setReasonFilter(r)}>
+                  {REASONS[r].label} ({reasonCounts[r]})
+                </button>
+              ))}
+              {reasonFilter !== "all" && (
+                <span style={{ fontSize: 12, color: "#697386" }}>
+                  Showing {shownSchools.length} of {schools.length}
+                </span>
+              )}
+            </div>
             <table>
               <thead>
                 <tr>
@@ -290,11 +355,14 @@ function NeedsReviewPageInner() {
                 </tr>
               </thead>
               <tbody>
-                {schools.map((s) => (
+                {shownSchools.map((s) => (
                   <tr key={s.id}>
                     <td>
                       <Link href={`/schools/${s.id}`}>{s.name}</Link>
                       <div style={{ fontSize: 11.5, color: "#697386" }}>{s.city}</div>
+                      {s.flagged_needs_review && s.needs_review_note && (
+                        <div style={{ fontSize: 11.5, color: "#8a6d3b", fontStyle: "italic", marginTop: 2, maxWidth: 340 }}>{s.needs_review_note}</div>
+                      )}
                     </td>
                     <td>
                       {s.hc_first_name || s.hc_last_name ? (
@@ -310,8 +378,8 @@ function NeedsReviewPageInner() {
                       {/* Every row here is guaranteed never_reviewed=true -- the API now
                           filters out anything already confirmed, so this queue only ever
                           shows what's actually still outstanding. */}
-                      <span className="badge" style={{ color: "#b3261e", background: "#fdeeed" }}>
-                        Never checked
+                      <span className="badge" style={{ color: REASONS[reasonOf(s)].color, background: REASONS[reasonOf(s)].bg }}>
+                        {REASONS[reasonOf(s)].label}
                       </span>
                     </td>
                     <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
@@ -328,6 +396,8 @@ function NeedsReviewPageInner() {
                 ))}
               </tbody>
             </table>
+            {shownSchools.length === 0 && <div className="empty-state">No schools match this filter.</div>}
+            </>
           )}
 
           {/* Repeats the counter after the table too, so it's visible without
