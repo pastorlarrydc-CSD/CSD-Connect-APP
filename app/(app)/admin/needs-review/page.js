@@ -24,6 +24,58 @@ const REASONS = {
 };
 const REASON_ORDER = ["paste", "unchecked", "flagged", "never"];
 
+// Most schools one click will queue for an AI web check. Keeps a single run
+// (and its search + AI cost) small enough to sanity-check before doing more.
+const AI_SEND_CAP = 100;
+
+// What the AI web check (a Batch Coach-Info run queued from this page, or any
+// other run that included the school) found, read against the school's
+// current on-file coach -- see lib/needsReviewAi.js. ai_check is null when
+// the school has never been in a run.
+const AI_FILTERS = {
+  ai_matched: { label: "AI matched", test: (s) => !!s.ai_check?.confirmable },
+  ai_review: { label: "AI: look closer", test: (s) => !!s.ai_check && ["differs", "name_ok", "no_result"].includes(s.ai_check.status) || (!!s.ai_check && s.ai_check.status === "matches" && !s.ai_check.confirmable) },
+  ai_pending: { label: "AI check in progress", test: (s) => s.ai_check?.status === "pending" },
+  ai_none: { label: "Not AI-checked", test: (s) => !s.ai_check },
+};
+const AI_FILTER_ORDER = ["ai_matched", "ai_review", "ai_pending", "ai_none"];
+
+function AiCheckCell({ ai }) {
+  if (!ai) return <span style={{ color: "#a2a9b6" }}>—</span>;
+  if (ai.status === "pending") {
+    return <span style={{ fontSize: 12, color: "#697386" }}>In progress (run #{ai.run_id})</span>;
+  }
+  if (ai.confirmable) {
+    return (
+      <span className="badge" style={{ color: "#1e7145", background: "#e9f5ee", fontWeight: 700 }} title={`Same coach and email as on file, high confidence (run #${ai.run_id})`}>
+        ✓ AI matched
+      </span>
+    );
+  }
+  if (ai.status === "matches") {
+    return (
+      <span style={{ fontSize: 12, color: "#8a6d3b" }} title={`Run #${ai.run_id}`}>
+        Matches on file, but only {ai.confidence || "low"} confidence
+      </span>
+    );
+  }
+  if (ai.status === "name_ok") {
+    return (
+      <span style={{ fontSize: 12, color: "#8a6d3b" }} title={`Run #${ai.run_id}`}>
+        Same coach — email {ai.suggestedEmail ? `differs (${ai.suggestedEmail})` : "not confirmed"}
+      </span>
+    );
+  }
+  if (ai.status === "differs") {
+    return (
+      <span style={{ fontSize: 12, color: "#b3261e", fontWeight: 600 }} title={`Run #${ai.run_id}`}>
+        AI found a different coach: {ai.suggestedName}
+      </span>
+    );
+  }
+  return <span style={{ fontSize: 12, color: "#697386" }}>AI found nothing usable</span>;
+}
+
 function reasonOf(s) {
   if (!s.flagged_needs_review) return "never";
   const note = s.needs_review_note || "";
@@ -55,7 +107,7 @@ function CoverageBar({ pct }) {
 
 function NeedsReviewPageInner() {
   const supabase = getSupabaseBrowserClient();
-  const { profile } = useAuth();
+  const { profile, user } = useAuth();
   const canReview = profile?.role === "verifier" || profile?.role === "sysadmin";
   const searchParams = useSearchParams();
   // Lets State Progress's "Review →" link (on the new Marked Reviewed
@@ -72,6 +124,9 @@ function NeedsReviewPageInner() {
   const [totalInQueue, setTotalInQueue] = useState(0);
   // "all" | "flagged" (every flagged school) | one of REASON_ORDER
   const [reasonFilter, setReasonFilter] = useState("all");
+  // AI web-check actions (see sendToAi / confirmAiMatched below).
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiNote, setAiNote] = useState(null); // { kind: "info" | "danger", text, runId? }
   const [confirmingId, setConfirmingId] = useState(null);
   const [priorityOnly, setPriorityOnly] = useState(true);
   const [error, setError] = useState("");
@@ -115,6 +170,7 @@ function NeedsReviewPageInner() {
     async (state) => {
       setSelectedState(state);
       setReasonFilter("all");
+      setAiNote(null);
       setLoadingSchools(true);
       setError("");
       try {
@@ -138,14 +194,18 @@ function NeedsReviewPageInner() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canReview, stateFromUrl]);
 
-  const confirmAccurate = async (schoolId) => {
+  // aiItemId (optional): confirm because the AI web check matched -- the
+  // server re-checks that and logs it as an AI lookup, not a human confirm.
+  // Returns true on success so the bulk "Confirm AI-matched" loop can stop
+  // on the first failure.
+  const confirmAccurate = async (schoolId, aiItemId = null) => {
     setConfirmingId(schoolId);
     setError("");
     try {
       const res = await authedFetch("/api/admin/needs-review/confirm", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ school_id: schoolId }),
+        body: JSON.stringify(aiItemId ? { school_id: schoolId, ai_item_id: aiItemId } : { school_id: schoolId }),
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "Could not save this confirmation.");
@@ -165,11 +225,72 @@ function NeedsReviewPageInner() {
             : s
         )
       );
+      return true;
     } catch (err) {
       setError(err.message);
+      return false;
     } finally {
       setConfirmingId(null);
     }
+  };
+
+  // Queues the given schools into a new Batch Coach-Info Discovery run
+  // (candidate_mode "re_verify": the open, identity-confirming search, so a
+  // coach who has since been replaced gets found rather than re-confirmed).
+  // Same insert Import & Reconcile and the Batch Coach-Info page itself use.
+  // Nothing is fetched or paid for yet -- the run just sits in "collecting"
+  // until its sources are fetched and it's submitted on the Batch Coach-Info
+  // page. Schools already queued or checked are skipped by the caller.
+  const sendToAi = async (list) => {
+    const picked = list.slice(0, AI_SEND_CAP);
+    if (!picked.length || !user) return;
+    setAiBusy(true);
+    setAiNote(null);
+    setError("");
+    try {
+      const { data: runRow, error: runErr } = await supabase
+        .from("coach_info_batch_runs")
+        .insert({ status: "collecting", state_filter: [selectedState], requested_count: picked.length, created_by: user.id, candidate_mode: "re_verify" })
+        .select()
+        .single();
+      if (runErr) throw runErr;
+      for (let i = 0; i < picked.length; i += 200) {
+        const rows = picked.slice(i, i + 200).map((s) => ({ batch_run_id: runRow.id, school_id: s.id }));
+        const { error: itemsErr } = await supabase.from("coach_info_batch_items").insert(rows);
+        if (itemsErr) throw itemsErr;
+      }
+      const queued = new Set(picked.map((s) => s.id));
+      setSchools((prev) => prev.map((s) => (queued.has(s.id) ? { ...s, ai_check: { status: "pending", run_id: runRow.id, run_status: "collecting", confirmable: false } } : s)));
+      setAiNote({
+        kind: "info",
+        runId: runRow.id,
+        text: `Queued ${picked.length} school${picked.length === 1 ? "" : "s"} as batch run #${runRow.id}${
+          list.length > picked.length ? ` (the first ${AI_SEND_CAP} — ${list.length - picked.length} more are still waiting)` : ""
+        }. Nothing has been searched or charged yet: open Batch Coach-Info, fetch sources for that run, then submit it. When it's collected, reload this page and the results show in the AI check column.`,
+      });
+    } catch (err) {
+      setAiNote({ kind: "danger", text: err.message || "Could not queue these schools." });
+    } finally {
+      setAiBusy(false);
+    }
+  };
+
+  // Confirms every school in the list whose AI check matched the on-file
+  // coach and email at high confidence. One at a time (each call is
+  // re-verified on the server) and stops at the first failure.
+  const confirmAiMatched = async (list) => {
+    if (!list.length) return;
+    setAiBusy(true);
+    setAiNote(null);
+    let done = 0;
+    for (const s of list) {
+      // eslint-disable-next-line no-await-in-loop
+      const ok = await confirmAccurate(s.id, s.ai_check.item_id);
+      if (!ok) break;
+      done += 1;
+    }
+    setAiNote({ kind: done === list.length ? "info" : "danger", text: `Confirmed ${done} of ${list.length} AI-matched school${list.length === 1 ? "" : "s"}.${done < list.length ? " Stopped at the first error shown above." : ""}` });
+    setAiBusy(false);
   };
 
   if (!canReview) {
@@ -192,11 +313,19 @@ function NeedsReviewPageInner() {
     reasonCounts[reasonOf(s)] += 1;
   });
   const flaggedCount = reasonCounts.paste + reasonCounts.unchecked + reasonCounts.flagged;
+  const aiCounts = {};
+  AI_FILTER_ORDER.forEach((k) => {
+    aiCounts[k] = schools.filter(AI_FILTERS[k].test).length;
+  });
   const shownSchools = schools.filter((s) => {
     if (reasonFilter === "all") return true;
     if (reasonFilter === "flagged") return reasonOf(s) !== "never";
+    if (AI_FILTERS[reasonFilter]) return AI_FILTERS[reasonFilter].test(s);
     return reasonOf(s) === reasonFilter;
   });
+  // What the two AI buttons act on: whatever the current filter is showing.
+  const aiSendable = shownSchools.filter((s) => !s.ai_check);
+  const aiConfirmable = shownSchools.filter((s) => s.ai_check?.confirmable);
 
   return (
     <div className="view">
@@ -336,12 +465,44 @@ function NeedsReviewPageInner() {
                   {REASONS[r].label} ({reasonCounts[r]})
                 </button>
               ))}
+              {AI_FILTER_ORDER.filter((k) => aiCounts[k] > 0 && (k !== "ai_none" || aiCounts[k] < schools.length)).map((k) => (
+                <button key={k} className={`btn btn-sm ${reasonFilter === k ? "btn-gold" : ""}`} onClick={() => setReasonFilter(k)}>
+                  {AI_FILTERS[k].label} ({aiCounts[k]})
+                </button>
+              ))}
               {reasonFilter !== "all" && (
                 <span style={{ fontSize: 12, color: "#697386" }}>
                   Showing {shownSchools.length} of {schools.length}
                 </span>
               )}
             </div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 10, alignItems: "center" }}>
+              <button
+                className="btn btn-sm"
+                disabled={aiBusy || aiSendable.length === 0}
+                onClick={() => sendToAi(aiSendable)}
+                title="Queues these schools for an AI web check of who the head coach is now. Nothing is searched or charged until you fetch sources and submit the run on the Batch Coach-Info page."
+              >
+                {aiBusy ? "Working…" : `Send ${Math.min(aiSendable.length, AI_SEND_CAP)}${aiSendable.length > AI_SEND_CAP ? ` of ${aiSendable.length}` : ""} to AI verification`}
+              </button>
+              <button
+                className="btn btn-sm"
+                style={aiConfirmable.length ? { background: "#1e7145", color: "#fff", borderColor: "#1e7145" } : undefined}
+                disabled={aiBusy || aiConfirmable.length === 0}
+                onClick={() => confirmAiMatched(aiConfirmable)}
+                title="Confirms the schools whose AI web check found the same coach and email as on file, at high confidence. Logged as an AI lookup."
+              >
+                {`Confirm ${aiConfirmable.length} AI-matched`}
+              </button>
+              <Link href="/admin/batch-coach-info" className="btn btn-sm">
+                Open Batch Coach-Info →
+              </Link>
+            </div>
+            {aiNote && (
+              <div className={`notice ${aiNote.kind === "danger" ? "danger" : "info"}`} style={{ marginBottom: 10, fontSize: 12.5 }}>
+                {aiNote.text}
+              </div>
+            )}
             <table>
               <thead>
                 <tr>
@@ -351,6 +512,7 @@ function NeedsReviewPageInner() {
                   <th>Cell</th>
                   <th>Office</th>
                   <th>Status</th>
+                  <th>AI check</th>
                   <th />
                 </tr>
               </thead>
@@ -381,6 +543,9 @@ function NeedsReviewPageInner() {
                       <span className="badge" style={{ color: REASONS[reasonOf(s)].color, background: REASONS[reasonOf(s)].bg }}>
                         {REASONS[reasonOf(s)].label}
                       </span>
+                    </td>
+                    <td>
+                      <AiCheckCell ai={s.ai_check} />
                     </td>
                     <td style={{ textAlign: "right", whiteSpace: "nowrap" }}>
                       <button
