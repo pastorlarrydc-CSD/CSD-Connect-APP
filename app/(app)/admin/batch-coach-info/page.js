@@ -46,6 +46,8 @@ const FETCH_CONCURRENCY = 8; // matches the weekly automated cron's own concurre
 // call) -- can safely run more of these in parallel than the page-fetching
 // step above, which is why bulk-apply uses its own higher concurrency.
 const APPLY_CONCURRENCY = 5;
+// Most rows "Edit all shown" will open at once.
+const EDIT_ALL_CAP = 40;
 // ad_name/ad_email are the Athletic Director fallback contact -- a separate
 // pair of fields from the hc_* head-coach ones, captured by the same AI
 // lookup alongside them (see lib/coachInfoLookup.js's SYSTEM_PROMPT).
@@ -105,6 +107,17 @@ function readStoredQuickFix() {
   } catch (_) {
     return null;
   }
+}
+// Several rows can be open for editing at once now, so what's stored is a
+// {itemId: draft} map. An older single-row entry ({itemId, draft}) written
+// before that change is still understood so a draft in progress isn't lost
+// across the deploy.
+function readStoredDrafts() {
+  const stored = readStoredQuickFix();
+  if (!stored) return {};
+  if (stored.drafts && typeof stored.drafts === "object") return stored.drafts;
+  if (stored.itemId != null && stored.draft) return { [stored.itemId]: stored.draft };
+  return {};
 }
 
 function StatusBadge({ status }) {
@@ -392,7 +405,7 @@ function BatchCoachInfoPageInner() {
 
   // Inline "Quick Fix" editor -- Larry's ask: fix a wrong field on the
   // suggestion (or fill in one the AI missed) without leaving this page for
-  // the school's own record. Only one row open at a time (editingId), with
+  // the school's own record. Any number of rows can be open at once (editDrafts), each with
   // its draft values kept separately from item.suggestion so typing doesn't
   // mutate the AI's original output -- Cancel just drops the draft. Seeded
   // with the suggested value where there is one, falling back to what's
@@ -403,10 +416,18 @@ function BatchCoachInfoPageInner() {
   // is back on screen the instant this page remounts. Only reads on mount,
   // by design -- the persistence effect below is what keeps it saved as it
   // changes.
-  const [editingId, setEditingId] = useState(() => readStoredQuickFix()?.itemId ?? null);
-  const [editDraft, setEditDraft] = useState(() => readStoredQuickFix()?.draft || {});
+  //
+  // Several rows can now be open at the same time: editDrafts is a
+  // {itemId: draft} map (a row is "open" exactly when it has an entry), and
+  // editErrors holds each row's own save error. "Save all" in the bar above
+  // the table writes every open row the reviewer actually changed.
+  const [editDrafts, setEditDrafts] = useState(() => readStoredDrafts());
+  const [editErrors, setEditErrors] = useState({});
   const [savingEdit, setSavingEdit] = useState(false);
-  const [editError, setEditError] = useState("");
+  const [saveAllProgress, setSaveAllProgress] = useState(null); // { done, total } while Save all runs
+  // The row whose editor the reviewer last touched -- what Esc closes when
+  // more than one editor is open.
+  const activeEditIdRef = useRef(null);
 
   // Undo toast -- a Quick Fix save is a hand-typed correction with no review
   // step of its own (unlike Apply, which is at least confirming an AI
@@ -429,8 +450,8 @@ function BatchCoachInfoPageInner() {
   useEffect(() => {
     if (typeof window === "undefined") return;
     try {
-      if (editingId !== null) {
-        window.sessionStorage.setItem(QUICK_FIX_STORAGE_KEY, JSON.stringify({ runId: selectedRunId, itemId: editingId, draft: editDraft }));
+      if (Object.keys(editDrafts).length > 0) {
+        window.sessionStorage.setItem(QUICK_FIX_STORAGE_KEY, JSON.stringify({ runId: selectedRunId, drafts: editDrafts }));
       } else {
         window.sessionStorage.removeItem(QUICK_FIX_STORAGE_KEY);
       }
@@ -438,7 +459,7 @@ function BatchCoachInfoPageInner() {
       // Storage can throw in a private tab with site data blocked -- a lost
       // draft on save/cancel isn't worth surfacing an error over.
     }
-  }, [editingId, editDraft, selectedRunId]);
+  }, [editDrafts, selectedRunId]);
 
   function draftFromItem(item) {
     const s = item.school || {};
@@ -455,24 +476,80 @@ function BatchCoachInfoPageInner() {
     return draft;
   }
 
+  function isEditingItem(item) {
+    return Object.prototype.hasOwnProperty.call(editDrafts, item.id);
+  }
+
   function openEdit(item) {
-    if (editingId === item.id) {
-      setEditingId(null);
+    if (isEditingItem(item)) {
+      cancelEdit(item.id);
       return;
     }
-    setEditingId(item.id);
-    setEditDraft(draftFromItem(item));
-    setEditError("");
+    activeEditIdRef.current = item.id;
+    setEditDrafts((prev) => ({ ...prev, [item.id]: draftFromItem(item) }));
+    setEditErrors((prev) => {
+      const { [item.id]: _drop, ...rest } = prev;
+      return rest;
+    });
   }
 
-  function cancelEdit() {
-    setEditingId(null);
-    setEditDraft({});
-    setEditError("");
+  // Opens Quick Fix on every pending row currently shown (the confidence tab
+  // and search box both apply), up to EDIT_ALL_CAP so a 300-row run can't
+  // mount 300 forms at once. Rows already open keep what's been typed.
+  function openEditAllShown() {
+    const targets = visibleRows.filter((i) => i.review_status === "pending" && i.school && i.suggestion).slice(0, EDIT_ALL_CAP);
+    setEditDrafts((prev) => {
+      const next = { ...prev };
+      targets.forEach((i) => {
+        if (!Object.prototype.hasOwnProperty.call(next, i.id)) next[i.id] = draftFromItem(i);
+      });
+      return next;
+    });
   }
 
-  function updateDraftField(field, value) {
-    setEditDraft((prev) => ({ ...prev, [field]: value }));
+  function cancelEdit(itemId) {
+    setEditDrafts((prev) => {
+      const { [itemId]: _drop, ...rest } = prev;
+      return rest;
+    });
+    setEditErrors((prev) => {
+      const { [itemId]: _drop, ...rest } = prev;
+      return rest;
+    });
+  }
+
+  function cancelAllEdits() {
+    setEditDrafts({});
+    setEditErrors({});
+  }
+
+  function updateDraftField(itemId, field, value) {
+    setEditDrafts((prev) => ({ ...prev, [itemId]: { ...(prev[itemId] || {}), [field]: value } }));
+  }
+
+  // "Changed" = the reviewer actually touched something: any field, or the
+  // remove-email checkbox, differs from what the editor opened with. Save
+  // all only writes changed rows -- opening 30 editors and pressing Save all
+  // must NOT quietly apply 30 AI suggestions the reviewer never looked at
+  // (that would sidestep the high-confidence bar Apply All keeps). A row's
+  // own Save button is a deliberate click on that one row, so it still
+  // saves as-is.
+  function isEditDirty(item) {
+    const draft = editDrafts[item.id];
+    if (!draft) return false;
+    const base = draftFromItem(item);
+    if (draft.__clearEmail) return true;
+    return SUGGESTION_FIELDS.some((f) => (draft[f] || "").trim() !== (base[f] || "").trim());
+  }
+
+  function effectiveFieldsFromDraft(draft) {
+    const effectiveFields = {};
+    SUGGESTION_FIELDS.forEach((f) => {
+      const v = ((draft || {})[f] || "").trim();
+      if (v) effectiveFields[f] = v;
+    });
+    if (draft && draft.__clearEmail) effectiveFields.__clearEmail = true;
+    return effectiveFields;
   }
 
   // Reuses applySuggestionFromCsv's write path below -- it already takes a
@@ -484,24 +561,21 @@ function BatchCoachInfoPageInner() {
   // inline inputs instead of a spreadsheet cell.
   async function saveEdit(item) {
     setSavingEdit(true);
-    setEditError("");
+    setEditErrors((prev) => {
+      const { [item.id]: _drop, ...rest } = prev;
+      return rest;
+    });
     // Snapshot exactly what's on file right now, before this write --
     // undoQuickFixSave below restores from this, not from item.suggestion,
     // so Undo always gets back to the real prior state even if the draft
     // only touched one of the nine fields.
     const previousSchool = { ...(item.school || {}) };
     const previousReviewStatus = item.review_status;
-    const effectiveFields = {};
-    SUGGESTION_FIELDS.forEach((f) => {
-      const v = (editDraft[f] || "").trim();
-      if (v) effectiveFields[f] = v;
-    });
-    if (editDraft.__clearEmail) effectiveFields.__clearEmail = true;
+    const effectiveFields = effectiveFieldsFromDraft(editDrafts[item.id]);
     const result = await applySuggestionFromCsv(item, effectiveFields);
     if (result.ok) {
       setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: result.changed ? "applied" : "skipped" } : i)));
-      setEditingId(null);
-      setEditDraft({});
+      cancelEdit(item.id);
       if (result.changed) {
         clearTimeout(undoTimeoutRef.current);
         const toastId = Date.now();
@@ -511,9 +585,45 @@ function BatchCoachInfoPageInner() {
         }, 8000);
       }
     } else {
-      setEditError(result.error);
+      setEditErrors((prev) => ({ ...prev, [item.id]: result.error }));
     }
     setSavingEdit(false);
+  }
+
+  // Saves every open row the reviewer changed, a few at a time, through the
+  // same applySuggestionFromCsv path a single Save uses (same audit log, same
+  // coach-change / unconfirmed-email handling). Rows that save are closed and
+  // marked done; a row that fails stays open with its own error so nothing
+  // typed is lost. Unchanged open rows are left alone. No undo toast -- that
+  // is single-save only; a bulk save can be walked back per school from the
+  // school's change history.
+  async function saveAllEdits() {
+    const targets = visibleRows.filter((i) => i.review_status === "pending" && isEditingItem(i) && isEditDirty(i));
+    if (targets.length === 0) return;
+    setSavingEdit(true);
+    setEditErrors({});
+    setReviewError("");
+    setSaveAllProgress({ done: 0, total: targets.length });
+    let done = 0;
+    const failures = [];
+    await runWithConcurrency(targets, APPLY_CONCURRENCY, async (item) => {
+      const result = await applySuggestionFromCsv(item, effectiveFieldsFromDraft(editDrafts[item.id]));
+      if (result.ok) {
+        setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: result.changed ? "applied" : "skipped" } : i)));
+        cancelEdit(item.id);
+        if (result.flagWarning) failures.push(`${item.school?.name || `#${item.id}`}: saved, but couldn't clear its Data Quality flag`);
+      } else {
+        failures.push(`${item.school?.name || `#${item.id}`}: ${result.error}`);
+        setEditErrors((prev) => ({ ...prev, [item.id]: result.error }));
+      }
+      done++;
+      setSaveAllProgress({ done, total: targets.length });
+    });
+    setSaveAllProgress(null);
+    setSavingEdit(false);
+    if (failures.length > 0) {
+      setReviewError(`Saved ${targets.length - failures.length} of ${targets.length} edited rows. ${failures.slice(0, 3).join("; ")}${failures.length > 3 ? "…" : ""} -- rows that failed are still open.`);
+    }
   }
 
   // Reverts a Quick Fix save back to exactly what was on file before it --
@@ -719,6 +829,10 @@ function BatchCoachInfoPageInner() {
   );
   const clampedFocusedIndex = keyboardTargets.length === 0 ? 0 : Math.min(focusedIndex, keyboardTargets.length - 1);
   const focusedItem = keyboardTargets[clampedFocusedIndex] || null;
+  // Multi-row Quick Fix bar counts -- only rows still shown and pending.
+  const visibleEditableCount = visibleRows.filter((i) => i.review_status === "pending" && i.school && i.suggestion).length;
+  const openEditCount = visibleRows.filter((i) => i.review_status === "pending" && Object.prototype.hasOwnProperty.call(editDrafts, i.id)).length;
+  const dirtyEditCount = visibleRows.filter((i) => i.review_status === "pending" && isEditDirty(i)).length;
 
   // Keyboard shortcuts for the review queue -- Up/Down move focus between
   // pending rows, A applies the focused row, S skips it, E opens/closes the
@@ -732,9 +846,13 @@ function BatchCoachInfoPageInner() {
     function onKeyDown(e) {
       if (selectedRun?.status !== "collected") return;
       if (bulkApplying || bulkSkipping || applyingId) return;
-      if (e.key === "Escape" && editingId !== null) {
+      if (e.key === "Escape" && Object.keys(editDrafts).length > 0) {
         e.preventDefault();
-        cancelEdit();
+        // Closes the editor you last touched; with only one open, that one.
+        const openIds = Object.keys(editDrafts);
+        const last = activeEditIdRef.current;
+        const target = last != null && Object.prototype.hasOwnProperty.call(editDrafts, last) ? last : openIds[openIds.length - 1];
+        cancelEdit(target);
         return;
       }
       const tag = document.activeElement?.tagName;
@@ -766,7 +884,7 @@ function BatchCoachInfoPageInner() {
     }
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [selectedRun?.status, bulkApplying, bulkSkipping, applyingId, focusedItem, keyboardTargets.length, editingId]);
+  }, [selectedRun?.status, bulkApplying, bulkSkipping, applyingId, focusedItem, keyboardTargets.length, editDrafts]);
 
   // Narrowing the confidence filter or typing a search query changes which
   // rows count as keyboard-nav targets -- reset focus to the top of the new
@@ -892,8 +1010,8 @@ function BatchCoachInfoPageInner() {
 
   function openRun(runId) {
     setSelectedRunId(runId);
-    setEditingId(null);
-    setEditError("");
+    setEditDrafts({});
+    setEditErrors({});
     setCreateError("");
     setSubmitError("");
     setStatusError("");
@@ -2419,6 +2537,45 @@ function BatchCoachInfoPageInner() {
                 </div>
               )}
 
+              {/* Multi-row Quick Fix: open several editors, then save them in one go. */}
+              <div
+                style={{
+                  position: "sticky",
+                  top: 0,
+                  zIndex: 5,
+                  display: "flex",
+                  alignItems: "center",
+                  flexWrap: "wrap",
+                  gap: 8,
+                  marginBottom: 8,
+                  padding: "8px 10px",
+                  background: openEditCount > 0 ? "#eef4fb" : "#f8fafc",
+                  border: `1px solid ${openEditCount > 0 ? "#cfe0f2" : "#e3e6ea"}`,
+                  borderRadius: 8,
+                  fontSize: 12.5,
+                }}
+              >
+                <button className="btn btn-sm" disabled={savingEdit || bulkApplying || bulkSkipping || visibleEditableCount === 0} onClick={openEditAllShown}>
+                  Edit all shown ({Math.min(visibleEditableCount, EDIT_ALL_CAP)})
+                </button>
+                {openEditCount > 0 ? (
+                  <>
+                    <span>
+                      <strong>{openEditCount}</strong> open · <strong>{dirtyEditCount}</strong> changed
+                    </span>
+                    <button className="btn btn-gold btn-sm" disabled={savingEdit || dirtyEditCount === 0} onClick={saveAllEdits}>
+                      {saveAllProgress ? `Saving ${saveAllProgress.done} of ${saveAllProgress.total}…` : `Save all changed (${dirtyEditCount})`}
+                    </button>
+                    <button className="btn btn-sm" disabled={savingEdit} onClick={cancelAllEdits}>
+                      Close all
+                    </button>
+                    <span style={{ color: "#9aa1ab", fontSize: 11.5 }}>Save all only writes rows you changed; a row's own button saves just that row.</span>
+                  </>
+                ) : (
+                  <span style={{ color: "#9aa1ab", fontSize: 11.5 }}>Open Quick Fix on several rows, fix them, then save them all at once.</span>
+                )}
+              </div>
+
               <div style={{ fontSize: 11.5, color: "#9aa1ab", marginBottom: 6 }}>
                 Keyboard shortcuts: <strong>↑</strong>/<strong>↓</strong> move focus · <strong>A</strong> apply · <strong>S</strong> skip · <strong>E</strong> quick-edit · <strong>Esc</strong> cancel edit
               </div>
@@ -2454,6 +2611,8 @@ function BatchCoachInfoPageInner() {
                         // catches it before an Apply click, rather than
                         // relying on them to notice a quiet text diff.
                         const rowAssess = assessItem(item);
+                        const isEditing = isEditingItem(item);
+                        const draft = editDrafts[item.id] || {};
                         const nameChanged = rowAssess.nameChanged;
                         return [
                           <tr
@@ -2589,10 +2748,10 @@ function BatchCoachInfoPageInner() {
                                     className="btn btn-sm"
                                     disabled={applying || bulkApplying || bulkSkipping}
                                     onClick={() => openEdit(item)}
-                                    style={editingId === item.id ? { background: "#0b5fff", borderColor: "#0b5fff", color: "#fff" } : undefined}
+                                    style={isEditing ? { background: "#0b5fff", borderColor: "#0b5fff", color: "#fff" } : undefined}
                                     title="Fix a field before applying, right here, without opening the school's record"
                                   >
-                                    {editingId === item.id ? "Editing…" : "Edit"}
+                                    {isEditing ? "Editing…" : "Edit"}
                                   </button>
                                   <Link href={`/schools/${s.id}`} className="btn btn-sm">
                                     Open
@@ -2601,9 +2760,9 @@ function BatchCoachInfoPageInner() {
                               )}
                             </td>
                           </tr>,
-                          editingId === item.id && (
+                          isEditing && (
                             <tr key={`edit-${item.id}`} style={{ borderBottom: "1px solid #eef0f3", background: "#f8fafc" }}>
-                              <td colSpan={4} style={{ padding: "10px 8px 14px" }}>
+                              <td colSpan={4} style={{ padding: "10px 8px 14px" }} onFocusCapture={() => { activeEditIdRef.current = item.id; }}>
                                 {/* Quick Fix -- same idea as the school profile
                                     page's own inline editor, brought into the
                                     batch review queue so correcting one field
@@ -2622,8 +2781,8 @@ function BatchCoachInfoPageInner() {
                                     <label key={f} style={{ fontSize: 11.5, color: "#697386" }}>
                                       {FIELD_LABELS[f]}
                                       <input
-                                        value={editDraft[f] || ""}
-                                        onChange={(e) => updateDraftField(f, e.target.value)}
+                                        value={draft[f] || ""}
+                                        onChange={(e) => updateDraftField(item.id, f, e.target.value)}
                                         style={{ width: "100%", marginTop: 2, fontSize: 12.5 }}
                                         placeholder={s[f] || ""}
                                       />
@@ -2634,24 +2793,24 @@ function BatchCoachInfoPageInner() {
                                   <label style={{ display: "block", marginTop: 8, fontSize: 12, color: "#8a6100" }}>
                                     <input
                                       type="checkbox"
-                                      checked={Boolean(editDraft.__clearEmail)}
-                                      onChange={(e) => updateDraftField("__clearEmail", e.target.checked)}
+                                      checked={Boolean(draft.__clearEmail)}
+                                      onChange={(e) => updateDraftField(item.id, "__clearEmail", e.target.checked)}
                                       style={{ marginRight: 6 }}
                                     />
                                     Remove the previous coach's email ({rowAssess.finalEmail}) — it matches {rowAssess.oldName}, not {rowAssess.newName}. Leave the Email box empty to
                                     clear it, or type the new coach's email to replace it.
                                   </label>
                                 )}
-                                {editError && (
+                                {editErrors[item.id] && (
                                   <div className="notice danger" style={{ marginTop: 8, fontSize: 12.5 }}>
-                                    {editError}
+                                    {editErrors[item.id]}
                                   </div>
                                 )}
                                 <div style={{ display: "flex", gap: 6, marginTop: 10 }}>
                                   <button className="btn btn-gold btn-sm" disabled={savingEdit} onClick={() => saveEdit(item)}>
-                                    {savingEdit ? "Saving…" : "Save & Next"}
+                                    {savingEdit ? "Saving…" : "Save this row"}
                                   </button>
-                                  <button className="btn btn-sm" disabled={savingEdit} onClick={cancelEdit}>
+                                  <button className="btn btn-sm" disabled={savingEdit} onClick={() => cancelEdit(item.id)}>
                                     Cancel
                                   </button>
                                   <span style={{ fontSize: 11, color: "#9aa1ab", alignSelf: "center" }}>
