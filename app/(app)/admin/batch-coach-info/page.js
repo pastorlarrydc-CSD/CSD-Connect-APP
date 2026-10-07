@@ -120,6 +120,44 @@ function readStoredDrafts() {
   return {};
 }
 
+// A school's athletics/website value as a safe, clickable http(s) URL --
+// stored values are sometimes bare ("hemetusd.org/athletics"), and anything
+// that isn't http(s) (javascript:, data:, junk) is refused rather than linked.
+function linkableUrl(value) {
+  const v = (value || "").trim();
+  if (!v) return null;
+  const withProto = /^https?:\/\//i.test(v) ? v : `https://${v}`;
+  try {
+    const u = new URL(withProto);
+    return u.protocol === "http:" || u.protocol === "https:" ? u.href : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+// The school's own athletics site (falling back to its general website) as a
+// new-tab link, so a reviewer can pull up the staff page and confirm the
+// coach's email without leaving the review list.
+function SchoolSiteLink({ school }) {
+  const ath = linkableUrl(school?.athletics_url);
+  const web = ath ? null : linkableUrl(school?.website);
+  const href = ath || web;
+  if (!href) {
+    return <div style={{ color: "#9aa1ab", fontStyle: "italic", fontSize: 11.5 }}>No athletics URL on file</div>;
+  }
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={href}
+      style={{ color: "#0b5fff", fontWeight: 600, fontSize: 12, textDecoration: "underline" }}
+    >
+      {ath ? "Athletics site ↗" : "School website ↗ (no athletics URL)"}
+    </a>
+  );
+}
+
 function StatusBadge({ status }) {
   const labels = {
     collecting: ["Fetching sources", "#697386"],
@@ -2646,6 +2684,9 @@ function BatchCoachInfoPageInner() {
                                 {s.hc_first_name || s.hc_last_name ? `${s.hc_first_name || ""} ${s.hc_last_name || ""}`.trim() : "No coach on file"}
                               </div>
                               {s.hc_email && <div style={{ color: "#9aa1ab" }}>{s.hc_email}</div>}
+                              <div style={{ marginTop: 3 }}>
+                                <SchoolSiteLink school={s} />
+                              </div>
                               {/* On-file social handles, same always-visible
                                   treatment -- Coach-Info's own AI lookup CAN
                                   suggest hc_twitter/hc_facebook (see
@@ -2773,8 +2814,9 @@ function BatchCoachInfoPageInner() {
                                     write path a reviewed-CSV re-upload uses --
                                     same audit-log entries, same
                                     verified/estimated-email handling. */}
-                                <div style={{ fontSize: 11.5, fontWeight: 600, color: "#697386", marginBottom: 8 }}>
-                                  Quick Fix — {s.name}
+                                <div style={{ fontSize: 11.5, fontWeight: 600, color: "#697386", marginBottom: 8, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                                  <span>Quick Fix — {s.name}</span>
+                                  <SchoolSiteLink school={s} />
                                 </div>
                                 <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(190px, 1fr))", gap: 8 }}>
                                   {SUGGESTION_FIELDS.map((f) => (
