@@ -102,6 +102,32 @@ const TAG_STYLE = {
   checking: { label: "Checking…", color: "#697386", bg: "#f1f3f6", border: "#d9dde4", dot: "#9aa3b2" },
 };
 
+// How many live AI lookups run at once in "Run AI on N rows". Each one is a
+// real web-search + Anthropic call (up to ~20s), so a small pool -- not all
+// of them at once -- keeps it fast without hammering the API.
+const AI_LOOKUP_CONCURRENCY = 4;
+
+const CHANGE_FILTERS = [
+  ["all", "Any change"],
+  ["coach", "Coach name changing"],
+  ["email", "Email"],
+  ["phone", "Phone / cell / office"],
+];
+
+function rowState(row) {
+  return String(row?.mapped_data?.state || "").trim().toUpperCase();
+}
+
+function rowMatchesFilters(row, stateFilter, changeFilter) {
+  if (stateFilter !== "all" && rowState(row) !== stateFilter) return false;
+  if (changeFilter === "all") return true;
+  const fields = new Set(((row.diff && row.diff.length ? row.diff.map((f) => f.field) : null) || ["hc_first_name", "hc_last_name", "hc_email", "hc_cell", "hc_office"].filter((f) => row.mapped_data?.[f])));
+  if (changeFilter === "coach") return fields.has("hc_first_name") || fields.has("hc_last_name");
+  if (changeFilter === "email") return fields.has("hc_email");
+  if (changeFilter === "phone") return fields.has("hc_cell") || fields.has("hc_office");
+  return true;
+}
+
 function rowTag(row, guard, indexReady) {
   if (!row || row.resolution !== "pending" || !FLOW_BUCKETS.includes(row.bucket)) return null;
   if (!indexReady) return { level: "checking", reasons: ["The mix-up safety check is still loading"] };
@@ -231,6 +257,10 @@ export default function ImportReconcilePage() {
   const [flowCursor, setFlowCursor] = useState(0);
   const [flowHint, setFlowHint] = useState("");
   const [tagFilter, setTagFilter] = useState("all"); // all | green | yellow | red
+  const [stateFilter, setStateFilter] = useState("all"); // all | two-letter state
+  const [changeFilter, setChangeFilter] = useState("all"); // all | coach | email | phone
+  const [aiBulkRunning, setAiBulkRunning] = useState(false);
+  const aiStopRef = useRef(false);
   const flowHandlersRef = useRef(null);
   const flowCardRef = useRef(null);
   const flowInFlightRef = useRef(null); // row id of a keyboard action still running -- stops a double-tap applying twice
@@ -621,6 +651,8 @@ export default function ImportReconcilePage() {
     setFlowOn(false);
     setFlowHint("");
     setTagFilter("all");
+    setStateFilter("all");
+    setChangeFilter("all");
     loadBatches();
     // Explicit clear -- clicking "Back to Import & Reconcile" is a
     // deliberate "I'm done with this batch for now" action, so a later
@@ -1183,27 +1215,44 @@ export default function ImportReconcilePage() {
     }
   }
 
-  // Runs runAiLookup across a whole set of rows sequentially (not in
-  // parallel -- the underlying route is a real web-search + Anthropic call
-  // per school, up to ~20s each, and this app's other sequential bulk
-  // actions above -- applyAllNewInfo, addAllNewSchools -- make the same
-  // choice for the same reason: predictable, one-at-a-time progress beats
-  // racing a pile of slow requests at once). Shares bulkBusy/bulkStatus
-  // with those other bulk actions so two bulk operations can't overlap.
+  // Runs runAiLookup across a whole set of rows, a few at a time
+  // (AI_LOOKUP_CONCURRENCY). Each lookup is a real web-search + Anthropic
+  // call (up to ~20s), so a small pool is ~4x faster than one-by-one
+  // without racing dozens of slow requests at once. Every lookup only
+  // fills blank fields on its OWN row and writes its OWN row's diff, so
+  // running them side by side can't collide. A Stop button lets the pool
+  // finish the lookups already running and skip the rest. Shares
+  // bulkBusy/bulkStatus with the other bulk actions so two bulk operations
+  // can't overlap.
   async function runAiLookupOnRows(targetRows) {
     if (!targetRows.length) return;
     setBulkBusy(true);
+    setAiBulkRunning(true);
+    aiStopRef.current = false;
     setBulkError("");
+    let next = 0;
+    let done = 0;
+    const total = targetRows.length;
     try {
-      for (let i = 0; i < targetRows.length; i++) {
-        setBulkStatus(`Running AI lookup on row ${i + 1} of ${targetRows.length}…`);
-        // eslint-disable-next-line no-await-in-loop
-        await runAiLookup(targetRows[i]);
-      }
+      setBulkStatus(`Running AI lookups… 0 of ${total} done`);
+      const worker = async () => {
+        while (!aiStopRef.current) {
+          const i = next;
+          next += 1;
+          if (i >= total) return;
+          // eslint-disable-next-line no-await-in-loop
+          await runAiLookup(targetRows[i]);
+          done += 1;
+          setBulkStatus(`Running AI lookups… ${done} of ${total} done`);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(AI_LOOKUP_CONCURRENCY, total) }, () => worker()));
+      if (aiStopRef.current && done < total) setBulkError(`Stopped after ${done} of ${total} lookups. The rest were left alone -- run it again any time.`);
     } catch (err) {
       setBulkError(err.message || "Something went wrong running AI lookup on these rows.");
     } finally {
       setBulkBusy(false);
+      setAiBulkRunning(false);
       setBulkStatus("");
     }
   }
@@ -1663,9 +1712,10 @@ export default function ImportReconcilePage() {
     return rows
       .filter((r) => r.bucket === activeBucket && r.resolution === "pending")
       .filter((r) => tagFilter === "all" || rowTag(r, guards[r.id], ready)?.level === tagFilter)
+      .filter((r) => rowMatchesFilters(r, stateFilter, changeFilter))
       .sort((a, b) => GUARD_RANK[guards[a.id]?.level || "none"] - GUARD_RANK[guards[b.id]?.level || "none"]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rows, selectedBatch, activeBucket, tagFilter, guards, indexLoading, indexVersion]);
+  }, [rows, selectedBatch, activeBucket, tagFilter, stateFilter, changeFilter, guards, indexLoading, indexVersion]);
 
   const flowIdx = Math.min(flowCursor, Math.max(flowRows.length - 1, 0));
   const flowRow = flowOn ? flowRows[flowIdx] || null : null;
@@ -1673,7 +1723,7 @@ export default function ImportReconcilePage() {
   useEffect(() => {
     setFlowCursor(0);
     setFlowHint("");
-  }, [activeBucket, tagFilter, flowOn]);
+  }, [activeBucket, tagFilter, stateFilter, changeFilter, flowOn]);
 
   useEffect(() => {
     if (flowOn && flowCardRef.current && typeof flowCardRef.current.scrollIntoView === "function") {
@@ -1817,7 +1867,14 @@ export default function ImportReconcilePage() {
       });
     }
     const showFlowTools = FLOW_BUCKETS.includes(activeBucket) && pendingInBucket.length > 0;
-    const listRows = tagFilter === "all" || !FLOW_BUCKETS.includes(activeBucket) ? bucketRows : bucketRows.filter((r) => r.resolution === "pending" && rowTag(r, guards[r.id], indexReady)?.level === tagFilter);
+    const filtersActive = tagFilter !== "all" || stateFilter !== "all" || changeFilter !== "all";
+    const listRows =
+      !filtersActive || !FLOW_BUCKETS.includes(activeBucket)
+        ? bucketRows
+        : bucketRows.filter((r) => r.resolution === "pending" && (tagFilter === "all" || rowTag(r, guards[r.id], indexReady)?.level === tagFilter) && rowMatchesFilters(r, stateFilter, changeFilter));
+    const stateCounts = {};
+    if (FLOW_BUCKETS.includes(activeBucket)) pendingInBucket.forEach((r) => { const st = rowState(r); if (st) stateCounts[st] = (stateCounts[st] || 0) + 1; });
+    const stateOptions = Object.keys(stateCounts).sort();
     const flowShown = flowOn && FLOW_BUCKETS.includes(activeBucket);
     const flowActionLabel = flowRow ? (flowRow.bucket === "new_school" ? "Add school" : flowRow.bucket === "conflict" ? "Apply checked" : "Apply") : "Apply";
 
@@ -2010,6 +2067,33 @@ export default function ImportReconcilePage() {
                     </button>
                   ))}
                   {tagCounts.checking > 0 && <span style={{ fontSize: 12, color: "#697386" }}>Safety check loading…</span>}
+                  {stateOptions.length > 1 && (
+                    <select value={stateFilter} onChange={(e) => setStateFilter(e.target.value)} style={{ fontSize: 12.5, padding: "3px 6px" }} title="Only show rows for one state">
+                      <option value="all">All states</option>
+                      {stateOptions.map((st) => (
+                        <option key={st} value={st}>
+                          {st} ({stateCounts[st]})
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  <select value={changeFilter} onChange={(e) => setChangeFilter(e.target.value)} style={{ fontSize: 12.5, padding: "3px 6px" }} title="Only show rows that change a certain kind of field">
+                    {CHANGE_FILTERS.map(([v, label]) => (
+                      <option key={v} value={v}>
+                        {label}
+                      </option>
+                    ))}
+                  </select>
+                  {filtersActive && (
+                    <button className="btn btn-sm" onClick={() => { setTagFilter("all"); setStateFilter("all"); setChangeFilter("all"); }}>
+                      Clear filters
+                    </button>
+                  )}
+                  {aiBulkRunning && (
+                    <button className="btn btn-sm" style={REDBTN} onClick={() => { aiStopRef.current = true; setBulkStatus("Stopping after the lookups already running…"); }}>
+                      Stop AI lookups
+                    </button>
+                  )}
                   <span style={{ flex: 1 }} />
                   <button className={`btn btn-sm ${flowOn ? "" : "btn-primary"}`} onClick={() => setFlowOn(!flowOn)}>
                     {flowOn ? "Show full list" : "Review one at a time (keyboard)"}
@@ -2029,8 +2113,8 @@ export default function ImportReconcilePage() {
                 {flowRows.length === 0 ? (
                   <div className="empty-state">
                     {pendingInBucket.length === 0 ? "Nothing left to review in this tab." : "No pending rows match this filter."}{" "}
-                    {tagFilter !== "all" && (
-                      <button className="btn btn-sm" onClick={() => setTagFilter("all")}>
+                    {filtersActive && (
+                      <button className="btn btn-sm" onClick={() => { setTagFilter("all"); setStateFilter("all"); setChangeFilter("all"); }}>
                         Show all
                       </button>
                     )}
