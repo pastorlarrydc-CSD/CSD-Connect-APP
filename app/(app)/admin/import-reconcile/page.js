@@ -1,5 +1,5 @@
 "use client";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
@@ -15,6 +15,7 @@ import {
   trimStr,
 } from "@/lib/importReconcile";
 import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
+import { buildSchoolIndex, buildSheetIndex, evaluateGuard, indexAddSchool, indexUpdateSchool, rowKeyFor } from "@/lib/importGuard";
 
 const PAGE_SIZE = 1000;
 const BATCH_SIZE = 300;
@@ -60,6 +61,31 @@ const PROFILE_FIELD_GROUPS = [
 // Tab order -- the buckets that need a human decision come first, the
 // read-only/no-action buckets last.
 const BUCKET_ORDER = ["needs_verification", "conflict", "new_info", "new_school", "exact_match", "skipped"];
+
+// "How was this sheet verified?" -- picked once per sheet, before it is saved.
+// A sheet that somebody actually checked (own research, or sent by the coach/
+// school itself) is applied the way this tool always has been: the school is
+// marked Verified. A scraped list or AI output that nobody checked is still
+// applied (the data is useful), but the school is left Not Verified and put
+// on the Needs Review list instead -- so a mass import can no longer stamp
+// thousands of schools "Verified" on the strength of a sheet nobody
+// confirmed (the 10/5 paste-match problem). The pick is saved on the batch
+// (import_batches.source_trust) and added to every change-log source line
+// so the Database screen's "How verified" filter can tell them apart.
+// A null source_trust (batches saved before this existed) behaves as trusted.
+const SOURCE_TRUST_OPTIONS = [
+  { value: "own_research", label: "My own research — I checked it", trusted: true, short: "Own research", suffix: " [sheet source: own research]" },
+  { value: "coach_submitted", label: "Submitted by the coach or school", trusted: true, short: "Coach-submitted", suffix: " [sheet source: coach-submitted]" },
+  { value: "scraped_list", label: "Scraped or third-party list — not independently checked", trusted: false, short: "Scraped list (unchecked)", suffix: " [unchecked sheet: scraped list]" },
+  { value: "ai_unchecked", label: "AI-generated or AI-pasted — not independently checked", trusted: false, short: "AI output (unchecked)", suffix: " [unchecked sheet: AI-generated]" },
+];
+
+function trustInfo(value) {
+  return SOURCE_TRUST_OPTIONS.find((o) => o.value === value) || { value: null, label: "Not recorded (older import)", trusted: true, short: "Not recorded", suffix: "" };
+}
+
+const GUARD_RANK = { red: 0, yellow: 1, none: 2 };
+const REDBTN = { background: "#b3261e", borderColor: "#b3261e", color: "#fff" };
 
 const SCHOOL_SELECT_COLUMNS = [
   "id",
@@ -131,6 +157,18 @@ export default function ImportReconcilePage() {
   const [preview, setPreview] = useState(() => readImportReconcileCache()?.preview || null); // { rows, columnMapping, summary }
   const [committing, setCommitting] = useState(false);
   const [commitError, setCommitError] = useState("");
+  // "How was this sheet verified?" -- empty until the reviewer picks one;
+  // Save & Start Reviewing stays disabled until then (see SOURCE_TRUST_OPTIONS).
+  const [sourceTrust, setSourceTrust] = useState("");
+
+  // Cross-school safety check (lib/importGuard.js): an index of every school
+  // on file, loaded in the background when a batch opens. A ref (mutated in
+  // place after each apply so the next row sees it) plus a version counter
+  // to tell React when to recompute the warnings.
+  const schoolIndexRef = useRef(null);
+  const [indexVersion, setIndexVersion] = useState(0);
+  const [indexLoading, setIndexLoading] = useState(false);
+  const [indexError, setIndexError] = useState("");
 
   // "Paste research text (AI-parsed)" -- an alternative to Step 2's CSV
   // upload, not a separate tool. See handlePasteParse below: it produces
@@ -299,6 +337,7 @@ export default function ImportReconcilePage() {
     setUploadError("");
     setCommitError("");
     setFileName("");
+    setSourceTrust("");
     if (fileInputRef.current) fileInputRef.current.value = "";
     // Explicit clear rather than waiting for the write effect to catch up --
     // starting a fresh upload/paste (or successfully committing one, which
@@ -451,12 +490,16 @@ export default function ImportReconcilePage() {
 
   async function commitBatch() {
     if (!preview) return;
+    if (!sourceTrust) {
+      setCommitError("Pick how this sheet was verified first.");
+      return;
+    }
     setCommitting(true);
     setCommitError("");
     try {
       const { data: batchRow, error: batchErr } = await supabase
         .from("import_batches")
-        .insert({ file_name: fileName, status: "reviewing", column_mapping: preview.columnMapping, row_count: preview.rows.length, uploaded_by: user.id })
+        .insert({ file_name: fileName, status: "reviewing", column_mapping: preview.columnMapping, row_count: preview.rows.length, uploaded_by: user.id, source_trust: sourceTrust })
         .select()
         .single();
       if (batchErr) throw batchErr;
@@ -492,6 +535,18 @@ export default function ImportReconcilePage() {
     setRowError({});
     setVerificationRunId(null);
     verificationRunIdRef.current = null;
+    // Safety-check index -- loaded in the background so the batch itself
+    // opens right away; until it finishes, "Apply all" buttons wait.
+    schoolIndexRef.current = null;
+    setIndexError("");
+    setIndexLoading(true);
+    fetchAllSchools()
+      .then((list) => {
+        schoolIndexRef.current = buildSchoolIndex(list);
+        setIndexVersion((v) => v + 1);
+      })
+      .catch((err) => setIndexError(err.message || "Could not load the school list for the safety check."))
+      .finally(() => setIndexLoading(false));
     try {
       const { data: batchRow, error: batchErr } = await supabase.from("import_batches").select("*").eq("id", batchId).single();
       if (batchErr) throw batchErr;
@@ -617,7 +672,24 @@ export default function ImportReconcilePage() {
       // data just applied here is accurate. Setting it here excludes the
       // school from that sweep for COACH_RADAR_REVIEW_EXCLUSION_MONTHS,
       // exactly like every other manual-verification path already does.
-      const update = { verification_status: "verified", last_verified_at: now, coach_radar_reviewed_at: now, ...NEEDS_REVIEW_CLEAR_FIELDS };
+      //
+      // Sheet-trust (see SOURCE_TRUST_OPTIONS): a sheet nobody checked still
+      // gets its data applied, but the school is NOT marked Verified -- it is
+      // left Not Verified and put on the Needs Review list, with no
+      // last_verified_at / coach_radar_reviewed_at stamp, so it can't pass
+      // for a confirmed record. It also doesn't resolve Data Quality flags or
+      // confirm a bounced email below, since nobody actually confirmed
+      // anything.
+      const trust = trustInfo(selectedBatch?.source_trust);
+      const update = trust.trusted
+        ? { verification_status: "verified", last_verified_at: now, coach_radar_reviewed_at: now, ...NEEDS_REVIEW_CLEAR_FIELDS }
+        : {
+            verification_status: "not_verified",
+            needs_review: true,
+            needs_review_note: `Applied from an unchecked sheet (${trust.short}) on ${now.slice(0, 10)} - confirm before trusting.`,
+            needs_review_marked_at: now,
+            needs_review_marked_by: user.id,
+          };
       const logs = [];
       fieldsToApply.forEach((f) => {
         update[f.field] = f.new;
@@ -628,11 +700,11 @@ export default function ImportReconcilePage() {
           old_value: f.old || null,
           new_value: f.new,
           source:
-            f.kind === "clear"
+            (f.kind === "clear"
               ? "Import & Reconcile (cleared -- stale contact left by a departed coach)"
               : isCoachName
               ? "Head coach change (manual)"
-              : "Import & Reconcile (CSV)",
+              : "Import & Reconcile (CSV)") + trust.suffix,
           changed_by: user.id,
         });
       });
@@ -645,7 +717,10 @@ export default function ImportReconcilePage() {
       // whether it still matches the bounce.
       const hcEmailChange = fieldsToApply.find((f) => f.field === "hc_email");
       let bounceConfirm = null;
-      if (hcEmailChange) {
+      if (!trust.trusted) {
+        // Unchecked sheet -- nobody confirmed this address, so don't stamp
+        // the bounce as manually confirmed.
+      } else if (hcEmailChange) {
         bounceConfirm = await findConfirmableBounce(row.match_school_id, hcEmailChange.old || null, hcEmailChange.new);
       } else {
         const { data: currentRow } = await supabase.from("schools").select("hc_email").eq("id", row.match_school_id).maybeSingle();
@@ -657,7 +732,7 @@ export default function ImportReconcilePage() {
             field_name: "hc_email",
             old_value: currentHcEmail,
             new_value: currentHcEmail,
-            source: `Import & Reconcile (CSV) -- confirmed same address, no better option found (Claude, ${now.slice(0, 10)})`,
+            source: `Import & Reconcile (CSV) -- confirmed same address, no better option found (Claude, ${now.slice(0, 10)})${trust.suffix}`,
             changed_by: user.id,
           });
         }
@@ -691,7 +766,7 @@ export default function ImportReconcilePage() {
       // and if it still didn't take, say so on the row instead of quietly
       // pretending it worked.
       let flagWarning = null;
-      for (let attempt = 0; attempt < 2; attempt++) {
+      for (let attempt = 0; trust.trusted && attempt < 2; attempt++) {
         const { error: flagErr } = await supabase
           .from("school_flags")
           .update({ status: "resolved", resolved_by: user.id, resolved_at: now })
@@ -709,6 +784,12 @@ export default function ImportReconcilePage() {
       if (rowErr) throw rowErr;
 
       patchRow(row.id, { resolution: "applied", resolved_at: now, resolved_by: user.id });
+      // Keep the safety-check index current so the NEXT row sees that this
+      // school now owns these values.
+      if (schoolIndexRef.current) {
+        indexUpdateSchool(schoolIndexRef.current, row.match_school_id, update);
+        setIndexVersion((v) => v + 1);
+      }
       if (flagWarning) {
         setRowError((p) => ({
           ...p,
@@ -736,9 +817,23 @@ export default function ImportReconcilePage() {
     }
   }
 
+  // "Apply all" only touches rows with NO safety warning -- a row whose email
+  // or cell already belongs to another school (red) or that has anything
+  // worth a second look (yellow) stays pending for a one-by-one decision.
+  // Waits for the school list to finish loading first: without it there is
+  // nothing to check against, and "safe" would just be a guess.
+  function safeRowsOf(bucket) {
+    return rows.filter((r) => r.bucket === bucket && r.resolution === "pending" && (guards[r.id]?.level || "none") === "none");
+  }
+
   async function applyAllNewInfo() {
-    const pending = rows.filter((r) => r.bucket === "new_info" && r.resolution === "pending");
+    if (!schoolIndexRef.current) {
+      setBulkError("Still loading the school list for the safety check — try again in a few seconds.");
+      return;
+    }
+    const pending = safeRowsOf("new_info");
     if (!pending.length) return;
+    setBulkError("");
     setBulkBusy(true);
     setBulkError("");
     try {
@@ -1150,7 +1245,19 @@ export default function ImportReconcilePage() {
       // same reasoning applies to a brand-new school added here: it's
       // already fresh, human-reviewed data, no need for tonight's sweep to
       // immediately re-check it.
-      const insertRow = { verification_status: "verified", confidence_score: 70, last_verified_at: now, coach_radar_reviewed_at: now, source: "Import & Reconcile (CSV)" };
+      const trust = trustInfo(selectedBatch?.source_trust);
+      const insertRow = trust.trusted
+        ? { verification_status: "verified", confidence_score: 70, last_verified_at: now, coach_radar_reviewed_at: now, source: "Import & Reconcile (CSV)" }
+        : {
+            // Unchecked sheet -- add the school, but Not Verified and on the
+            // Needs Review list (see applyRowFields).
+            verification_status: "not_verified",
+            needs_review: true,
+            needs_review_note: `Added from an unchecked sheet (${trust.short}) on ${now.slice(0, 10)} - confirm before trusting.`,
+            needs_review_marked_at: now,
+            needs_review_marked_by: user.id,
+            source: "Import & Reconcile (CSV)",
+          };
       ALL_FIELDS.forEach(([field]) => {
         if (field === "school_id") return;
         if (row.mapped_data[field]) insertRow[field] = row.mapped_data[field];
@@ -1160,7 +1267,7 @@ export default function ImportReconcilePage() {
 
       const { error: logErr } = await supabase
         .from("school_change_log")
-        .insert({ school_id: inserted.id, field_name: "created", old_value: null, new_value: inserted.name, source: "Import & Reconcile (CSV)", changed_by: user.id });
+        .insert({ school_id: inserted.id, field_name: "created", old_value: null, new_value: inserted.name, source: "Import & Reconcile (CSV)" + trust.suffix, changed_by: user.id });
       if (logErr) throw logErr;
 
       const { error: rowErr } = await supabase
@@ -1170,6 +1277,10 @@ export default function ImportReconcilePage() {
       if (rowErr) throw rowErr;
 
       patchRow(row.id, { resolution: "applied", match_school_id: inserted.id, resolved_at: now, resolved_by: user.id });
+      if (schoolIndexRef.current) {
+        indexAddSchool(schoolIndexRef.current, { ...insertRow, id: inserted.id, name: inserted.name });
+        setIndexVersion((v) => v + 1);
+      }
     } catch (err) {
       setRowError((p) => ({ ...p, [row.id]: err.message || "Could not add this school." }));
     } finally {
@@ -1178,8 +1289,13 @@ export default function ImportReconcilePage() {
   }
 
   async function addAllNewSchools() {
-    const pending = rows.filter((r) => r.bucket === "new_school" && r.resolution === "pending");
+    if (!schoolIndexRef.current) {
+      setBulkError("Still loading the school list for the safety check — try again in a few seconds.");
+      return;
+    }
+    const pending = safeRowsOf("new_school");
     if (!pending.length) return;
+    setBulkError("");
     setBulkBusy(true);
     setBulkError("");
     try {
@@ -1309,6 +1425,38 @@ export default function ImportReconcilePage() {
     }
   }
 
+  // Safety warnings per pending row (lib/importGuard.js) -- recomputed when
+  // rows change, a conflict checkbox changes, or the index changes (after
+  // each apply). Empty until the school list has loaded.
+  const guards = useMemo(() => {
+    const out = {};
+    const index = schoolIndexRef.current;
+    if (!index || !selectedBatch) return out;
+    const sheet = buildSheetIndex(rows);
+    rows.forEach((r) => {
+      if (r.resolution !== "pending") return;
+      if (r.bucket !== "new_info" && r.bucket !== "conflict" && r.bucket !== "new_school") return;
+      const m = r.mapped_data || {};
+      let fields;
+      let base = {};
+      let state = m.state || "";
+      if (r.bucket === "new_school") {
+        fields = ["hc_first_name", "hc_last_name", "hc_email", "hc_cell", "hc_office"].filter((f) => m[f]).map((f) => ({ field: f, new: m[f], kind: "fill" }));
+      } else {
+        const sel = r.bucket === "conflict" ? getSelection(r) : null;
+        fields = (r.diff || []).filter((f) => !sel || sel[f.field]);
+        const onFile = index.byId.get(String(r.match_school_id));
+        if (onFile) {
+          base = onFile;
+          state = onFile.state || state;
+        }
+      }
+      out[r.id] = evaluateGuard(index, sheet, { schoolId: r.bucket === "new_school" ? null : r.match_school_id, rowKey: rowKeyFor(r), state, base, fields });
+    });
+    return out;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows, selectedBatch, indexVersion, conflictSelections]);
+
   if (!canReview) {
     return (
       <div className="view">
@@ -1320,7 +1468,17 @@ export default function ImportReconcilePage() {
   // ---- Review screen -------------------------------------------------
 
   if (selectedBatch) {
-    const bucketRows = rows.filter((r) => r.bucket === activeBucket);
+    const bucketRowsRaw = rows.filter((r) => r.bucket === activeBucket);
+    // Rows with a safety warning float to the top of the tabs that write to
+    // the database (red first), so the risky ones are the first thing seen.
+    const bucketRows =
+      activeBucket === "new_info" || activeBucket === "conflict" || activeBucket === "new_school"
+        ? [...bucketRowsRaw].sort((a, b) => GUARD_RANK[guards[a.id]?.level || "none"] - GUARD_RANK[guards[b.id]?.level || "none"])
+        : bucketRowsRaw;
+    const batchTrust = trustInfo(selectedBatch.source_trust);
+    const indexReady = !!schoolIndexRef.current && !indexLoading;
+    const safeNewInfo = rows.filter((r) => r.bucket === "new_info" && r.resolution === "pending" && (guards[r.id]?.level || "none") === "none");
+    const safeNewSchools = rows.filter((r) => r.bucket === "new_school" && r.resolution === "pending" && (guards[r.id]?.level || "none") === "none");
     const pendingInBucket = bucketRows.filter((r) => r.resolution === "pending");
     const totalPending = rows.filter((r) => r.resolution === "pending").length;
     // Rows this tab's "Run AI on all rows missing email" bulk button will
@@ -1352,6 +1510,17 @@ export default function ImportReconcilePage() {
           )}
         </div>
 
+        {!batchTrust.trusted && (
+          <div className="notice danger" style={{ marginBottom: 12 }}>
+            <strong>Unchecked sheet ({batchTrust.short}).</strong> Rows you apply from this batch are saved, but the school is left <strong>Not Verified</strong> and put on the Needs Review
+            list — nothing here is stamped Verified.
+          </div>
+        )}
+        {batchTrust.trusted && batchTrust.value && (
+          <div style={{ fontSize: 12, color: "#697386", marginBottom: 10 }}>Sheet source: {batchTrust.label}</div>
+        )}
+        {indexLoading && <div className="notice info" style={{ marginBottom: 12 }}>Loading every school for the duplicate / mix-up safety check… the &quot;Apply all&quot; buttons unlock when it finishes.</div>}
+        {indexError && <div className="notice danger" style={{ marginBottom: 12 }}>Safety check unavailable: {indexError} Reopen this batch to retry; &quot;Apply all&quot; stays locked until it loads.</div>}
         {bulkError && <div className="notice danger" style={{ marginBottom: 12 }}>{bulkError}</div>}
         {verificationRunId && (
           <div className="notice info" style={{ marginBottom: 12 }}>
@@ -1401,15 +1570,31 @@ export default function ImportReconcilePage() {
               <div className="card" style={{ marginBottom: 14 }}>
                 <p style={{ marginTop: 0, fontSize: 12.5, color: "#697386" }}>
                   Every field below is currently blank on file — applying these can&apos;t overwrite anything that&apos;s already there.
+                  {indexReady && pendingInBucket.length > safeNewInfo.length && (
+                    <>
+                      {" "}
+                      <strong style={{ color: "#b3261e" }}>
+                        {pendingInBucket.length - safeNewInfo.length} row{pendingInBucket.length - safeNewInfo.length > 1 ? "s have" : " has"} a safety warning
+                      </strong>{" "}
+                      (shown first, below) and {pendingInBucket.length - safeNewInfo.length > 1 ? "are" : "is"} left out of &quot;Apply all&quot; — review {pendingInBucket.length - safeNewInfo.length > 1 ? "them" : "it"} one at a time.
+                    </>
+                  )}
                 </p>
-                <button className="btn btn-sm btn-gold" onClick={applyAllNewInfo} disabled={bulkBusy}>
-                  {bulkBusy ? bulkStatus || "Applying…" : `Apply all ${pendingInBucket.length} rows`}
+                <button className="btn btn-sm btn-gold" onClick={applyAllNewInfo} disabled={bulkBusy || !indexReady || safeNewInfo.length === 0}>
+                  {bulkBusy ? bulkStatus || "Applying…" : !indexReady ? "Checking for mix-ups…" : `Apply all ${safeNewInfo.length} safe row${safeNewInfo.length === 1 ? "" : "s"}`}
                 </button>{" "}
                 {missingEmailInBucket.length > 0 && (
                   <button className="btn btn-sm" onClick={() => runAiLookupOnRows(missingEmailInBucket)} disabled={bulkBusy} title="Runs the live AI coach-info lookup on every row in this tab with no email yet, and drops any real gaps it fills straight into each row's table below">
                     {bulkBusy ? bulkStatus || "Running…" : `Run AI on ${missingEmailInBucket.length} row${missingEmailInBucket.length > 1 ? "s" : ""} missing email`}
                   </button>
                 )}
+              </div>
+            )}
+
+            {activeBucket === "conflict" && indexReady && bucketRowsRaw.some((r) => r.resolution === "pending" && (guards[r.id]?.level || "none") !== "none") && (
+              <div className="notice danger" style={{ marginBottom: 14 }}>
+                {bucketRowsRaw.filter((r) => r.resolution === "pending" && (guards[r.id]?.level || "none") !== "none").length} row(s) here have a safety warning for the fields currently checked
+                (shown first). Conflict rows are always applied one at a time.
               </div>
             )}
 
@@ -1428,8 +1613,16 @@ export default function ImportReconcilePage() {
 
             {activeBucket === "new_school" && pendingInBucket.length > 0 && (
               <div className="card" style={{ marginBottom: 14 }}>
-                <button className="btn btn-sm btn-gold" onClick={addAllNewSchools} disabled={bulkBusy}>
-                  {bulkBusy ? bulkStatus || "Adding…" : `Add all ${pendingInBucket.length} new schools`}
+                {indexReady && pendingInBucket.length > safeNewSchools.length && (
+                  <p style={{ marginTop: 0, fontSize: 12.5, color: "#b3261e" }}>
+                    <strong>
+                      {pendingInBucket.length - safeNewSchools.length} new school{pendingInBucket.length - safeNewSchools.length > 1 ? "s have" : " has"} a safety warning
+                    </strong>{" "}
+                    (shown first, below) and {pendingInBucket.length - safeNewSchools.length > 1 ? "are" : "is"} left out of &quot;Add all&quot;.
+                  </p>
+                )}
+                <button className="btn btn-sm btn-gold" onClick={addAllNewSchools} disabled={bulkBusy || !indexReady || safeNewSchools.length === 0}>
+                  {bulkBusy ? bulkStatus || "Adding…" : !indexReady ? "Checking for mix-ups…" : `Add all ${safeNewSchools.length} safe new school${safeNewSchools.length === 1 ? "" : "s"}`}
                 </button>
               </div>
             )}
@@ -1454,6 +1647,7 @@ export default function ImportReconcilePage() {
                       busy={!!rowBusy[row.id]}
                       error={rowError[row.id]}
                       aiNote={aiNote[row.id]}
+                      guard={guards[row.id] || null}
                       selection={activeBucket === "conflict" ? getSelection(row) : null}
                       onToggleField={(field) => toggleField(row, field)}
                       onApplyNewInfo={() => applyRowFields(row, row.diff || [])}
@@ -1561,9 +1755,23 @@ export default function ImportReconcilePage() {
               </div>
             ))}
           </div>
+          <div style={{ marginBottom: 12 }}>
+            <div style={{ fontWeight: 700, marginBottom: 6 }}>How was this sheet verified?</div>
+            <p style={{ fontSize: 12.5, color: "#697386", margin: "0 0 8px" }}>
+              This decides what Apply does. A checked sheet marks schools <strong>Verified</strong>. An unchecked sheet still saves its data, but leaves each school{" "}
+              <strong>Not Verified</strong> and adds it to Needs Review — so nothing gets a Verified stamp that nobody confirmed.
+            </p>
+            {SOURCE_TRUST_OPTIONS.map((o) => (
+              <label key={o.value} style={{ display: "block", fontSize: 13, marginBottom: 4, cursor: "pointer" }}>
+                <input type="radio" name="source_trust" value={o.value} checked={sourceTrust === o.value} onChange={() => setSourceTrust(o.value)} style={{ marginRight: 8 }} />
+                {o.label}
+                {!o.trusted && <span style={{ color: "#b3261e", fontSize: 11.5 }}> — applies as Not Verified</span>}
+              </label>
+            ))}
+          </div>
           {commitError && <div className="notice danger" style={{ marginBottom: 10 }}>{commitError}</div>}
-          <button className="btn btn-gold" onClick={commitBatch} disabled={committing}>
-            {committing ? "Saving…" : `Save & Start Reviewing (${preview.rows.length} rows)`}
+          <button className="btn btn-gold" onClick={commitBatch} disabled={committing || !sourceTrust}>
+            {committing ? "Saving…" : !sourceTrust ? "Pick how it was verified to continue" : `Save & Start Reviewing (${preview.rows.length} rows)`}
           </button>
         </div>
       )}
@@ -1582,6 +1790,7 @@ export default function ImportReconcilePage() {
                 <tr>
                   <th>File</th>
                   <th>Rows</th>
+                  <th>Source</th>
                   <th>Status</th>
                   <th>Uploaded</th>
                   <th></th>
@@ -1592,6 +1801,7 @@ export default function ImportReconcilePage() {
                   <tr key={b.id}>
                     <td>{b.file_name}</td>
                     <td>{b.row_count}</td>
+                    <td>{trustInfo(b.source_trust).short}</td>
                     <td>{b.status === "done" ? "Closed" : "Reviewing"}</td>
                     <td>{new Date(b.created_at).toLocaleString()}</td>
                     <td>
@@ -1610,7 +1820,7 @@ export default function ImportReconcilePage() {
   );
 }
 
-function RowCard({ row, busy, error, aiNote, selection, onToggleField, onApplyNewInfo, onApplyConflict, onSkip, onAddNewSchool, onPickCandidate, onMarkNewSchool, onRunAiLookup, onOpenProfile }) {
+function RowCard({ row, busy, error, aiNote, guard, selection, onToggleField, onApplyNewInfo, onApplyConflict, onSkip, onAddNewSchool, onPickCandidate, onMarkNewSchool, onRunAiLookup, onOpenProfile }) {
   const resolved = row.resolution !== "pending";
   const m = row.mapped_data || {};
   const locationLabel = [m.city, m.state].filter(Boolean).join(", ");
@@ -1661,6 +1871,27 @@ function RowCard({ row, busy, error, aiNote, selection, onToggleField, onApplyNe
       {aiNote && <div style={{ fontSize: 12, color: "#1c5fb3", marginTop: 6 }}>🤖 {aiNote}</div>}
 
       {row.skip_reason && <div style={{ fontSize: 12.5, color: "#a94442", marginTop: 6 }}>{row.skip_reason}</div>}
+
+      {!resolved && guard && guard.items.length > 0 && (
+        <div
+          style={{
+            marginTop: 8,
+            padding: "8px 10px",
+            borderRadius: 6,
+            fontSize: 12.5,
+            border: `1px solid ${guard.level === "red" ? "#e8b4b0" : "#ecd9a4"}`,
+            background: guard.level === "red" ? "#fdeceb" : "#fff8e5",
+            color: guard.level === "red" ? "#8c1d18" : "#7a5a00",
+          }}
+        >
+          <strong>{guard.level === "red" ? "⛔ Possible mix-up — check before applying" : "⚠️ Worth a second look"}</strong>
+          <ul style={{ margin: "4px 0 0", paddingLeft: 18 }}>
+            {guard.items.map((it, i) => (
+              <li key={i}>{it.text}</li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {row.candidates && row.candidates.length > 0 && (
         <div style={{ marginTop: 8 }}>
@@ -1789,18 +2020,18 @@ function RowCard({ row, busy, error, aiNote, selection, onToggleField, onApplyNe
       {!resolved && (
         <div style={{ marginTop: 10, display: "flex", gap: 8 }}>
           {row.bucket === "new_info" && (
-            <button className="btn btn-sm btn-gold" disabled={busy} onClick={onApplyNewInfo}>
-              Apply
+            <button className="btn btn-sm btn-gold" disabled={busy} onClick={onApplyNewInfo} style={guard?.level === "red" ? REDBTN : undefined}>
+              {guard?.level === "red" ? "Apply anyway" : "Apply"}
             </button>
           )}
           {row.bucket === "conflict" && (
-            <button className="btn btn-sm btn-gold" disabled={busy} onClick={onApplyConflict}>
-              Apply selected
+            <button className="btn btn-sm btn-gold" disabled={busy} onClick={onApplyConflict} style={guard?.level === "red" ? REDBTN : undefined}>
+              {guard?.level === "red" ? "Apply selected anyway" : "Apply selected"}
             </button>
           )}
           {row.bucket === "new_school" && (
-            <button className="btn btn-sm btn-gold" disabled={busy} onClick={onAddNewSchool}>
-              Add as new school
+            <button className="btn btn-sm btn-gold" disabled={busy} onClick={onAddNewSchool} style={guard?.level === "red" ? REDBTN : undefined}>
+              {guard?.level === "red" ? "Add anyway" : "Add as new school"}
             </button>
           )}
           {onRunAiLookup && (row.bucket === "new_info" || row.bucket === "conflict") && (
