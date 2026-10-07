@@ -87,6 +87,36 @@ function trustInfo(value) {
 const GUARD_RANK = { red: 0, yellow: 1, none: 2 };
 const REDBTN = { background: "#b3261e", borderColor: "#b3261e", color: "#fff" };
 
+// Traffic-light tag on every pending row in the three tabs that write to the
+// database. GREEN = nothing at all to look at (safe to apply -- exactly the
+// rows "Apply all safe" takes). YELLOW = fine to apply, but a human should
+// glance first (replaces a value on file, clears fields, guessed email,
+// duplicate row, or a "worth a second look" warning). RED = a possible
+// mix-up (email/cell already belongs to another coach's school) -- the
+// keyboard flow will NOT apply these without Shift+A.
+const FLOW_BUCKETS = ["new_info", "conflict", "new_school"];
+const TAG_STYLE = {
+  green: { label: "Safe", color: "#1e7145", bg: "#e6f4ec", border: "#b9dfc8", dot: "#2e9e5b" },
+  yellow: { label: "Check", color: "#7a5a00", bg: "#fff8e5", border: "#ecd9a4", dot: "#d9a400" },
+  red: { label: "Possible mix-up", color: "#8c1d18", bg: "#fdeceb", border: "#e8b4b0", dot: "#b3261e" },
+  checking: { label: "Checking…", color: "#697386", bg: "#f1f3f6", border: "#d9dde4", dot: "#9aa3b2" },
+};
+
+function rowTag(row, guard, indexReady) {
+  if (!row || row.resolution !== "pending" || !FLOW_BUCKETS.includes(row.bucket)) return null;
+  if (!indexReady) return { level: "checking", reasons: ["The mix-up safety check is still loading"] };
+  const reasons = [];
+  (guard?.items || []).forEach((it) => reasons.push(it.text));
+  if (guard?.level === "red") return { level: "red", reasons };
+  const diff = row.diff || [];
+  if (diff.some((f) => f.kind === "clear")) reasons.push("The coach is changing -- some fields would be cleared");
+  if (diff.some((f) => f.kind === "overwrite")) reasons.push("Replaces a value already on file");
+  if (diff.some((f) => f.source === "ai" && f.estimated)) reasons.push("Includes a guessed (not confirmed) email");
+  if (row.duplicate_in_file) reasons.push("Another row in this file has the same school");
+  if (guard?.level === "yellow" || reasons.length) return { level: "yellow", reasons };
+  return { level: "green", reasons: [] };
+}
+
 const SCHOOL_SELECT_COLUMNS = [
   "id",
   "name",
@@ -195,6 +225,15 @@ export default function ImportReconcilePage() {
   const [bulkError, setBulkError] = useState("");
   const [conflictSelections, setConflictSelections] = useState({}); // { [rowId]: { [field]: bool } }
   const [aiNote, setAiNote] = useState({}); // { [rowId]: "AI added 2 suggested fields..." } -- set by runAiLookup, cleared per-row on its next run
+
+  // One-at-a-time keyboard review ("flow mode") + traffic-light filter.
+  const [flowOn, setFlowOn] = useState(false);
+  const [flowCursor, setFlowCursor] = useState(0);
+  const [flowHint, setFlowHint] = useState("");
+  const [tagFilter, setTagFilter] = useState("all"); // all | green | yellow | red
+  const flowHandlersRef = useRef(null);
+  const flowCardRef = useRef(null);
+  const flowInFlightRef = useRef(null); // row id of a keyboard action still running -- stops a double-tap applying twice
 
   // "Open Profile" quick-edit drawer -- see openProfile/saveProfileEdit
   // below. profileDrawer holds which row/school it's open for; null means
@@ -579,6 +618,9 @@ export default function ImportReconcilePage() {
     setSelectedBatch(null);
     setRows([]);
     setRowError({});
+    setFlowOn(false);
+    setFlowHint("");
+    setTagFilter("all");
     loadBatches();
     // Explicit clear -- clicking "Back to Import & Reconcile" is a
     // deliberate "I'm done with this batch for now" action, so a later
@@ -1610,6 +1652,127 @@ export default function ImportReconcilePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rows, selectedBatch, indexVersion, conflictSelections]);
 
+  // ---- Flow mode (one row at a time, keyboard-driven) ---------------------
+  // Pending rows of the open tab, in the same order as the list (red first),
+  // narrowed by the traffic-light filter. Hooks live up here, above the early
+  // returns below, so their order never changes between renders.
+  const indexReadyNow = !!schoolIndexRef.current && !indexLoading;
+  const flowRows = useMemo(() => {
+    if (!selectedBatch || !FLOW_BUCKETS.includes(activeBucket)) return [];
+    const ready = !!schoolIndexRef.current && !indexLoading;
+    return rows
+      .filter((r) => r.bucket === activeBucket && r.resolution === "pending")
+      .filter((r) => tagFilter === "all" || rowTag(r, guards[r.id], ready)?.level === tagFilter)
+      .sort((a, b) => GUARD_RANK[guards[a.id]?.level || "none"] - GUARD_RANK[guards[b.id]?.level || "none"]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rows, selectedBatch, activeBucket, tagFilter, guards, indexLoading, indexVersion]);
+
+  const flowIdx = Math.min(flowCursor, Math.max(flowRows.length - 1, 0));
+  const flowRow = flowOn ? flowRows[flowIdx] || null : null;
+
+  useEffect(() => {
+    setFlowCursor(0);
+    setFlowHint("");
+  }, [activeBucket, tagFilter, flowOn]);
+
+  useEffect(() => {
+    if (flowOn && flowCardRef.current && typeof flowCardRef.current.scrollIntoView === "function") {
+      flowCardRef.current.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }
+  }, [flowOn, flowRow?.id]);
+
+  // Rebuilt on every render so the key handler below always sees the
+  // current row and current state (no stale closures).
+  useEffect(() => {
+    const row = flowRow;
+    flowHandlersRef.current = {
+      active: !!row && !profileDrawer && !bulkBusy && !undoBusy,
+      next: () => setFlowCursor(Math.min(flowIdx + 1, Math.max(flowRows.length - 1, 0))),
+      prev: () => setFlowCursor(Math.max(flowIdx - 1, 0)),
+      apply: (force) => {
+        if (!row || rowBusy[row.id]) return;
+        const tag = rowTag(row, guards[row.id], indexReadyNow);
+        if (!tag || tag.level === "checking") {
+          setFlowHint("Still loading the mix-up safety check -- give it a few seconds.");
+          return;
+        }
+        if (tag.level === "red" && !force) {
+          setFlowHint("This row is a possible mix-up. Press Shift+A to apply it anyway, or S to skip.");
+          return;
+        }
+        if (flowInFlightRef.current === row.id) return;
+        setFlowHint("");
+        flowInFlightRef.current = row.id;
+        let job = null;
+        if (row.bucket === "new_info") job = applyRowFields(row, row.diff || []);
+        else if (row.bucket === "conflict") job = applyConflictRow(row);
+        else if (row.bucket === "new_school") job = addRowAsNewSchool(row);
+        Promise.resolve(job).finally(() => {
+          if (flowInFlightRef.current === row.id) flowInFlightRef.current = null;
+        });
+      },
+      skip: () => {
+        if (!row || rowBusy[row.id] || flowInFlightRef.current === row.id) return;
+        setFlowHint("");
+        flowInFlightRef.current = row.id;
+        Promise.resolve(skipRow(row)).finally(() => {
+          if (flowInFlightRef.current === row.id) flowInFlightRef.current = null;
+        });
+      },
+      edit: () => {
+        if (!row || !row.match_school_id) {
+          setFlowHint("This row isn't matched to a school yet, so there's no profile to edit.");
+          return;
+        }
+        openProfile(row);
+      },
+      ai: () => {
+        if (!row || rowBusy[row.id]) return;
+        if (!row.match_school_id || row.bucket === "new_school") {
+          setFlowHint("AI lookup works on rows matched to an existing school.");
+          return;
+        }
+        setFlowHint("");
+        runAiLookup(row);
+      },
+    };
+  });
+
+  useEffect(() => {
+    function onKey(e) {
+      const h = flowHandlersRef.current;
+      if (!h || !h.active) return;
+      if (e.metaKey || e.ctrlKey || e.altKey || e.repeat) return;
+      const t = e.target;
+      const tagName = (t?.tagName || "").toUpperCase();
+      const inputType = (t?.type || "").toLowerCase();
+      if (tagName === "TEXTAREA" || tagName === "SELECT" || t?.isContentEditable) return;
+      if (tagName === "INPUT" && inputType !== "checkbox" && inputType !== "radio") return;
+      const k = e.key;
+      if (k === "a" || k === "A") {
+        e.preventDefault();
+        h.apply(e.shiftKey);
+      } else if (k === "s" || k === "S") {
+        e.preventDefault();
+        h.skip();
+      } else if (k === "e" || k === "E") {
+        e.preventDefault();
+        h.edit();
+      } else if (k === "l" || k === "L") {
+        e.preventDefault();
+        h.ai();
+      } else if (k === "ArrowRight" || k === "j" || k === "J") {
+        e.preventDefault();
+        h.next();
+      } else if (k === "ArrowLeft" || k === "k" || k === "K") {
+        e.preventDefault();
+        h.prev();
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   if (!canReview) {
     return (
       <div className="view">
@@ -1644,6 +1807,19 @@ export default function ImportReconcilePage() {
     const missingEmailInBucket = pendingInBucket.filter((r) => r.match_school_id && !(r.diff || []).some((f) => f.field === "hc_email"));
 
     const undoableCount = rows.filter((r) => r.resolution === "applied" && r.bucket !== "new_school" && r.match_school_id).length;
+
+    // Traffic-light counts for the open tab (before the filter is applied).
+    const tagCounts = { green: 0, yellow: 0, red: 0, checking: 0 };
+    if (FLOW_BUCKETS.includes(activeBucket)) {
+      pendingInBucket.forEach((r) => {
+        const t = rowTag(r, guards[r.id], indexReady);
+        if (t) tagCounts[t.level] += 1;
+      });
+    }
+    const showFlowTools = FLOW_BUCKETS.includes(activeBucket) && pendingInBucket.length > 0;
+    const listRows = tagFilter === "all" || !FLOW_BUCKETS.includes(activeBucket) ? bucketRows : bucketRows.filter((r) => r.resolution === "pending" && rowTag(r, guards[r.id], indexReady)?.level === tagFilter);
+    const flowShown = flowOn && FLOW_BUCKETS.includes(activeBucket);
+    const flowActionLabel = flowRow ? (flowRow.bucket === "new_school" ? "Add school" : flowRow.bucket === "conflict" ? "Apply checked" : "Apply") : "Apply";
 
     return (
       <div className="view">
@@ -1818,15 +1994,105 @@ export default function ImportReconcilePage() {
               </div>
             )}
 
+            {showFlowTools && (
+              <div className="card" style={{ marginBottom: 14 }}>
+                <div style={{ display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+                  <span style={{ fontSize: 12.5, color: "#697386" }}>Show:</span>
+                  {[
+                    ["all", `All (${pendingInBucket.length})`, null],
+                    ["green", `Safe (${tagCounts.green})`, "green"],
+                    ["yellow", `Check (${tagCounts.yellow})`, "yellow"],
+                    ["red", `Possible mix-up (${tagCounts.red})`, "red"],
+                  ].map(([key, label, lvl]) => (
+                    <button key={key} className={`btn btn-sm ${tagFilter === key ? "btn-gold" : ""}`} onClick={() => setTagFilter(key)}>
+                      {lvl && <span style={{ display: "inline-block", width: 9, height: 9, borderRadius: "50%", background: TAG_STYLE[lvl].dot, marginRight: 6 }} />}
+                      {label}
+                    </button>
+                  ))}
+                  {tagCounts.checking > 0 && <span style={{ fontSize: 12, color: "#697386" }}>Safety check loading…</span>}
+                  <span style={{ flex: 1 }} />
+                  <button className={`btn btn-sm ${flowOn ? "" : "btn-primary"}`} onClick={() => setFlowOn(!flowOn)}>
+                    {flowOn ? "Show full list" : "Review one at a time (keyboard)"}
+                  </button>
+                </div>
+                {!flowOn && (
+                  <p style={{ margin: "8px 0 0", fontSize: 12, color: "#697386" }}>
+                    One-at-a-time mode shows a single row with big keys: <strong>A</strong> apply · <strong>S</strong> skip · <strong>E</strong> edit profile · <strong>L</strong> AI lookup ·{" "}
+                    <strong>← →</strong> move. Possible mix-ups need <strong>Shift+A</strong>.
+                  </p>
+                )}
+              </div>
+            )}
+
+            {flowShown && (
+              <div className="card" ref={flowCardRef}>
+                {flowRows.length === 0 ? (
+                  <div className="empty-state">
+                    {pendingInBucket.length === 0 ? "Nothing left to review in this tab." : "No pending rows match this filter."}{" "}
+                    {tagFilter !== "all" && (
+                      <button className="btn btn-sm" onClick={() => setTagFilter("all")}>
+                        Show all
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  <>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
+                      <strong>
+                        Row {flowIdx + 1} of {flowRows.length}
+                      </strong>
+                      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", fontSize: 12 }}>
+                        {[
+                          ["A", flowActionLabel],
+                          ["S", "Skip"],
+                          ["E", "Edit profile"],
+                          ["L", "AI lookup"],
+                          ["← →", "Move"],
+                        ].map(([k, label]) => (
+                          <span key={k} style={{ display: "inline-flex", alignItems: "center", gap: 4 }}>
+                            <kbd style={{ border: "1px solid #c9ced8", borderBottomWidth: 2, borderRadius: 4, padding: "1px 6px", background: "#f6f7f9", fontFamily: "inherit", fontWeight: 700 }}>{k}</kbd>
+                            {label}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                    {flowHint && <div className="notice danger" style={{ marginBottom: 10, fontSize: 12.5 }}>{flowHint}</div>}
+                    <RowCard
+                      key={flowRow.id}
+                      row={flowRow}
+                      tag={rowTag(flowRow, guards[flowRow.id], indexReady)}
+                      busy={!!rowBusy[flowRow.id]}
+                      error={rowError[flowRow.id]}
+                      aiNote={aiNote[flowRow.id]}
+                      guard={guards[flowRow.id] || null}
+                      selection={activeBucket === "conflict" ? getSelection(flowRow) : null}
+                      onToggleField={(field) => toggleField(flowRow, field)}
+                      onApplyNewInfo={() => applyRowFields(flowRow, flowRow.diff || [])}
+                      onApplyConflict={() => applyConflictRow(flowRow)}
+                      onSkip={() => skipRow(flowRow)}
+                      onAddNewSchool={() => addRowAsNewSchool(flowRow)}
+                      onPickCandidate={(candidate) => sendToVerification(flowRow, candidate.id)}
+                      onMarkNewSchool={() => markRowAsNewSchoolInstead(flowRow)}
+                      onRunAiLookup={flowRow.match_school_id ? () => runAiLookup(flowRow) : null}
+                      onOpenProfile={flowRow.match_school_id ? () => openProfile(flowRow) : null}
+                      onUndo={null}
+                    />
+                  </>
+                )}
+              </div>
+            )}
+
+            {!flowShown && (
             <div className="card">
-              {bucketRows.length === 0 ? (
-                <div className="empty-state">No rows in this bucket.</div>
+              {listRows.length === 0 ? (
+                <div className="empty-state">{bucketRows.length === 0 ? "No rows in this bucket." : "No rows match this filter."}</div>
               ) : (
                 <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-                  {bucketRows.map((row) => (
+                  {listRows.map((row) => (
                     <RowCard
                       key={row.id}
                       row={row}
+                      tag={rowTag(row, guards[row.id], indexReady)}
                       busy={!!rowBusy[row.id]}
                       error={rowError[row.id]}
                       aiNote={aiNote[row.id]}
@@ -1847,6 +2113,7 @@ export default function ImportReconcilePage() {
                 </div>
               )}
             </div>
+            )}
           </>
         )}
 
@@ -2004,7 +2271,7 @@ export default function ImportReconcilePage() {
   );
 }
 
-function RowCard({ row, busy, error, aiNote, guard, selection, onToggleField, onApplyNewInfo, onApplyConflict, onSkip, onAddNewSchool, onPickCandidate, onMarkNewSchool, onRunAiLookup, onOpenProfile, onUndo }) {
+function RowCard({ row, tag, busy, error, aiNote, guard, selection, onToggleField, onApplyNewInfo, onApplyConflict, onSkip, onAddNewSchool, onPickCandidate, onMarkNewSchool, onRunAiLookup, onOpenProfile, onUndo }) {
   const resolved = row.resolution !== "pending";
   const m = row.mapped_data || {};
   const locationLabel = [m.city, m.state].filter(Boolean).join(", ");
@@ -2013,6 +2280,27 @@ function RowCard({ row, busy, error, aiNote, guard, selection, onToggleField, on
     <div className="log-item" style={{ opacity: resolved ? 0.6 : 1 }}>
       <div style={{ display: "flex", justifyContent: "space-between", flexWrap: "wrap", gap: 8 }}>
         <div>
+          {tag && (
+            <span
+              title={tag.reasons.length ? tag.reasons.join("\n") : "Nothing unusual -- safe to apply"}
+              style={{
+                display: "inline-flex",
+                alignItems: "center",
+                gap: 5,
+                marginRight: 8,
+                padding: "1px 8px",
+                borderRadius: 10,
+                fontSize: 11,
+                fontWeight: 700,
+                color: TAG_STYLE[tag.level].color,
+                background: TAG_STYLE[tag.level].bg,
+                border: `1px solid ${TAG_STYLE[tag.level].border}`,
+              }}
+            >
+              <span style={{ width: 8, height: 8, borderRadius: "50%", background: TAG_STYLE[tag.level].dot }} />
+              {TAG_STYLE[tag.level].label}
+            </span>
+          )}
           <strong>{row.label || m.name || `Row ${row.row_index}`}</strong>
           {locationLabel && <span style={{ color: "#697386", fontSize: 12.5 }}> — {locationLabel}</span>}
           {row.duplicate_in_file && (
