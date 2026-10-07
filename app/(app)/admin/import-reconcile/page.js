@@ -9,6 +9,7 @@ import {
   categorizeRow,
   categorizeAgainstSchool,
   matchKey,
+  resolveHeader,
   DIFF_FIELDS,
   ALL_FIELDS,
   BUCKET_LABELS,
@@ -102,6 +103,142 @@ const TAG_STYLE = {
   checking: { label: "Checking…", color: "#697386", bg: "#f1f3f6", border: "#d9dde4", dot: "#9aa3b2" },
 };
 
+// ---- Intake helpers (Excel files, spreadsheet pastes, long pastes) -------
+
+// AI-parse pastes are split into parts of about this many characters so each
+// call stays well inside the model's output budget, and the whole paste is
+// capped so one click can't queue an unbounded number of paid AI calls.
+const PASTE_CHUNK_CHARS = 6000;
+const PASTE_MAX_CHARS = 100000;
+const PASTE_PARALLEL = 2;
+
+// Splits a long paste into parts at blank lines (a new school usually starts
+// after one), falling back to line breaks, then a hard cut for a single huge
+// line. A paste under the limit comes back as one part, untouched.
+function chunkPasteText(text, max) {
+  const t = String(text || "").trim();
+  if (!t) return [];
+  if (t.length <= max) return [t];
+  const pieces = [];
+  t.split(/\n\s*\n/).forEach((para) => {
+    if (para.length <= max) {
+      pieces.push(para);
+      return;
+    }
+    let buf = "";
+    para.split("\n").forEach((line0) => {
+      let line = line0;
+      while (line.length > max) {
+        if (buf) {
+          pieces.push(buf);
+          buf = "";
+        }
+        pieces.push(line.slice(0, max));
+        line = line.slice(max);
+      }
+      if (buf && buf.length + 1 + line.length > max) {
+        pieces.push(buf);
+        buf = line;
+      } else {
+        buf = buf ? `${buf}\n${line}` : line;
+      }
+    });
+    if (buf) pieces.push(buf);
+  });
+  const chunks = [];
+  let cur = "";
+  pieces.forEach((p) => {
+    if (cur && cur.length + 2 + p.length > max) {
+      chunks.push(cur.trim());
+      cur = "";
+    }
+    cur = cur ? `${cur}\n\n${p}` : p;
+  });
+  if (cur.trim()) chunks.push(cur.trim());
+  return chunks;
+}
+
+// True when the pasted text is cells copied from Excel / Google Sheets: tab
+// separated, with a header row that includes a school-name and a state column.
+// Those are read directly (same column matching as a CSV upload) -- no AI.
+function looksLikeSheetPaste(text) {
+  const lines = String(text || "").slice(0, 5000).split(/\r?\n/).filter((l) => l.trim());
+  if (lines.length < 2) return false;
+  const cols = lines[0].split("\t");
+  if (cols.length < 3) return false;
+  const fields = new Set(cols.map((c) => resolveHeader(c)).filter(Boolean));
+  return fields.has("name") && fields.has("state");
+}
+
+function xlsxCellText(v) {
+  if (v == null) return "";
+  if (v instanceof Date) return v.toISOString().slice(0, 10);
+  if (typeof v === "object") {
+    if (Array.isArray(v.richText)) return v.richText.map((r) => r.text || "").join("");
+    if (v.result !== undefined) return xlsxCellText(v.result);
+    if (v.text !== undefined) return xlsxCellText(v.text);
+    if (v.hyperlink) return String(v.hyperlink).replace(/^mailto:/i, "");
+    if (v.error) return "";
+    return "";
+  }
+  return String(v);
+}
+
+// Reads the first sheet that has data from an .xlsx file into the same
+// header -> value row objects Papa.parse gives a CSV, so everything after
+// this point is shared. ExcelJS is loaded only when an .xlsx is dropped in.
+async function readXlsxRows(file) {
+  const mod = await import("exceljs/dist/exceljs.min.js");
+  const ExcelJS = mod.default || mod;
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(await file.arrayBuffer());
+  const ws = wb.worksheets.find((sheet) => sheet.actualRowCount > 1);
+  if (!ws) throw new Error("That workbook has no sheet with data rows.");
+  const readRow = (row) => {
+    const vals = [];
+    row.eachCell({ includeEmpty: true }, (cell, col) => {
+      vals[col - 1] = xlsxCellText(cell.value).trim();
+    });
+    return Array.from(vals, (v) => v || "");
+  };
+  let headerRowNum = 0;
+  let headers = [];
+  for (let n = 1; n <= ws.rowCount && !headerRowNum; n++) {
+    const vals = readRow(ws.getRow(n));
+    if (vals.filter(Boolean).length >= 2) {
+      headerRowNum = n;
+      headers = vals;
+    }
+  }
+  if (!headerRowNum) throw new Error("Couldn't find a header row in that workbook.");
+  const seen = {};
+  const keys = headers.map((h, i) => {
+    const base = h || `Column ${i + 1}`;
+    seen[base] = (seen[base] || 0) + 1;
+    return seen[base] > 1 ? `${base}_${seen[base]}` : base;
+  });
+  const out = [];
+  for (let n = headerRowNum + 1; n <= ws.rowCount; n++) {
+    const vals = readRow(ws.getRow(n));
+    if (!vals.some(Boolean)) continue;
+    const obj = {};
+    keys.forEach((k, i) => {
+      let v = vals[i] || "";
+      // Excel stores zips as numbers, dropping the leading zero (Maine, Mass., NJ...).
+      if (v && resolveHeader(k) === "zip" && /^\d{1,4}$/.test(v)) v = v.padStart(5, "0");
+      obj[k] = v;
+    });
+    out.push(obj);
+  }
+  return out;
+}
+
+// A same-name row the page matched using only the CITY (weakest of the
+// zip / phone / website / city signals in lib/importReconcile.js) -- tagged
+// "Check" and left out of the bulk "Apply all" buttons.
+const isWeakMatch = (row) => row?.match_confidence === "detail:city";
+const MATCH_VIA_LABELS = { zip: "zip code", phone: "phone number", website: "website", city: "city" };
+
 // How many live AI lookups run at once in "Run AI on N rows". Each one is a
 // real web-search + Anthropic call (up to ~20s), so a small pool -- not all
 // of them at once -- keeps it fast without hammering the API.
@@ -139,6 +276,7 @@ function rowTag(row, guard, indexReady) {
   if (diff.some((f) => f.kind === "overwrite")) reasons.push("Replaces a value already on file");
   if (diff.some((f) => f.source === "ai" && f.estimated)) reasons.push("Includes a guessed (not confirmed) email");
   if (row.duplicate_in_file) reasons.push("Another row in this file has the same school");
+  if (isWeakMatch(row)) reasons.push("Several schools share this name -- matched to this one by city only. Confirm it's the right school.");
   if (guard?.level === "yellow" || reasons.length) return { level: "yellow", reasons };
   return { level: "green", reasons: [] };
 }
@@ -234,6 +372,8 @@ export default function ImportReconcilePage() {
   const [pasteText, setPasteText] = useState("");
   const [parsingPaste, setParsingPaste] = useState(false);
   const [pasteError, setPasteError] = useState("");
+  const [pasteProgress, setPasteProgress] = useState("");
+  const [dragOver, setDragOver] = useState(false);
 
   // Review screen (an opened, already-saved batch).
   const [selectedBatch, setSelectedBatch] = useState(null);
@@ -423,63 +563,83 @@ export default function ImportReconcilePage() {
     }
   }
 
-  async function handleFileChange(e) {
-    const file = e.target.files?.[0];
+  // Matches every raw row (header -> value) against the schools on file and
+  // builds the preview. Shared by CSV upload, Excel upload and a pasted
+  // spreadsheet, so all three get identical matching, same-name handling and
+  // duplicate-in-file checks. firstRowNumber is the sheet row of rawRows[0]
+  // (2 = right under the header row).
+  async function buildPreviewFromRawRows(rawRows, firstRowNumber = 2) {
+    const schools = await fetchAllSchools();
+    const existingById = new Map(schools.map((s) => [String(s.id), s]));
+    const existingByKey = new Map();
+    schools.forEach((s) => {
+      const key = matchKey(s.name, s.state);
+      if (!existingByKey.has(key)) existingByKey.set(key, []);
+      existingByKey.get(key).push(s);
+    });
+
+    let columnMapping = {};
+    const seenInFile = new Map();
+    const built = rawRows.map((raw, i) => {
+      const { mapped, columnMapping: thisMapping } = mapRow(raw);
+      if (i === 0) columnMapping = thisMapping;
+      const result = categorizeRow(mapped, { existingById, existingByKey });
+
+      let duplicateInFile = false;
+      if (result.bucket === "new_school" && mapped.name && mapped.state) {
+        const key = matchKey(mapped.name, mapped.state);
+        if (seenInFile.has(key)) duplicateInFile = true;
+        seenInFile.set(key, true);
+      }
+
+      return {
+        row_index: i + firstRowNumber,
+        label: mapped.name || `Row ${i + firstRowNumber}`,
+        raw_row: raw,
+        mapped_data: mapped,
+        ...result,
+        duplicate_in_file: duplicateInFile,
+      };
+    });
+
+    const summary = {};
+    BUCKET_ORDER.forEach((b) => {
+      summary[b] = built.filter((r) => r.bucket === b).length;
+    });
+    return { rows: built, columnMapping, summary };
+  }
+
+  // Reads one dropped / chosen file (.csv or .xlsx) into the preview.
+  async function handleFile(file) {
     if (!file) return;
     resetUpload();
     setFileName(file.name);
     setUploading(true);
     try {
-      const text = await file.text();
-      const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
-      if (parsed.errors?.length) throw new Error(parsed.errors[0].message);
-      const rawRows = parsed.data || [];
+      const lower = file.name.toLowerCase();
+      let rawRows;
+      if (lower.endsWith(".xlsx")) {
+        rawRows = await readXlsxRows(file);
+      } else if (lower.endsWith(".xls")) {
+        throw new Error("Old .xls files aren't supported -- open it in Excel and Save As .xlsx or .csv, then try again.");
+      } else {
+        const text = await file.text();
+        const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+        if (parsed.errors?.length) throw new Error(parsed.errors[0].message);
+        rawRows = parsed.data || [];
+      }
       if (!rawRows.length) throw new Error("The file has no data rows.");
-
-      const schools = await fetchAllSchools();
-      const existingById = new Map(schools.map((s) => [String(s.id), s]));
-      const existingByKey = new Map();
-      schools.forEach((s) => {
-        const key = matchKey(s.name, s.state);
-        if (!existingByKey.has(key)) existingByKey.set(key, []);
-        existingByKey.get(key).push(s);
-      });
-
-      let columnMapping = {};
-      const seenInFile = new Map();
-      const built = rawRows.map((raw, i) => {
-        const { mapped, columnMapping: thisMapping } = mapRow(raw);
-        if (i === 0) columnMapping = thisMapping;
-        const result = categorizeRow(mapped, { existingById, existingByKey });
-
-        let duplicateInFile = false;
-        if (result.bucket === "new_school" && mapped.name && mapped.state) {
-          const key = matchKey(mapped.name, mapped.state);
-          if (seenInFile.has(key)) duplicateInFile = true;
-          seenInFile.set(key, true);
-        }
-
-        return {
-          row_index: i + 2, // +1 for 0-index, +1 for the header row
-          label: mapped.name || `Row ${i + 2}`,
-          raw_row: raw,
-          mapped_data: mapped,
-          ...result,
-          duplicate_in_file: duplicateInFile,
-        };
-      });
-
-      const summary = {};
-      BUCKET_ORDER.forEach((b) => {
-        summary[b] = built.filter((r) => r.bucket === b).length;
-      });
-
-      setPreview({ rows: built, columnMapping, summary });
+      setPreview(await buildPreviewFromRawRows(rawRows, 2));
     } catch (err) {
       setUploadError(err.message || "Could not read this file.");
     } finally {
       setUploading(false);
     }
+  }
+
+  function handleFileChange(e) {
+    const file = e.target.files?.[0];
+    if (file) handleFile(file);
   }
 
   // Alternative to handleFileChange above: instead of a CSV, a reviewer
@@ -494,27 +654,74 @@ export default function ImportReconcilePage() {
   // and conflict-vs-new-info bucketing a CSV row gets, with no separate
   // backstop logic needed in this function.
   async function handlePasteParse() {
-    const text = pasteText.trim();
-    if (!text) {
+    const raw = pasteText.replace(/^(\s*\r?\n)+/, "").trimEnd();
+    if (!raw.trim()) {
       setPasteError("Paste some research text first.");
       return;
     }
     resetUpload();
     setParsingPaste(true);
     setPasteError("");
+    setPasteProgress("");
     try {
+      // Cells copied from Excel / Google Sheets (tab separated, with a header
+      // row) are read directly -- no AI, no cost, no guessing.
+      if (looksLikeSheetPaste(raw)) {
+        const parsed = Papa.parse(raw, { header: true, delimiter: "\t", skipEmptyLines: true });
+        const fatal = (parsed.errors || []).find((e) => e.type === "Quotes");
+        if (fatal) throw new Error(fatal.message);
+        const rawRows = parsed.data || [];
+        if (!rawRows.length) throw new Error("The pasted sheet has a header row but no data rows.");
+        const built = await buildPreviewFromRawRows(rawRows, 2);
+        setFileName(`Pasted sheet — ${new Date().toLocaleString()}`);
+        setPreview(built);
+        return;
+      }
+
+      const text = raw.trim();
+      if (text.length > PASTE_MAX_CHARS) {
+        throw new Error(`That's ${text.length.toLocaleString()} characters -- please paste ${PASTE_MAX_CHARS.toLocaleString()} or fewer at a time.`);
+      }
+      const chunks = chunkPasteText(text, PASTE_CHUNK_CHARS);
       const {
         data: { session },
       } = await supabase.auth.getSession();
-      const res = await fetch("/api/admin/bulk-parse", {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Authorization: `Bearer ${session?.access_token}` },
-        body: JSON.stringify({ text }),
-      });
-      const json = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(json.error || "Could not parse this text.");
-      const parsedSchools = json.schools || [];
-      if (!parsedSchools.length) throw new Error("Didn't find any school with both a name and a state in that text.");
+
+      const results = new Array(chunks.length).fill(null);
+      const failures = [];
+      let nextChunk = 0;
+      let finished = 0;
+      const parseWorker = async () => {
+        for (;;) {
+          const idx = nextChunk;
+          nextChunk += 1;
+          if (idx >= chunks.length) return;
+          try {
+            // eslint-disable-next-line no-await-in-loop
+            const res = await fetch("/api/admin/bulk-parse", {
+              method: "POST",
+              headers: { "Content-Type": "application/json", Authorization: `Bearer ${session?.access_token}` },
+              body: JSON.stringify({ text: chunks[idx] }),
+            });
+            // eslint-disable-next-line no-await-in-loop
+            const json = await res.json().catch(() => ({}));
+            if (!res.ok) throw new Error(json.error || "Could not parse this text.");
+            results[idx] = json.schools || [];
+          } catch (err) {
+            failures.push({ part: idx + 1, message: err.message || "failed", preview: chunks[idx].slice(0, 60).replace(/\s+/g, " ") });
+          }
+          finished += 1;
+          if (chunks.length > 1) setPasteProgress(`Parsing… ${finished} of ${chunks.length} parts done`);
+        }
+      };
+      if (chunks.length > 1) setPasteProgress(`Parsing… 0 of ${chunks.length} parts done`);
+      await Promise.all(Array.from({ length: Math.min(PASTE_PARALLEL, chunks.length) }, () => parseWorker()));
+
+      const parsedSchools = results.flat().filter(Boolean);
+      if (!parsedSchools.length) {
+        if (failures.length) throw new Error(failures[0].message);
+        throw new Error("Didn't find any school with both a name and a state in that text.");
+      }
 
       const schools = await fetchAllSchools();
       const existingById = new Map(schools.map((s) => [String(s.id), s]));
@@ -554,10 +761,18 @@ export default function ImportReconcilePage() {
 
       setFileName(`Pasted research (AI-parsed) — ${new Date().toLocaleString()}`);
       setPreview({ rows: built, columnMapping: { _source: "ai_paste_parse" }, summary });
+      if (failures.length) {
+        setPasteError(
+          `${failures.length} of ${chunks.length} part${chunks.length > 1 ? "s" : ""} couldn't be parsed and ${failures.length > 1 ? "were" : "was"} left out (${failures
+            .map((f) => `part ${f.part}, starting "${f.preview}…": ${f.message}`)
+            .join(" | ")}). Everything else is in the preview below -- paste the missing part(s) again afterwards.`
+        );
+      }
     } catch (err) {
       setPasteError(err.message || "Could not parse this text.");
     } finally {
       setParsingPaste(false);
+      setPasteProgress("");
     }
   }
 
@@ -1050,7 +1265,7 @@ export default function ImportReconcilePage() {
   // Waits for the school list to finish loading first: without it there is
   // nothing to check against, and "safe" would just be a guess.
   function safeRowsOf(bucket) {
-    return rows.filter((r) => r.bucket === bucket && r.resolution === "pending" && (guards[r.id]?.level || "none") === "none");
+    return rows.filter((r) => r.bucket === bucket && r.resolution === "pending" && (guards[r.id]?.level || "none") === "none" && !isWeakMatch(r));
   }
 
   async function applyAllNewInfo() {
@@ -1843,7 +2058,7 @@ export default function ImportReconcilePage() {
         : bucketRowsRaw;
     const batchTrust = trustInfo(selectedBatch.source_trust);
     const indexReady = !!schoolIndexRef.current && !indexLoading;
-    const safeNewInfo = rows.filter((r) => r.bucket === "new_info" && r.resolution === "pending" && (guards[r.id]?.level || "none") === "none");
+    const safeNewInfo = rows.filter((r) => r.bucket === "new_info" && r.resolution === "pending" && (guards[r.id]?.level || "none") === "none" && !isWeakMatch(r));
     const safeNewSchools = rows.filter((r) => r.bucket === "new_school" && r.resolution === "pending" && (guards[r.id]?.level || "none") === "none");
     const pendingInBucket = bucketRows.filter((r) => r.resolution === "pending");
     const totalPending = rows.filter((r) => r.resolution === "pending").length;
@@ -2253,15 +2468,38 @@ export default function ImportReconcilePage() {
           <h3>Step 2 — Upload a sheet</h3>
           <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>Nothing is saved until you review the preview and click Save &amp; Start Reviewing.</p>
           {uploadError && <div className="notice danger" style={{ marginBottom: 10 }}>{uploadError}</div>}
-          <input ref={fileInputRef} type="file" accept=".csv" onChange={handleFileChange} disabled={uploading} />
+          <div
+            onDragOver={(e) => {
+              e.preventDefault();
+              if (!dragOver) setDragOver(true);
+            }}
+            onDragLeave={() => setDragOver(false)}
+            onDrop={(e) => {
+              e.preventDefault();
+              setDragOver(false);
+              const f = e.dataTransfer?.files?.[0];
+              if (f && !uploading) handleFile(f);
+            }}
+            style={{
+              border: `2px dashed ${dragOver ? "#1c5fb3" : "#c9ced8"}`,
+              background: dragOver ? "#e7effc" : "#fafbfc",
+              borderRadius: 8,
+              padding: "14px 12px",
+              textAlign: "center",
+            }}
+          >
+            <div style={{ fontSize: 13, marginBottom: 8, color: "#445" }}>Drag an Excel (.xlsx) or CSV file here, or choose one:</div>
+            <input ref={fileInputRef} type="file" accept=".csv,.xlsx" onChange={handleFileChange} disabled={uploading} />
+          </div>
           {uploading && <div className="empty-state" style={{ marginTop: 8 }}>Reading {fileName}…</div>}
         </div>
       </div>
 
       <div className="card" style={{ marginBottom: 14 }}>
-        <h3>Or paste research text (AI-parsed)</h3>
+        <h3>Or paste cells from Excel, or paste research text</h3>
         <p style={{ fontSize: 12.5, color: "#697386", marginTop: -4 }}>
-          Paste any research you&apos;ve already done — one school or several, in whatever shape it&apos;s in. The AI only structures what you pasted into rows below; it never
+          <strong>Copied cells from Excel or Google Sheets</strong> (with a header row that has a school name and a state column) are read directly — no AI, no cost. Anything else:
+          paste any research you&apos;ve already done — one school or several, in whatever shape it&apos;s in; long pastes are split into parts automatically. The AI only structures what you pasted into rows below; it never
           searches the web or adds anything you didn&apos;t already write. Everything it finds still runs through the exact same matching and conflict checks as a CSV upload
           before anything is saved — nothing is applied automatically.
         </p>
@@ -2275,7 +2513,7 @@ export default function ImportReconcilePage() {
           disabled={parsingPaste}
         />
         <button className="btn btn-primary btn-sm" onClick={handlePasteParse} disabled={parsingPaste || !pasteText.trim()}>
-          {parsingPaste ? "Parsing…" : "Parse with AI"}
+          {parsingPaste ? pasteProgress || "Parsing…" : looksLikeSheetPaste(pasteText) ? "Read pasted sheet (no AI)" : "Parse with AI"}
         </button>
       </div>
 
@@ -2437,6 +2675,18 @@ function RowCard({ row, tag, busy, error, aiNote, guard, selection, onToggleFiel
       {error && <div className="notice danger" style={{ marginTop: 8, fontSize: 12.5 }}>{error}</div>}
 
       {aiNote && <div style={{ fontSize: 12, color: "#1c5fb3", marginTop: 6 }}>🤖 {aiNote}</div>}
+
+      {typeof row.match_confidence === "string" && row.match_confidence.startsWith("detail:") && (
+        <div style={{ fontSize: 12, color: "#445", marginTop: 6 }}>
+          Several schools on file share this name — matched to this one by{" "}
+          {row.match_confidence
+            .slice(7)
+            .split("+")
+            .map((v) => MATCH_VIA_LABELS[v] || v)
+            .join(" + ")}
+          .
+        </div>
+      )}
 
       {row.skip_reason && <div style={{ fontSize: 12.5, color: "#a94442", marginTop: 6 }}>{row.skip_reason}</div>}
 
