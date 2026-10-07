@@ -13,6 +13,7 @@ import { NextResponse } from "next/server";
 import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
 import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
+import { compareSuggestion, isFreshAiCheck, AI_TRUSTED_MODE } from "@/lib/needsReviewAi";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
 
@@ -54,6 +55,31 @@ export async function POST(req) {
       return NextResponse.json({ error: "School not found." }, { status: 404 });
     }
 
+    // Optional: confirm because an AI web check (a Batch Coach-Info item)
+    // matched the on-file coach and email. Re-verified HERE from the item
+    // itself -- the page's say-so isn't trusted -- and logged with its own
+    // source wording so the Database screen's "How verified" shows it as an
+    // AI lookup, not as a human confirmation. Wording deliberately avoids the
+    // phrases school_verification_meta uses for paste-match / independent.
+    let confirmSource = "Needs-Review dashboard - confirmed accurate, no change needed";
+    const aiItemId = Number(body.ai_item_id) || null;
+    if (aiItemId) {
+      const { data: aiItem } = await admin
+        .from("coach_info_batch_items")
+        .select("id,school_id,batch_run_id,suggestion")
+        .eq("id", aiItemId)
+        .maybeSingle();
+      const { data: aiRun } = aiItem ? await admin.from("coach_info_batch_runs").select("collected_at,candidate_mode").eq("id", aiItem.batch_run_id).maybeSingle() : { data: null };
+      const cmp = aiItem && aiItem.school_id === schoolId && aiRun?.candidate_mode === AI_TRUSTED_MODE && isFreshAiCheck(aiRun?.collected_at) ? compareSuggestion(school, aiItem.suggestion) : null;
+      if (!cmp || !cmp.confirmable) {
+        return NextResponse.json(
+          { error: "That AI check no longer matches this school's coach and email at high confidence, so it can't be used to confirm it. Review the school by hand." },
+          { status: 409 }
+        );
+      }
+      confirmSource = `Batch AI lookup - web check matched the on-file coach and email (confirmed from Needs Review, batch run #${aiItem.batch_run_id})`;
+    }
+
     const snapshot = JSON.stringify({
       coach: `${school.hc_first_name ?? ""} ${school.hc_last_name ?? ""}`.trim(),
       email: school.hc_email,
@@ -66,7 +92,7 @@ export async function POST(req) {
       field_name: "review_confirmed",
       old_value: snapshot,
       new_value: snapshot,
-      source: "Needs-Review dashboard - confirmed accurate, no change needed",
+      source: confirmSource,
       changed_by: userData.user.id,
     });
     if (logErr) throw logErr;
