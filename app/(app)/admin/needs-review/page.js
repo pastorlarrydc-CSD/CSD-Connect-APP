@@ -28,6 +28,28 @@ const REASON_ORDER = ["paste", "unchecked", "flagged", "never"];
 // Most schools one click will queue for an AI web check. Keeps a single run
 // (and its search + AI cost) small enough to sanity-check before doing more.
 const AI_SEND_CAP = 100;
+// How many schools' web sources are fetched at once while a run is being
+// prepared (same number Batch Coach-Info uses for its own Fetch Sources).
+const AI_FETCH_CONCURRENCY = 8;
+
+// Plain-English status for an AI verification run in the banner.
+const RUN_STATUS_TEXT = {
+  collecting: "Queued — web sources not fetched yet",
+  submitted: "Sent to the AI — results usually arrive within a few hours",
+  processing: "The AI is working on it — results usually arrive within a few hours",
+  ready: "Finished — results ready to collect",
+};
+
+async function runWithConcurrency(items, limit, worker) {
+  let next = 0;
+  async function runNext() {
+    const i = next++;
+    if (i >= items.length) return;
+    await worker(items[i], i);
+    return runNext();
+  }
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, runNext));
+}
 // Most rows "Edit all shown" opens at once.
 const EDIT_ALL_CAP = 40;
 // Rows saved at the same time by "Save all changed".
@@ -147,6 +169,11 @@ function NeedsReviewPageInner() {
   // AI web-check actions (see sendToAi / confirmAiMatched below).
   const [aiBusy, setAiBusy] = useState(false);
   const [aiNote, setAiNote] = useState(null); // { kind: "info" | "danger", text, runId? }
+  // AI verification runs still in flight for the state on screen (queued,
+  // sent, or finished-but-not-collected), plus the live step of whichever run
+  // this tab is currently preparing: { runId, step: "fetch" | "submit" | "check" | "collect", done, total }.
+  const [aiRuns, setAiRuns] = useState([]);
+  const [aiStep, setAiStep] = useState(null);
   const [confirmingId, setConfirmingId] = useState(null);
   // Quick Fix: any number of rows can be open at once. editDrafts is a
   // {schoolId: {field: value, __clearEmail}} map (a row is open exactly when it
@@ -308,13 +335,135 @@ function NeedsReviewPageInner() {
     }
   };
 
+  // Runs from this tool for the state on screen that haven't been collected
+  // yet. Read straight from the table so the banner survives a reload, a
+  // closed tab, or a run that was started on another day.
+  const loadAiRuns = useCallback(
+    async (state) => {
+      if (!state) {
+        setAiRuns([]);
+        return;
+      }
+      try {
+        const { data, error: runsErr } = await supabase
+          .from("coach_info_batch_runs")
+          .select("id,status,requested_count,fetched_count,created_at")
+          .eq("candidate_mode", "re_verify")
+          .contains("state_filter", [state])
+          .in("status", ["collecting", "submitted", "processing", "ready"])
+          .order("id", { ascending: false })
+          .limit(8);
+        if (runsErr) throw runsErr;
+        setAiRuns(data || []);
+      } catch (_) {
+        setAiRuns([]);
+      }
+    },
+    [supabase]
+  );
+
+  useEffect(() => {
+    if (canReview && selectedState) loadAiRuns(selectedState);
+  }, [canReview, selectedState, loadAiRuns]);
+
+  // Re-reads the queue (so AI check results show up) WITHOUT touching any
+  // Quick Fix edits that are open.
+  const refreshQueue = async () => {
+    if (!selectedState) return;
+    const res = await authedFetch(`/api/admin/needs-review?state=${selectedState}`);
+    const json = await res.json();
+    if (!res.ok) throw new Error(json.error || "Could not refresh the queue.");
+    setSchools(json.schools || []);
+    setTotalInQueue(json.total_in_queue ?? (json.schools || []).length);
+    setReviewedToday(json.reviewed_today || 0);
+  };
+
+  // Steps 2 and 3 of the one-click flow: fetch each queued school's web
+  // sources, then submit the run to the AI. Safe to run again on a run that
+  // stopped part-way -- it only fetches items still pending, and submit only
+  // takes a run that hasn't been sent yet.
+  const prepareAndSubmitRun = async (runId) => {
+    setAiBusy(true);
+    setError("");
+    try {
+      const { data: pending, error: pendErr } = await supabase.from("coach_info_batch_items").select("id").eq("batch_run_id", runId).eq("fetch_status", "pending");
+      if (pendErr) throw pendErr;
+      const toFetch = pending || [];
+      let done = 0;
+      setAiStep({ runId, step: "fetch", done: 0, total: toFetch.length });
+      await runWithConcurrency(toFetch, AI_FETCH_CONCURRENCY, async (item) => {
+        try {
+          await authedFetch("/api/admin/batch-coach-info/fetch-item", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ itemId: item.id }),
+          });
+        } catch (_) {
+          // an item that fails here is simply left out of the submit
+        }
+        done += 1;
+        setAiStep({ runId, step: "fetch", done, total: toFetch.length });
+      });
+      setAiStep({ runId, step: "submit", done: 0, total: 0 });
+      const res = await authedFetch(`/api/admin/batch-coach-info/${runId}/submit`, { method: "POST" });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || "Could not submit this run to the AI.");
+      setAiNote({
+        kind: "info",
+        runId,
+        text: `Run #${runId} is with the AI: ${json.submitted_count ?? "your"} school${json.submitted_count === 1 ? "" : "s"} submitted. Results usually arrive within a few hours and are collected automatically overnight — or click "Check & collect" in the banner below any time. Then the AI check column fills in and the matches can be confirmed in one click.`,
+      });
+    } catch (err) {
+      setAiNote({ kind: "danger", text: `${err.message || "Could not finish preparing this run."} The run is saved — click "Fetch sources & submit" in the banner to try again.` });
+    } finally {
+      setAiStep(null);
+      setAiBusy(false);
+      loadAiRuns(selectedState);
+    }
+  };
+
+  // One button for a run that's already with the AI: ask whether it's done,
+  // and if it is, collect the results and refresh the queue.
+  const checkAndCollectRun = async (runId) => {
+    setAiBusy(true);
+    setAiNote(null);
+    setError("");
+    try {
+      setAiStep({ runId, step: "check", done: 0, total: 0 });
+      const res = await authedFetch(`/api/admin/batch-coach-info/${runId}/check-status`);
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || "Could not check this run.");
+      if (json.processing_status !== "ended") {
+        const counts = json.request_counts;
+        const left = counts && typeof counts.processing === "number" ? ` (${counts.processing} still being worked on)` : "";
+        setAiNote({ kind: "info", text: `Run #${runId} isn't finished yet${left}. Check again in a little while — it's also collected automatically overnight.` });
+        return;
+      }
+      setAiStep({ runId, step: "collect", done: 0, total: 0 });
+      const cRes = await authedFetch(`/api/admin/batch-coach-info/${runId}/collect`, { method: "POST" });
+      const cJson = await cRes.json().catch(() => ({}));
+      if (!cRes.ok) throw new Error(cJson.error || "Could not collect this run's results.");
+      await refreshQueue();
+      setAiNote({
+        kind: "info",
+        text: `Run #${runId} collected: ${cJson.succeeded ?? 0} result${cJson.succeeded === 1 ? "" : "s"}${cJson.failed ? `, ${cJson.failed} with no answer` : ""}. The AI check column is updated — use the "AI matched" filter and "Confirm AI-matched" for the easy ones, and Quick Fix for the rest.`,
+      });
+    } catch (err) {
+      setAiNote({ kind: "danger", text: err.message || "Could not check this run." });
+    } finally {
+      setAiStep(null);
+      setAiBusy(false);
+      loadAiRuns(selectedState);
+    }
+  };
+
   // Queues the given schools into a new Batch Coach-Info Discovery run
   // (candidate_mode "re_verify": the open, identity-confirming search, so a
   // coach who has since been replaced gets found rather than re-confirmed).
   // Same insert Import & Reconcile and the Batch Coach-Info page itself use.
-  // Nothing is fetched or paid for yet -- the run just sits in "collecting"
-  // until its sources are fetched and it's submitted on the Batch Coach-Info
-  // page. Schools already queued or checked are skipped by the caller.
+  // Then carries straight on (prepareAndSubmitRun): web sources fetched for
+  // each school, the run submitted to the AI batch. Schools already queued or
+  // checked are skipped by the caller.
   const sendToAi = async (list) => {
     const picked = list.slice(0, AI_SEND_CAP);
     if (!picked.length || !user) return;
@@ -335,18 +484,15 @@ function NeedsReviewPageInner() {
       }
       const queued = new Set(picked.map((s) => s.id));
       setSchools((prev) => prev.map((s) => (queued.has(s.id) ? { ...s, ai_check: { status: "pending", run_id: runRow.id, run_status: "collecting", confirmable: false } } : s)));
-      setAiNote({
-        kind: "info",
-        runId: runRow.id,
-        text: `Queued ${picked.length} school${picked.length === 1 ? "" : "s"} as batch run #${runRow.id}${
-          list.length > picked.length ? ` (the first ${AI_SEND_CAP} — ${list.length - picked.length} more are still waiting)` : ""
-        }. Nothing has been searched or charged yet: open Batch Coach-Info, fetch sources for that run, then submit it. When it's collected, reload this page and the results show in the AI check column.`,
-      });
+      // Straight on to the web search + submit -- the old flow stopped here
+      // and made you finish on the Batch Coach-Info page.
+      setAiBusy(false);
+      await prepareAndSubmitRun(runRow.id);
+      return;
     } catch (err) {
       setAiNote({ kind: "danger", text: err.message || "Could not queue these schools." });
-    } finally {
-      setAiBusy(false);
     }
+    setAiBusy(false);
   };
 
   // Confirms every school in the list whose AI check matched the on-file
@@ -718,9 +864,15 @@ function NeedsReviewPageInner() {
                 className="btn btn-sm"
                 disabled={aiBusy || aiSendable.length === 0}
                 onClick={() => sendToAi(aiSendable)}
-                title="Queues these schools for an AI web check of who the head coach is now. Nothing is searched or charged until you fetch sources and submit the run on the Batch Coach-Info page."
+                title="One click: queues these schools, searches the web for each one's current head coach, and submits them to the AI. Keep this tab open for a couple of minutes while the searches run. Searches and AI time are charged."
               >
-                {aiBusy ? "Working…" : `Send ${Math.min(aiSendable.length, AI_SEND_CAP)}${aiSendable.length > AI_SEND_CAP ? ` of ${aiSendable.length}` : ""} to AI verification`}
+                {aiStep?.step === "fetch"
+                  ? `Searching the web… ${aiStep.done} of ${aiStep.total}`
+                  : aiStep?.step === "submit"
+                  ? "Sending to the AI…"
+                  : aiBusy
+                  ? "Working…"
+                  : `Send ${Math.min(aiSendable.length, AI_SEND_CAP)}${aiSendable.length > AI_SEND_CAP ? ` of ${aiSendable.length}` : ""} to AI verification`}
               </button>
               <button
                 className="btn btn-sm"
@@ -738,6 +890,31 @@ function NeedsReviewPageInner() {
             {aiNote && (
               <div className={`notice ${aiNote.kind === "danger" ? "danger" : "info"}`} style={{ marginBottom: 10, fontSize: 12.5 }}>
                 {aiNote.text}
+              </div>
+            )}
+            {aiRuns.length > 0 && (
+              <div style={{ marginBottom: 10, padding: "8px 10px", border: "1px solid #d7e3f3", background: "#f6f9fd", borderRadius: 8, fontSize: 12.5 }}>
+                <div style={{ fontWeight: 600, marginBottom: 4 }}>AI verification runs in progress</div>
+                {aiRuns.map((r) => {
+                  const mine = aiStep && aiStep.runId === r.id;
+                  return (
+                    <div key={r.id} style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "3px 0" }}>
+                      <span>
+                        <strong>Run #{r.id}</strong> · {r.requested_count} school{r.requested_count === 1 ? "" : "s"} · {RUN_STATUS_TEXT[r.status] || r.status}
+                      </span>
+                      {r.status === "collecting" ? (
+                        <button className="btn btn-sm" disabled={aiBusy} onClick={() => prepareAndSubmitRun(r.id)}>
+                          {mine && aiStep.step === "fetch" ? `Searching… ${aiStep.done} of ${aiStep.total}` : mine ? "Sending…" : "Fetch sources & submit"}
+                        </button>
+                      ) : (
+                        <button className="btn btn-sm" disabled={aiBusy} onClick={() => checkAndCollectRun(r.id)}>
+                          {mine && aiStep.step === "check" ? "Checking…" : mine && aiStep.step === "collect" ? "Collecting…" : "Check & collect"}
+                        </button>
+                      )}
+                    </div>
+                  );
+                })}
+                <div style={{ color: "#697386", fontSize: 11.5, marginTop: 2 }}>Anything the AI finishes is also collected automatically overnight; results then show in the AI check column.</div>
               </div>
             )}
             <div
