@@ -3,6 +3,8 @@ import { useState, useEffect, useCallback } from "react";
 import Link from "next/link";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
+import { assessCoachChange } from "@/lib/coachEmailFit";
+import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
 
 // Unified cross-tool Review Queue -- every PENDING suggestion from all four
 // AI batch discovery tools (Coach-Info, Athletics-URL, MaxPreps, Social
@@ -56,7 +58,7 @@ const TOOLS = [
     itemsTable: "coach_info_batch_items",
     href: "/admin/batch-coach-info",
     select:
-      "id,school_id,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_office,hc_cell,hc_twitter,hc_facebook,ad_name,ad_email)",
+      "id,batch_run_id,school_id,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_office,hc_cell,hc_twitter,hc_facebook,ad_name,ad_email,needs_review)",
   },
   {
     key: "athletics",
@@ -105,6 +107,31 @@ const APPLY_CONCURRENCY = 5;
 
 function rowKey(row) {
   return `${row.tool}:${row.id}`;
+}
+
+// What a coach-info suggestion would change on the school, run through the
+// same coach/email fit check Batch Coach-Info uses (lib/coachEmailFit.js).
+// "High confidence" speaks to WHO the coach is, not to whether the email on
+// the record belongs to them (Hemet High: right new coach, no email found,
+// previous coach's address left behind). Non-coach-info rows have nothing to
+// assess. Returns null for those.
+function assessRow(row) {
+  if (row.tool !== "coach_info") return null;
+  const s = row.school || {};
+  const sug = row.suggestion || {};
+  const proposed = {};
+  COACH_INFO_FIELDS.forEach((f) => {
+    const v = (sug[f] || "").trim();
+    if (v && v !== (s[f] || "")) proposed[f] = v;
+  });
+  return assessCoachChange(s, proposed, { emailEstimated: Boolean(sug.hc_email_estimated) });
+}
+
+// Left out of "Apply All High-Confidence": coach changes, and anything that
+// would leave a previous coach's email on the record. Reviewed one at a time.
+function isRiskyRow(row) {
+  const a = assessRow(row);
+  return Boolean(a && a.risky);
 }
 
 export default function ReviewQueuePage() {
@@ -202,6 +229,11 @@ export default function ReviewQueuePage() {
     toolCounts[t.key] = confidenceSearchFiltered.filter((r) => r.tool === t.key).length;
   });
 
+  // "Apply All High-Confidence" only takes the safe ones; coach changes and
+  // stale-email rows stay in the list for one-at-a-time review.
+  const highSafeCount = toolSearchFiltered.filter((r) => r.suggestion?.confidence === "high" && !isRiskyRow(r)).length;
+  const highRiskyCount = confidenceCounts.high - highSafeCount;
+
   const visibleRows = toolSearchFiltered.filter((r) => confidenceFilter === "all" || r.suggestion?.confidence === confidenceFilter);
   const clampedFocusedIndex = visibleRows.length === 0 ? 0 : Math.min(focusedIndex, visibleRows.length - 1);
   const focusedRow = visibleRows[clampedFocusedIndex] || null;
@@ -252,9 +284,28 @@ export default function ReviewQueuePage() {
         // Social suggestions (below) don't touch verification_status --
         // this is specifically about confirming a person's identity and
         // contact info, which only the coach-info tool suggests.
-        if (!sug.hc_email_estimated) {
+        //
+        // NOT stamped verified when the coach CHANGED and no real email for the
+        // new coach came with it (assessCoachChange.emailUnconfirmed) -- the
+        // Hemet High case. That write saves the new name, drops the record to
+        // not_verified, and flags it for Needs Review with a note saying
+        // what's missing, instead of calling a mismatched name/email pair
+        // "verified". Same rule as Batch Coach-Info's own Apply.
+        const assess = assessCoachChange(s, update, { emailEstimated: Boolean(sug.hc_email_estimated) });
+        if (assess.emailUnconfirmed) {
+          update.verification_status = "not_verified";
+          update.needs_review = true;
+          update.needs_review_note = assess.reviewNote(row.batch_run_id);
+          update.needs_review_marked_at = new Date().toISOString();
+          update.needs_review_marked_by = user.id;
+        } else if (!sug.hc_email_estimated) {
           update.verification_status = "verified";
           update.last_verified_at = new Date().toISOString();
+        }
+        // A real, confirmed email arriving WITH the apply resolves a Needs
+        // Review flag; anything less leaves the flag where it is.
+        if (update.hc_email && !assess.emailUnconfirmed) {
+          Object.assign(update, NEEDS_REVIEW_CLEAR_FIELDS);
         }
       } else if (row.tool === "athletics" || row.tool === "maxpreps") {
         const field = row.tool === "athletics" ? "athletics_url" : "maxpreps_url";
@@ -332,7 +383,7 @@ export default function ReviewQueuePage() {
   // filter and search box (ignoring the confidence tab itself, same as
   // each individual tool page's own bulk-apply button) in one click.
   async function bulkApplyHighConfidence() {
-    const targets = toolSearchFiltered.filter((r) => r.suggestion?.confidence === "high");
+    const targets = toolSearchFiltered.filter((r) => r.suggestion?.confidence === "high" && !isRiskyRow(r));
     if (!targets.length) return;
     setBulkApplying(true);
     setReviewError("");
@@ -450,10 +501,17 @@ export default function ReviewQueuePage() {
                 </button>
               ))}
             </div>
-            <button className="btn btn-gold btn-sm" onClick={bulkApplyHighConfidence} disabled={bulkApplying || confidenceCounts.high === 0}>
-              {bulkApplying ? `Applying ${bulkProgress.done}/${bulkProgress.total}…` : `Apply All High-Confidence (${confidenceCounts.high})`}
+            <button className="btn btn-gold btn-sm" onClick={bulkApplyHighConfidence} disabled={bulkApplying || highSafeCount === 0}>
+              {bulkApplying ? `Applying ${bulkProgress.done}/${bulkProgress.total}…` : `Apply All High-Confidence (${highSafeCount})`}
             </button>
           </div>
+
+          {highRiskyCount > 0 && (
+            <div className="notice" style={{ marginBottom: 10, fontSize: 12.5 }}>
+              <strong>{highRiskyCount}</strong> high-confidence {highRiskyCount === 1 ? "suggestion is" : "suggestions are"} a <strong>coach change</strong> (or would leave a previous coach&apos;s email on the record) and{" "}
+              {highRiskyCount === 1 ? "is" : "are"} left out of Apply All. High confidence means the AI is sure who the coach is, not that the email fits. Review {highRiskyCount === 1 ? "it" : "them"} one at a time.
+            </div>
+          )}
 
           {reviewError && (
             <div className="notice danger" style={{ marginBottom: 10, fontSize: 12.5 }}>
@@ -537,10 +595,23 @@ export default function ReviewQueuePage() {
                               const suggested = (sug[f] || "").trim();
                               return suggested && suggested !== (s[f] || "");
                             });
+                            const rowAssess = assessRow(row);
                             return changedFields.length === 0 ? (
                               <span style={{ color: "#9aa1ab" }}>No changes suggested</span>
                             ) : (
-                              changedFields.map((f) => (
+                              <>
+                              {rowAssess && rowAssess.nameChanged && rowAssess.emailUnconfirmed && (
+                                <div style={{ color: "#b3261e", fontWeight: 600, marginBottom: 3 }}>
+                                  Coach change: {rowAssess.oldName || "(blank)"} → {rowAssess.newName}.{" "}
+                                  {!rowAssess.finalEmail
+                                    ? "No email for the new coach."
+                                    : rowAssess.staleEmail
+                                    ? `Email on file (${rowAssess.finalEmail}) matches the previous coach.`
+                                    : `Email (${rowAssess.finalEmail}) isn't confirmed for the new coach.`}{" "}
+                                  Apply saves the new name as not verified and flags it for Needs Review.
+                                </div>
+                              )}
+                              {changedFields.map((f) => (
                                 <div key={f}>
                                   <strong>{COACH_INFO_FIELD_LABELS[f]}:</strong> {sug[f]}
                                   {s[f] ? <span style={{ color: "#9aa1ab" }}> (was: {s[f]})</span> : null}
@@ -548,7 +619,8 @@ export default function ReviewQueuePage() {
                                     <span style={{ color: "#8a6100", fontWeight: 600 }}> (pattern-estimated, not confirmed)</span>
                                   ) : null}
                                 </div>
-                              ))
+                              ))}
+                              </>
                             );
                           })()}
                         {(row.tool === "athletics" || row.tool === "maxpreps") && (
