@@ -156,6 +156,7 @@ function NeedsReviewPageInner() {
   const [rowNotes, setRowNotes] = useState({});
   const [savingIds, setSavingIds] = useState({});
   const [saveAllProgress, setSaveAllProgress] = useState(null); // { done, total }
+  const [aiNotesOpen, setAiNotesOpen] = useState({}); // schoolId -> true while "Why?" is open
   const [priorityOnly, setPriorityOnly] = useState(true);
   const [error, setError] = useState("");
 
@@ -380,6 +381,38 @@ function NeedsReviewPageInner() {
     });
   };
   const updateDraft = (id, field, value) => setEditDrafts((prev) => ({ ...prev, [id]: { ...(prev[id] || {}), [field]: value } }));
+  // What the AI web check found that differs from what's on file, as
+  // [{field, value, estimated}] -- the fields Quick Fix can fill in one click.
+  const aiFindings = (s) => {
+    const sg = s.ai_suggestion;
+    if (!sg) return [];
+    return EDIT_FIELDS.filter((f) => (sg[f] || "").trim() && (sg[f] || "").trim() !== (s[f] || "").trim()).map((f) => ({
+      field: f,
+      value: sg[f].trim(),
+      estimated: f === "hc_email" && sg.hc_email_estimated,
+    }));
+  };
+  const useAiField = (s, field) => {
+    const f = aiFindings(s).find((x) => x.field === field);
+    if (!f) return;
+    // A different email than what the draft started with is also no longer the
+    // "remove the old email" case, so untick that.
+    setEditDrafts((prev) => ({ ...prev, [s.id]: { ...(prev[s.id] || {}), [field]: f.value, ...(field === "hc_email" ? { __clearEmail: false } : {}) } }));
+  };
+  // Fills every AI finding except a pattern-guessed email, which has to be
+  // chosen on its own.
+  const useAiAll = (s) => {
+    const list = aiFindings(s).filter((x) => !x.estimated);
+    if (!list.length) return;
+    setEditDrafts((prev) => {
+      const next = { ...(prev[s.id] || {}) };
+      list.forEach((x) => {
+        next[x.field] = x.value;
+        if (x.field === "hc_email") next.__clearEmail = false;
+      });
+      return { ...prev, [s.id]: next };
+    });
+  };
   const openEditAllShown = () => {
     const targets = shownSchools.slice(0, EDIT_ALL_CAP);
     setEditDrafts((prev) => {
@@ -730,6 +763,7 @@ function NeedsReviewPageInner() {
               <tbody>
                 {shownSchools.map((s) => {
                   const stale = staleEmailInfo(s);
+                  const findings = aiFindings(s);
                   const draft = editDrafts[s.id] || {};
                   const editing = isEditing(s);
                   const saving = !!savingIds[s.id];
@@ -756,6 +790,12 @@ function NeedsReviewPageInner() {
                       {s.hc_email || <span style={{ color: "#a2a9b6" }}>—</span>}
                       {stale && (
                         <div style={{ fontSize: 11.5, color: "#b3261e", fontWeight: 600, maxWidth: 220 }}>⚠ Looks like the previous coach&apos;s email ({stale.priorLast})</div>
+                      )}
+                      {findings.find((x) => x.field === "hc_email") && (
+                        <div style={{ fontSize: 11.5, color: "#1e7145", maxWidth: 220, wordBreak: "break-all" }}>
+                          AI found: {findings.find((x) => x.field === "hc_email").value}
+                          {findings.find((x) => x.field === "hc_email").estimated ? " (guess)" : ""}
+                        </div>
                       )}
                     </td>
                     <td>{s.hc_cell || <span style={{ color: "#a2a9b6" }}>—</span>}</td>
@@ -806,6 +846,54 @@ function NeedsReviewPageInner() {
                           <span>Quick Fix — {s.name}</span>
                           <SchoolSiteLink school={s} />
                         </div>
+                        {s.ai_suggestion && (
+                          <div style={{ marginBottom: 10, padding: "8px 10px", background: "#f0f7f2", border: "1px solid #cfe6d7", borderRadius: 8, fontSize: 12.5 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", marginBottom: findings.length ? 6 : 0 }}>
+                              <strong style={{ color: "#1e7145" }}>AI web check</strong>
+                              <span style={{ color: "#697386", fontSize: 11.5 }}>
+                                run #{s.ai_suggestion.run_id}
+                                {s.ai_suggestion.mode ? ` (${String(s.ai_suggestion.mode).replace(/_/g, " ")})` : ""}
+                                {s.ai_suggestion.confidence ? ` · ${s.ai_suggestion.confidence} confidence` : ""}
+                              </span>
+                              {findings.length === 0 && <span style={{ color: "#697386" }}>— found nothing different from what's on file.</span>}
+                              {findings.some((x) => !x.estimated) && (
+                                <button className="btn btn-sm" onClick={() => useAiAll(s)} style={{ marginLeft: "auto" }}>
+                                  Use all
+                                </button>
+                              )}
+                            </div>
+                            {findings.map((x) => {
+                              const filled = (draft[x.field] || "").trim() === x.value;
+                              return (
+                                <div key={x.field} style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", padding: "2px 0" }}>
+                                  <span style={{ width: 90, color: "#697386" }}>{EDIT_LABELS[x.field]}</span>
+                                  <span style={{ fontWeight: 600, wordBreak: "break-all" }}>{x.value}</span>
+                                  {s[x.field] ? <span style={{ color: "#9aa1ab" }}>(on file: {s[x.field]})</span> : null}
+                                  {x.estimated && <span style={{ color: "#8a6100", fontWeight: 600 }}>pattern-estimated, never seen on a page</span>}
+                                  {filled ? (
+                                    <span style={{ color: "#1e7145", fontWeight: 600 }}>✓ filled in</span>
+                                  ) : (
+                                    <button className="btn btn-sm" onClick={() => useAiField(s, x.field)}>
+                                      Use this
+                                    </button>
+                                  )}
+                                </div>
+                              );
+                            })}
+                            {s.ai_suggestion.notes && (
+                              <div style={{ marginTop: 4 }}>
+                                <button
+                                  type="button"
+                                  onClick={() => setAiNotesOpen((prev) => ({ ...prev, [s.id]: !prev[s.id] }))}
+                                  style={{ background: "none", border: "none", padding: 0, color: "#5b7fb5", fontSize: 11.5, cursor: "pointer", textDecoration: "underline" }}
+                                >
+                                  {aiNotesOpen[s.id] ? "Hide reasoning" : "Why?"}
+                                </button>
+                                {aiNotesOpen[s.id] && <div style={{ marginTop: 2, fontStyle: "italic", color: "#697386" }}>&ldquo;{s.ai_suggestion.notes}&rdquo;{s.ai_suggestion.source ? ` — ${s.ai_suggestion.source}` : ""}</div>}
+                              </div>
+                            )}
+                          </div>
+                        )}
                         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(190px, 1fr))", gap: 8 }}>
                           {EDIT_FIELDS.map((f) => (
                             <label key={f} style={{ fontSize: 11.5, color: "#697386" }}>
