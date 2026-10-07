@@ -12,6 +12,7 @@
 import { NextResponse } from "next/server";
 import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
+import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
 
@@ -70,12 +71,17 @@ export async function POST(req) {
     });
     if (logErr) throw logErr;
 
+    // NEEDS_REVIEW_CLEAR_FIELDS (lib/needsReview.js): confirming a school here
+    // also lifts its needs_review flag. The queue now treats a flagged school
+    // as still needing review (see school_review_status), so without this a
+    // school someone just confirmed would keep reappearing in the queue.
     const { error: updateErr } = await admin
       .from("schools")
       .update({
         coach_radar_reviewed_at: new Date().toISOString(),
         verification_status: "verified",
         last_verified_at: new Date().toISOString(),
+        ...NEEDS_REVIEW_CLEAR_FIELDS,
       })
       .eq("id", schoolId);
     if (updateErr) throw updateErr;
