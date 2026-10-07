@@ -26,6 +26,11 @@ import { getSupabaseAdminClient } from "@/lib/supabase/admin";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
 const PRIORITY_STATES = ["TX", "FL", "GA", "CA", "OH", "IN"];
+// Per-state queue size cap. Was 500, which Texas (459 after the 10/5
+// paste-match flagging) was close to hitting -- a state with more than the
+// cap would silently hide the rest. The response now also carries
+// total_in_queue so the page can say so when a state IS truncated.
+const QUEUE_LIMIT = 1000;
 
 export async function GET(req) {
   try {
@@ -67,13 +72,20 @@ export async function GET(req) {
       return NextResponse.json({ states: withPriority });
     }
 
-    const { data, error } = await admin
+    // Flagged schools (needs_review = true, with their needs_review_note
+    // reason) come first -- those are the ones somebody specifically said
+    // need a second look -- then everything else alphabetically. Both
+    // flagged_needs_review and needs_review_note are columns of the
+    // school_review_status view (added when the view started honoring the
+    // needs_review flag).
+    const { data, error, count } = await admin
       .from("school_review_status")
-      .select("*")
+      .select("*", { count: "exact" })
       .eq("state", state)
       .eq("never_reviewed", true)
+      .order("flagged_needs_review", { ascending: false })
       .order("name", { ascending: true })
-      .limit(500);
+      .limit(QUEUE_LIMIT);
     if (error) throw error;
 
     // A same-day counter for the queue screen itself -- a positive "X
@@ -89,7 +101,7 @@ export async function GET(req) {
       .gte("coach_radar_reviewed_at", startOfToday.toISOString());
     if (countErr) throw countErr;
 
-    return NextResponse.json({ state, schools: data, reviewed_today: reviewedTodayCount || 0 });
+    return NextResponse.json({ state, schools: data, total_in_queue: count ?? data.length, reviewed_today: reviewedTodayCount || 0 });
   } catch (err) {
     console.error("needs-review GET error", err);
     return NextResponse.json({ error: "Could not load the Needs Review queue. Please try again." }, { status: 500 });
