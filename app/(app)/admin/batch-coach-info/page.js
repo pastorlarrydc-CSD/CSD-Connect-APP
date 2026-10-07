@@ -7,6 +7,7 @@ import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 import { fetchAllTouchedSchoolIds } from "@/lib/batchExclusion";
 import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
+import { assessCoachChange } from "@/lib/coachEmailFit";
 
 // Overnight Coach-Info Batch API job -- see the batch-coach-info-discovery
 // spec doc in the project for the full plan this implements. Turns the
@@ -446,6 +447,11 @@ function BatchCoachInfoPageInner() {
     SUGGESTION_FIELDS.forEach((f) => {
       draft[f] = (sug[f] || s[f] || "").toString();
     });
+    // Coach changed and no email found for the new coach: don't prefill the
+    // previous coach's address as if it belonged to them (the on-file value
+    // still shows as the placeholder, and the "remove" checkbox below can
+    // clear it).
+    if (assessItem(item).staleEmail && !(sug.hc_email || "").trim()) draft.hc_email = "";
     return draft;
   }
 
@@ -490,6 +496,7 @@ function BatchCoachInfoPageInner() {
       const v = (editDraft[f] || "").trim();
       if (v) effectiveFields[f] = v;
     });
+    if (editDraft.__clearEmail) effectiveFields.__clearEmail = true;
     const result = await applySuggestionFromCsv(item, effectiveFields);
     if (result.ok) {
       setItems((prev) => prev.map((i) => (i.id === item.id ? { ...i, review_status: result.changed ? "applied" : "skipped" } : i)));
@@ -572,7 +579,29 @@ function BatchCoachInfoPageInner() {
   // or a confirmed row would keep showing up in the "Confirm no data
   // available" section forever.
   const failedItems = suggestedItems.filter((i) => i.suggestion_error && i.review_status === "pending");
-  const highConfidencePendingCount = pendingReview.filter((i) => i.suggestion?.confidence === "high").length;
+  // What a suggestion would change on the school, as a {field: value} map of
+  // only the fields that differ from what's on file -- the same diff the table
+  // rows and applySuggestionCore both use. assessCoachChange (lib/coachEmailFit.js)
+  // reads it to tell a routine fill-in from a coach CHANGE, and whether the
+  // email that would be left on the record actually fits the coach.
+  function assessItem(item) {
+    const s = item.school || {};
+    const sug = item.suggestion || {};
+    const proposed = {};
+    SUGGESTION_FIELDS.forEach((f) => {
+      const v = (sug[f] || "").trim();
+      if (v && v !== (s[f] || "")) proposed[f] = v;
+    });
+    return assessCoachChange(s, proposed, { emailEstimated: Boolean(sug.hc_email_estimated) });
+  }
+  // "High" speaks to WHO the coach is, not to whether the email fits them
+  // (Hemet High: right new coach, no email found, old coach's address left
+  // behind). Coach changes and stale-email rows are never bulk-applied --
+  // they get reviewed one at a time.
+  const highPending = pendingReview.filter((i) => i.suggestion?.confidence === "high");
+  const highConfidenceSafeItems = highPending.filter((i) => !assessItem(i).risky);
+  const highConfidencePendingCount = highConfidenceSafeItems.length;
+  const highConfidenceRiskyCount = highPending.length - highConfidenceSafeItems.length;
 
   // Whether a run still has something actionable left -- a run that's not
   // "collected" yet is always still open (nothing to hide, it's mid-flight).
@@ -1256,7 +1285,22 @@ function BatchCoachInfoPageInner() {
       // autoApplyHighConfidenceSuggestion (lib/coachInfoLookup.js) -- that
       // path writes unattended overnight with nobody reviewing it at all,
       // so it must never claim a human verified anything.
-      if (!sug.hc_email_estimated) {
+      //
+      // Also not applied when the coach CHANGED and no real email for the new
+      // coach came with it (assessCoachChange.emailUnconfirmed) -- that's the
+      // Hemet High case: the name is right, but the previous coach's address
+      // is still sitting on the record. That write saves the new name, drops
+      // the record back to not_verified, and puts it in Needs Review with a
+      // note saying what's missing, instead of stamping a mismatched
+      // name/email pair "verified".
+      const assess = assessCoachChange(s, update, { emailEstimated: Boolean(sug.hc_email_estimated) });
+      if (assess.emailUnconfirmed) {
+        update.verification_status = "not_verified";
+        update.needs_review = true;
+        update.needs_review_note = assess.reviewNote(selectedRun?.id);
+        update.needs_review_marked_at = new Date().toISOString();
+        update.needs_review_marked_by = user.id;
+      } else if (!sug.hc_email_estimated) {
         update.verification_status = "verified";
         update.last_verified_at = new Date().toISOString();
       }
@@ -1273,7 +1317,7 @@ function BatchCoachInfoPageInner() {
         // and Import & Reconcile stay unconditional -- there a human is
         // reading the flag's own note and deciding by hand whether it's
         // resolved, which this AI-suggestion Apply path can't claim.
-        if (update.hc_email) {
+        if (update.hc_email && !assess.emailUnconfirmed) {
           Object.assign(update, NEEDS_REVIEW_CLEAR_FIELDS);
         }
         const { error: updateErr } = await supabase.from("schools").update(update).eq("id", s.id);
@@ -1348,6 +1392,20 @@ function BatchCoachInfoPageInner() {
       const update = {};
       const changes = [];
       let sawChange = false;
+      // Quick Fix's "remove the previous coach's email" checkbox. Only honored
+      // when no replacement email was typed -- a typed address always wins.
+      if (effectiveFields.__clearEmail && !(effectiveFields.hc_email || "").trim() && (s.hc_email || "").trim()) {
+        sawChange = true;
+        update.hc_email = null;
+        changes.push({
+          school_id: s.id,
+          field_name: "hc_email",
+          old_value: s.hc_email || null,
+          new_value: null,
+          source: "Batch AI lookup (previous coach's email removed, reviewed)",
+          changed_by: user.id,
+        });
+      }
       SUGGESTION_FIELDS.forEach((f) => {
         const newVal = (effectiveFields[f] || "").trim();
         if (!newVal || newVal === (s[f] || "")) return;
@@ -1362,7 +1420,19 @@ function BatchCoachInfoPageInner() {
         sawChange && changes.every((c) => c.field_name === "hc_email" && originalSug.hc_email_estimated && c.new_value === (originalSug.hc_email || "").trim());
 
       if (Object.keys(update).length > 0) {
-        if (!allChangesAreUnverifiedGuesses) {
+        // Same coach-change rule as applySuggestionCore: a new coach name with
+        // no new email typed/found is never stamped "verified" -- it's saved
+        // unverified and flagged for Needs Review with a note saying what's
+        // missing. (A human typing a real new email over it IS the
+        // confirmation, so that case still verifies.)
+        const assess = assessCoachChange(s, update, { emailEstimated: allChangesAreUnverifiedGuesses && Boolean(originalSug.hc_email_estimated) });
+        if (assess.emailUnconfirmed) {
+          update.verification_status = "not_verified";
+          update.needs_review = true;
+          update.needs_review_note = assess.reviewNote(selectedRun?.id);
+          update.needs_review_marked_at = new Date().toISOString();
+          update.needs_review_marked_by = user.id;
+        } else if (!allChangesAreUnverifiedGuesses) {
           update.verification_status = "verified";
           update.last_verified_at = new Date().toISOString();
         }
@@ -1370,7 +1440,7 @@ function BatchCoachInfoPageInner() {
         // only when hc_email is actually one of the fields this row
         // changed, not on any change (see the comment above that one for
         // what went wrong when this was unconditional).
-        if (update.hc_email) {
+        if (update.hc_email && !assess.emailUnconfirmed) {
           Object.assign(update, NEEDS_REVIEW_CLEAR_FIELDS);
         }
         const { error: updateErr } = await supabase.from("schools").update(update).eq("id", s.id);
@@ -1523,7 +1593,7 @@ function BatchCoachInfoPageInner() {
   // "no_name" targeting mode, a typical run of a few hundred schools often
   // has well over half land as high confidence.
   async function bulkApplyHighConfidence() {
-    const targets = pendingReview.filter((i) => i.suggestion?.confidence === "high");
+    const targets = pendingReview.filter((i) => i.suggestion?.confidence === "high" && !assessItem(i).risky);
     if (!targets.length) return;
     setBulkApplying(true);
     setReviewError("");
@@ -2210,6 +2280,14 @@ function BatchCoachInfoPageInner() {
                 />
               </div>
 
+              {highConfidenceRiskyCount > 0 && (
+                <div style={{ marginBottom: 10, padding: "10px 12px", background: "#fdf3e3", border: "1px solid #ecd3a3", borderRadius: 8, fontSize: 12.5 }}>
+                  <strong>{highConfidenceRiskyCount}</strong> high-confidence {highConfidenceRiskyCount === 1 ? "suggestion is" : "suggestions are"} a <strong>coach change</strong> (or would leave a
+                  previous coach's email on the record) and {highConfidenceRiskyCount === 1 ? "is" : "are"} left out of Apply All. High confidence means the AI is sure who the coach is, not that the
+                  email fits -- review these one at a time (look for the red ⚠ on the row).
+                </div>
+              )}
+
               {highConfidencePendingCount > 0 && (
                 <div
                   style={{
@@ -2375,8 +2453,8 @@ function BatchCoachInfoPageInner() {
                         // at the wrong school. Flag it so a reviewer's eye
                         // catches it before an Apply click, rather than
                         // relying on them to notice a quiet text diff.
-                        const hadPriorName = Boolean((s.hc_first_name || "").trim() || (s.hc_last_name || "").trim());
-                        const nameChanged = hadPriorName && (changedFields.includes("hc_first_name") || changedFields.includes("hc_last_name"));
+                        const rowAssess = assessItem(item);
+                        const nameChanged = rowAssess.nameChanged;
                         return [
                           <tr
                             key={item.id}
@@ -2441,6 +2519,17 @@ function BatchCoachInfoPageInner() {
                               {nameChanged && (
                                 <div style={{ color: "#b3261e", fontWeight: 600, marginBottom: 4 }}>
                                   ⚠ Different coach than on file — confirm this is the same program before applying
+                                </div>
+                              )}
+                              {nameChanged && rowAssess.emailUnconfirmed && !reviewed && (
+                                <div style={{ color: "#b3261e", marginBottom: 4 }}>
+                                  ⚠{" "}
+                                  {rowAssess.staleEmail
+                                    ? `Email on file (${rowAssess.finalEmail}) matches the previous coach (${rowAssess.oldName}), not ${rowAssess.newName}.`
+                                    : !rowAssess.finalEmail
+                                    ? `No email on file for ${rowAssess.newName}.`
+                                    : `No new email was confirmed for ${rowAssess.newName}.`}{" "}
+                                  Apply saves the new name but leaves the record <strong>not verified</strong> and in Needs Review until a correct email is added.
                                 </div>
                               )}
                               {changedFields.length === 0 ? (
@@ -2541,6 +2630,18 @@ function BatchCoachInfoPageInner() {
                                     </label>
                                   ))}
                                 </div>
+                                {rowAssess.staleEmail && (
+                                  <label style={{ display: "block", marginTop: 8, fontSize: 12, color: "#8a6100" }}>
+                                    <input
+                                      type="checkbox"
+                                      checked={Boolean(editDraft.__clearEmail)}
+                                      onChange={(e) => updateDraftField("__clearEmail", e.target.checked)}
+                                      style={{ marginRight: 6 }}
+                                    />
+                                    Remove the previous coach's email ({rowAssess.finalEmail}) — it matches {rowAssess.oldName}, not {rowAssess.newName}. Leave the Email box empty to
+                                    clear it, or type the new coach's email to replace it.
+                                  </label>
+                                )}
                                 {editError && (
                                   <div className="notice danger" style={{ marginTop: 8, fontSize: 12.5 }}>
                                     {editError}
