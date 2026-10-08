@@ -1,7 +1,7 @@
 // app/(app)/admin/needs-review/page.js
 "use client";
 
-import { useState, useEffect, useCallback, Suspense } from "react";
+import { useState, useEffect, useCallback, useRef, Suspense } from "react";
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
@@ -147,6 +147,8 @@ function CoverageBar({ pct }) {
   );
 }
 
+const LAST_STATE_KEY = "needsReviewLastState";
+
 function NeedsReviewPageInner() {
   const supabase = getSupabaseBrowserClient();
   const { profile, user } = useAuth();
@@ -225,6 +227,12 @@ function NeedsReviewPageInner() {
   const loadState = useCallback(
     async (state) => {
       setSelectedState(state);
+      // Remember the state this browser last worked in, so coming back to
+      // Needs Review later (from the Admin page, a bookmark, a new tab) opens
+      // straight into it instead of the state picker. "All states" clears it.
+      try {
+        window.localStorage.setItem(LAST_STATE_KEY, state);
+      } catch {}
       // Keep the state in the address bar, so a reload or the Back button lands
       // right back in this queue instead of the state picker.
       try {
@@ -274,6 +282,22 @@ function NeedsReviewPageInner() {
     if (canReview && stateFromUrl && stateFromUrl.toUpperCase() !== selectedState) loadState(stateFromUrl.toUpperCase());
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canReview, stateFromUrl]);
+
+  // No ?state= in the address bar (opened from the Admin page, a bookmark, a
+  // new tab): reopen the state worked in last. Runs once per page load, and
+  // never after the person has clicked "All states" on purpose (that clears
+  // the remembered state).
+  const triedLastState = useRef(false);
+  useEffect(() => {
+    if (!canReview || triedLastState.current) return;
+    triedLastState.current = true;
+    if (stateFromUrl) return;
+    try {
+      const last = (window.localStorage.getItem(LAST_STATE_KEY) || "").toUpperCase();
+      if (/^[A-Z]{2}$/.test(last)) loadState(last);
+    } catch {}
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [canReview]);
 
   // Save open edit drafts for this browser tab only, so nothing typed is lost.
   useEffect(() => {
@@ -812,7 +836,7 @@ function NeedsReviewPageInner() {
                 </span>
               )}
             </div>
-            <button className="btn btn-sm" onClick={() => { setSelectedState(null); try { window.history.replaceState(window.history.state, "", window.location.pathname); } catch {} }}>
+            <button className="btn btn-sm" onClick={() => { setSelectedState(null); try { window.localStorage.removeItem(LAST_STATE_KEY); } catch {} try { window.history.replaceState(window.history.state, "", window.location.pathname); } catch {} }}>
               ← All states
             </button>
           </div>
