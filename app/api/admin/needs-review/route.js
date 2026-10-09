@@ -122,15 +122,16 @@ export async function GET(req) {
       if (runsErr) throw runsErr;
       (runs || []).forEach((r) => runStatus.set(r.id, { status: r.status, collected_at: r.collected_at, created_at: r.created_at, candidate_mode: r.candidate_mode }));
     }
-    // school_review_status doesn't carry the athletics/website URLs, so they
-    // are read from schools here -- the Needs Review page shows an "Athletics
+    // school_review_status doesn't carry the athletics/website URLs or the
+    // street address (shown under the school name so a reviewer can tell
+    // same-named schools apart), so they are read from schools here -- the Needs Review page shows an "Athletics
     // site" link on every row so a reviewer can pull up the staff page.
     const siteBySchool = new Map();
     for (let i = 0; i < schoolRows.length; i += 200) {
       const chunk = schoolRows.slice(i, i + 200).map((s) => s.id);
-      const { data: sites, error: sitesErr } = await admin.from("schools").select("id,athletics_url,website").in("id", chunk);
+      const { data: sites, error: sitesErr } = await admin.from("schools").select("id,athletics_url,website,addr1,addr2,zip,county").in("id", chunk);
       if (sitesErr) throw sitesErr;
-      (sites || []).forEach((r) => siteBySchool.set(r.id, { athletics_url: r.athletics_url || null, website: r.website || null }));
+      (sites || []).forEach((r) => siteBySchool.set(r.id, { athletics_url: r.athletics_url || null, website: r.website || null, addr1: r.addr1 || null, addr2: r.addr2 || null, zip: r.zip || null, county: r.county || null }));
     }
     // What the AI found for a school, trimmed to what Quick Fix shows. Null when
     // there is no result, or it is older than AI_CHECK_MAX_AGE_DAYS.
@@ -157,7 +158,7 @@ export async function GET(req) {
       };
     };
     const schoolsWithAi = schoolRows.map((row) => {
-      const s = { ...row, ...(siteBySchool.get(row.id) || { athletics_url: null, website: null }) };
+      const s = { ...row, ...(siteBySchool.get(row.id) || { athletics_url: null, website: null, addr1: null, addr2: null, zip: null, county: null }) };
       const it = aiBySchool.get(s.id);
       if (!it) return { ...s, ai_check: null };
       // Only re_verify runs count (see AI_TRUSTED_MODE) -- results from
