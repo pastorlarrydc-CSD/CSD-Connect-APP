@@ -149,6 +149,13 @@ function CoverageBar({ pct }) {
 
 const LAST_STATE_KEY = "needsReviewLastState";
 
+// "123 Main St, Suite 4, Chicago, IL 60601" -- whatever parts are on file.
+// Shown under each school name so same-named schools are easy to tell apart.
+function schoolAddressLine(s) {
+  const cityState = [s.city, [s.state, s.zip].filter(Boolean).join(" ")].filter(Boolean).join(", ");
+  return [s.addr1, s.addr2, cityState].filter((x) => x && String(x).trim()).join(", ");
+}
+
 function NeedsReviewPageInner() {
   const supabase = getSupabaseBrowserClient();
   const { profile, user } = useAuth();
@@ -1004,7 +1011,7 @@ function NeedsReviewPageInner() {
                   <tr key={s.id}>
                     <td>
                       <Link href={`/schools/${s.id}`} target="_blank" rel="noopener noreferrer" title="Opens in a new tab so this queue stays open">{s.name}</Link>
-                      <div style={{ fontSize: 11.5, color: "#697386" }}>{s.city}</div>
+                      <div style={{ fontSize: 11.5, color: "#697386" }}>{schoolAddressLine(s)}</div>
                       <div style={{ marginTop: 3 }}>
                         <SchoolSiteLink school={s} />
                       </div>
