@@ -44,7 +44,7 @@ const FETCH_CONCURRENCY = 8; // matches the weekly automated cron's own concurre
 const APPLY_CONCURRENCY = 5; // applying is just a DB write, no web fetch/AI call, so higher concurrency than FETCH_CONCURRENCY is safe -- matches batch-athletics/batch-coach-info
 
 const ITEM_SELECT =
-  "id,batch_run_id,school_id,fetch_status,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,hc_first_name,hc_last_name,hc_twitter,hc_facebook,verification_status,last_verified_at,needs_review)";
+  "id,batch_run_id,school_id,fetch_status,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_twitter,hc_facebook,verification_status,last_verified_at,needs_review)";
 
 async function runWithConcurrency(items, limit, worker) {
   let next = 0;
@@ -171,6 +171,40 @@ function wasVerifiedElsewhere(item, run) {
   if (!s.last_verified_at) return false;
   return new Date(s.last_verified_at).getTime() > new Date(run.created_at).getTime();
 }
+
+// How far the coach name / email on a school's record can be trusted -- a
+// social handle found for a coach is only as good as the coach it was
+// searched for. If the name or email is wrong, the "high confidence" handle
+// belongs to the wrong person, so the confidence badge alone can't be the
+// signal for a one-click bulk apply. Returns { level, label, detail, safe }:
+//   verified   -- a person checked this record (verified, not flagged, email
+//                 not bounced, email doesn't look like the previous coach's)
+//   flagged    -- sitting in Needs Review: the coach or email is in doubt
+//   issue      -- the email on file hard-bounced
+//   unverified -- nobody has confirmed the coach or email yet
+// bouncedEmails: lowercase addresses that have hard-bounced for this school.
+function coachTrust(school, bouncedEmails) {
+  const s = school || {};
+  const email = String(s.hc_email || "").trim().toLowerCase();
+  if (s.needs_review) {
+    return { level: "flagged", label: "⚑ Flagged for review", detail: "Sitting in Needs Review -- the coach or email is in doubt, so a handle found for this coach may be the wrong person's.", safe: false };
+  }
+  if (email && (bouncedEmails || []).includes(email)) {
+    return { level: "issue", label: "✉ Email bounced", detail: "The email on file hard-bounced -- this coach record is likely out of date.", safe: false };
+  }
+  if (s.verification_status === "verified") {
+    const when = s.last_verified_at ? new Date(s.last_verified_at).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : null;
+    return { level: "verified", label: "✓ Coach & email verified", detail: when ? `Verified ${when}` : "Verified", safe: true };
+  }
+  return { level: "unverified", label: "Not verified", detail: "Nobody has confirmed this coach or email yet -- check it before trusting the handle.", safe: false };
+}
+
+const TRUST_STYLES = {
+  verified: { color: "#1e7145", background: "#1e71451a" },
+  unverified: { color: "#8a6100", background: "#8a610019" },
+  flagged: { color: "#b3261e", background: "#b3261e19" },
+  issue: { color: "#b3261e", background: "#b3261e19" },
+};
 
 function confidenceColor(confidence) {
   if (confidence === "high") return "#1e7145";
@@ -436,6 +470,14 @@ function BatchSocialPageInner() {
   // trusted and Applied here without opening the school's own profile to
   // cross-check the coach. Empty object for a normal (non-chained) run.
   const [coachInfoReviewMap, setCoachInfoReviewMap] = useState({});
+  // Hard-bounced emails per school for the open run ({schoolId: [email,...]}),
+  // read from email_bounce_events -- part of "can this coach record be
+  // trusted" (see coachTrust). bounceReady stays false until it has loaded (or
+  // if it fails), and until then NO row counts as safe to bulk apply.
+  const [bounceMap, setBounceMap] = useState({});
+  const [bounceReady, setBounceReady] = useState(false);
+  // "all" | "safe" (verified coach & email) | "check" (everything else)
+  const [trustFilter, setTrustFilter] = useState("all");
 
   const readyCount = items.filter((i) => i.fetch_status === "ready").length;
   const pendingFetchCount = items.filter((i) => i.fetch_status === "pending").length;
@@ -504,6 +546,15 @@ function BatchSocialPageInner() {
   const duplicateTwitterGroups = groupByValue((sug) => sug?.twitter_url);
   const duplicateFacebookGroups = groupByValue((sug) => sug?.facebook_url);
   const highConfidencePendingCount = pendingReview.filter((i) => i.suggestion?.confidence === "high").length;
+  // Trust of each row's coach/email record -- see coachTrust. Until the bounce
+  // history has loaded nothing counts as safe, so the one-click button can
+  // never fire on a record whose bounce status isn't known yet.
+  const trustOf = (item) => {
+    const t = coachTrust(item.school, bounceMap[item.school_id]);
+    return bounceReady ? t : { ...t, safe: false };
+  };
+  const safeHighPending = pendingReview.filter((i) => i.suggestion?.confidence === "high" && trustOf(i).safe);
+  const heldHighPendingCount = highConfidencePendingCount - safeHighPending.length;
   // Pending rows whose Coach-Info suggestion was already Applied -- the
   // "safe to trust, apply without opening the record" set. Any confidence
   // tier counts (not just high) because the trust signal here is about the
@@ -561,12 +612,18 @@ function BatchSocialPageInner() {
     // reviewBaseRows excludes reviewed items otherwise.
     reviewed: reviewBaseRows.filter((i) => i.review_status !== "pending").length,
   };
+  const trustCounts = {
+    all: reviewBaseRows.length,
+    safe: reviewBaseRows.filter((i) => trustOf(i).safe).length,
+    check: reviewBaseRows.filter((i) => !trustOf(i).safe).length,
+  };
+  const trustMatch = (i) => trustFilter === "all" || (trustFilter === "safe" ? trustOf(i).safe : !trustOf(i).safe);
   const visibleRows = reviewBaseRows.filter((i) => {
     // "reviewed" isn't a confidence tier -- it's a shortcut to the
     // already-reviewed rows so a reviewer can jump straight to the ones with
     // a reviewed-date badge instead of scrolling past every pending row first.
     const tierMatch = confidenceFilter === "reviewed" ? i.review_status !== "pending" : confidenceFilter === "all" || i.suggestion?.confidence === confidenceFilter;
-    return tierMatch && matchesSearch(i);
+    return tierMatch && trustMatch(i) && matchesSearch(i);
   });
 
   // Keyboard-nav targets mirror the table's own row filter (pendingReview
@@ -574,7 +631,7 @@ function BatchSocialPageInner() {
   // focused row always lines up with what's actually on screen -- reviewed
   // rows stay excluded here regardless of "Show already-reviewed" since
   // there's nothing left to apply/skip on one.
-  const keyboardTargets = pendingReview.filter((i) => (confidenceFilter === "all" || i.suggestion?.confidence === confidenceFilter) && matchesSearch(i));
+  const keyboardTargets = pendingReview.filter((i) => (confidenceFilter === "all" || i.suggestion?.confidence === confidenceFilter) && trustMatch(i) && matchesSearch(i));
   // Keeps the keyboard-focused row valid as keyboardTargets shrinks (typing
   // in the search box, narrowing the confidence filter, or applying/
   // skipping removes items) or a different run is opened.
@@ -587,7 +644,7 @@ function BatchSocialPageInner() {
   // else (or nothing at all).
   useEffect(() => {
     setFocusedIndex(0);
-  }, [confidenceFilter, searchQuery]);
+  }, [confidenceFilter, trustFilter, searchQuery]);
 
   // Keyboard shortcuts for the review queue -- Up/Down move focus between
   // pending rows, A applies the focused row, S skips it. Only active while
@@ -721,6 +778,44 @@ function BatchSocialPageInner() {
   useEffect(() => {
     if (selectedRunId) loadItems(selectedRunId);
   }, [selectedRunId, loadItems]);
+
+  // Loads the bounce history for the schools in the open run -- see
+  // bounceMap's comment. Pages in chunks of 200 ids so the request URL stays
+  // short and a big run can't hit the 1000-row response cap.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const ids = Array.from(new Set(items.map((i) => i.school_id).filter(Boolean)));
+      setBounceReady(false);
+      if (ids.length === 0) {
+        if (!cancelled) {
+          setBounceMap({});
+          setBounceReady(true);
+        }
+        return;
+      }
+      try {
+        const map = {};
+        for (let i = 0; i < ids.length; i += 200) {
+          const { data, error } = await supabase.from("email_bounce_events").select("school_id,bounced_email").in("school_id", ids.slice(i, i + 200));
+          if (error) throw error;
+          (data || []).forEach((r) => {
+            (map[r.school_id] = map[r.school_id] || []).push(String(r.bounced_email || "").trim().toLowerCase());
+          });
+        }
+        if (!cancelled) {
+          setBounceMap(map);
+          setBounceReady(true);
+        }
+      } catch (err) {
+        console.error("batch-social bounce history load failed", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // items.length changes when a run's items load; selectedRunId when another run opens
+  }, [items.length, selectedRunId, supabase]);
 
   // Loads coachInfoReviewMap for the currently-open run -- only meaningful
   // when this run has a source_coach_info_run_id (i.e. it was started via
@@ -1078,7 +1173,10 @@ function BatchSocialPageInner() {
   // rather than as a later upgrade, since the review-speed lesson from
   // those two tools is already learned.
   async function bulkApplyHighConfidence() {
-    const targets = pendingReview.filter((i) => i.suggestion?.confidence === "high");
+    // Only high-confidence rows whose coach & email are verified (see
+    // coachTrust) -- on an unverified/flagged record the coach may be wrong,
+    // which would make the "high confidence" handle the wrong person's.
+    const targets = safeHighPending;
     if (!targets.length) return;
     setBulkApplying(true);
     setReviewError("");
@@ -1299,6 +1397,7 @@ function BatchSocialPageInner() {
         "current_facebook",
         "suggested_facebook",
         "confidence",
+        "coach_status",
         "reasoning",
         "status",
       ],
@@ -1316,6 +1415,7 @@ function BatchSocialPageInner() {
           s.hc_facebook || "",
           sug.facebook_url || "",
           sug.confidence || "",
+          coachTrust(s, bounceMap[s.id]).label.replace(/^[^A-Za-z]+/, ""),
           sug.reasoning || "",
           item.review_status === "pending"
             ? "Pending"
@@ -1608,6 +1708,22 @@ function BatchSocialPageInner() {
                     );
                   })}
                 </div>
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }} title="Whether the coach name and email on the record have been verified by a person">
+                  {[
+                    ["all", "Any coach status"],
+                    ["safe", "✓ Verified coach & email"],
+                    ["check", "⚠ Check coach first"],
+                  ].map(([key, label]) => (
+                    <button
+                      key={key}
+                      className="btn btn-sm"
+                      onClick={() => setTrustFilter(key)}
+                      style={trustFilter === key ? { background: "#1e7145", borderColor: "#1e7145", color: "#fff" } : undefined}
+                    >
+                      {label} ({trustCounts[key]})
+                    </button>
+                  ))}
+                </div>
                 <input
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
@@ -1631,12 +1747,29 @@ function BatchSocialPageInner() {
                     borderRadius: 8,
                   }}
                 >
-                  <span style={{ fontSize: 12.5 }}>
-                    <strong>{highConfidencePendingCount}</strong> of those are <strong>high confidence</strong> -- the AI was confident the account it picked is unambiguously this coach's
-                    own. These are safe to clear in one click instead of reviewing one at a time.
+                  <span style={{ fontSize: 12.5, maxWidth: 780 }}>
+                    <strong>{safeHighPending.length}</strong> high-confidence suggestion{safeHighPending.length === 1 ? "" : "s"} {safeHighPending.length === 1 ? "is" : "are"} on records whose{" "}
+                    <strong>coach &amp; email are already verified</strong> -- safe to clear in one click.
+                    {heldHighPendingCount > 0 && (
+                      <>
+                        {" "}
+                        <strong style={{ color: "#8a6100" }}>{heldHighPendingCount} more are held back</strong> because their coach or email isn&apos;t verified (or is flagged / bounced) -- if the
+                        coach is wrong, the handle is too. Check those one at a time.{" "}
+                        <button
+                          className="btn btn-sm"
+                          onClick={() => {
+                            setConfidenceFilter("high");
+                            setTrustFilter("check");
+                          }}
+                        >
+                          Show the {heldHighPendingCount} held back
+                        </button>
+                      </>
+                    )}
+                    {!bounceReady && <span style={{ color: "#8a6100" }}> Checking bounce history…</span>}
                   </span>
-                  <button className="btn btn-gold btn-sm" onClick={bulkApplyHighConfidence} disabled={bulkApplying}>
-                    {bulkApplying ? `Applying ${bulkProgress.done} of ${bulkProgress.total}…` : `Apply All High-Confidence (${highConfidencePendingCount})`}
+                  <button className="btn btn-gold btn-sm" onClick={bulkApplyHighConfidence} disabled={bulkApplying || safeHighPending.length === 0}>
+                    {bulkApplying ? `Applying ${bulkProgress.done} of ${bulkProgress.total}…` : `Apply Verified High-Confidence (${safeHighPending.length})`}
                   </button>
                 </div>
               )}
@@ -1817,6 +1950,18 @@ function BatchSocialPageInner() {
                             <div style={{ color: "#9aa1ab" }}>
                               {[s.hc_first_name, s.hc_last_name].filter(Boolean).join(" ") || "(no coach name)"}
                             </div>
+                            {(() => {
+                              const t = trustOf(item);
+                              const st = TRUST_STYLES[t.level] || TRUST_STYLES.unverified;
+                              return (
+                                <div style={{ marginTop: 3 }} title={t.detail}>
+                                  <span className="badge" style={{ fontSize: 10.5, fontWeight: 600, color: st.color, background: st.background }}>
+                                    {t.label}
+                                  </span>
+                                  {t.level === "verified" && t.detail !== "Verified" && <span style={{ fontSize: 10.5, color: "#9aa1ab", marginLeft: 4 }}>{t.detail.replace("Verified ", "")}</span>}
+                                </div>
+                              );
+                            })()}
                             {wasVerifiedElsewhere(item, selectedRun) && (
                               <span className="badge" style={{ fontSize: 10.5, color: "#1e7145", background: "#1e714519", fontWeight: 600, marginTop: 2, display: "inline-block" }}>
                                 ✓ Verified elsewhere since this run started
