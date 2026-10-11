@@ -7,6 +7,7 @@ import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 import { fetchAllTouchedSchoolIds } from "@/lib/batchExclusion";
 import { isEligibleSocialClassification } from "@/lib/socialLookup";
+import { linkableUrl } from "@/lib/needsReviewEdit";
 
 // Overnight Social Media Batch API job -- the social-handle counterpart to
 // /admin/batch-athletics (see that page for the pattern this mirrors, and
@@ -205,6 +206,30 @@ const TRUST_STYLES = {
   flagged: { color: "#b3261e", background: "#b3261e19" },
   issue: { color: "#b3261e", background: "#b3261e19" },
 };
+
+// A handle URL the AI found (or one already on file) as a live link that opens
+// in a NEW tab, so the review screen stays put while the account is checked.
+// Shown without the https://www. noise so a long list stays readable; the full
+// address is in the tooltip. A value that can't be made into a safe web
+// address is shown as plain text instead of a link.
+function SocialLink({ url }) {
+  const href = linkableUrl(url);
+  if (!href) return <span>{url}</span>;
+  const shown = href.replace(/^https?:\/\/(www\.)?/i, "").replace(/\/$/, "");
+  return (
+    <a href={href} target="_blank" rel="noopener noreferrer" title={`Open ${href} in a new tab`} style={{ color: "#0b5fff", textDecoration: "underline", wordBreak: "break-all" }}>
+      {shown} ↗
+    </a>
+  );
+}
+
+// A Google search for this coach at this school, to check a handle (or find
+// one) when the AI's pick looks doubtful.
+function coachSearchUrl(school) {
+  const coach = [school?.hc_first_name, school?.hc_last_name].filter(Boolean).join(" ");
+  const q = [coach, school?.name, school?.city, school?.state, "football coach twitter facebook"].filter(Boolean).join(" ");
+  return `https://www.google.com/search?q=${encodeURIComponent(q)}`;
+}
 
 function confidenceColor(confidence) {
   if (confidence === "high") return "#1e7145";
@@ -1998,23 +2023,32 @@ function BatchSocialPageInner() {
                               <strong>Twitter/X:</strong>{" "}
                               {sug.twitter_url ? (
                                 <>
-                                  {sug.twitter_url}
+                                  <SocialLink url={sug.twitter_url} />
                                   {s.hc_twitter && s.hc_twitter !== sug.twitter_url ? <span style={{ color: "#9aa1ab" }}> (was: {s.hc_twitter})</span> : null}
                                 </>
+                              ) : s.hc_twitter ? (
+                                <SocialLink url={s.hc_twitter} />
                               ) : (
-                                <span style={{ color: "#9aa1ab" }}>{s.hc_twitter || "(blank)"}</span>
+                                <span style={{ color: "#9aa1ab" }}>(blank)</span>
                               )}
                             </div>
                             <div>
                               <strong>Facebook:</strong>{" "}
                               {sug.facebook_url ? (
                                 <>
-                                  {sug.facebook_url}
+                                  <SocialLink url={sug.facebook_url} />
                                   {s.hc_facebook && s.hc_facebook !== sug.facebook_url ? <span style={{ color: "#9aa1ab" }}> (was: {s.hc_facebook})</span> : null}
                                 </>
+                              ) : s.hc_facebook ? (
+                                <SocialLink url={s.hc_facebook} />
                               ) : (
-                                <span style={{ color: "#9aa1ab" }}>{s.hc_facebook || "(blank)"}</span>
+                                <span style={{ color: "#9aa1ab" }}>(blank)</span>
                               )}
+                            </div>
+                            <div style={{ marginTop: 3 }}>
+                              <a href={coachSearchUrl(s)} target="_blank" rel="noopener noreferrer" style={{ color: "#5b7fb5", fontSize: 11.5, textDecoration: "underline" }} title="Search Google for this coach at this school">
+                                Search Google for this coach ↗
+                              </a>
                             </div>
                             {sug.reasoning && (
                               <div style={{ marginTop: 4 }}>
