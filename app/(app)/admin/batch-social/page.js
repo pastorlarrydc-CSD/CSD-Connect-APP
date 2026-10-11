@@ -225,6 +225,12 @@ function BatchSocialPageInner() {
   // option) comfortably covers any single state's real gap today. See
   // state_data_coverage.
   const [targetCount, setTargetCount] = useState(stateFromUrl ? 1000 : DEFAULT_TARGET_COUNT);
+  // On (the default): schools already marked "verified" are eligible too. A
+  // verified school's coach/email were checked by a person, but its social
+  // handles usually weren't -- so once a state's coach data is finished (every
+  // school verified), excluding verified schools left this tool with almost
+  // nothing to pull. Off: the older behavior (skip every verified school).
+  const [includeVerified, setIncludeVerified] = useState(true);
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState("");
 
@@ -768,54 +774,52 @@ function BatchSocialPageInner() {
       // Missing either handle (not necessarily both) is enough to qualify,
       // since a school might already have a Twitter but not a Facebook, or
       // vice versa, and this run can still fill in whichever's missing.
-      let query = supabase
-        .from("schools")
-        .select("id,name,city,state,classification,hc_first_name,hc_last_name")
-        .not("hc_first_name", "is", null)
-        .neq("hc_first_name", "")
-        .not("hc_last_name", "is", null)
-        .neq("hc_last_name", "")
-        .or("hc_twitter.is.null,hc_twitter.eq.,hc_facebook.is.null,hc_facebook.eq.")
-        // Skip schools a human has already confirmed have no social media --
-        // otherwise they'd resurface here forever (blank fields look the
-        // same as "not yet checked"). See lib/dataQuality.js.
-        .eq("social_not_available", false)
-        // Closed/discontinued schools will never have real social media to
-        // find -- see lib/dataQuality.js.
-        .eq("is_closed", false)
-        // Skip schools Larry has already marked reviewed/confirmed-accurate
-        // (verification_status = "verified") even if the handle fields
-        // above still read blank -- a human already looked at this record,
-        // so it shouldn't come back through an automated sweep. Doesn't
-        // affect the single-school "Find Social Media" button on a
-        // school's own profile, which is still there any time someone
-        // wants to force a fresh look at one specific school.
-        .neq("verification_status", "verified")
-        .order("id", { ascending: true })
-        // Was targetCount * 3. Bumped once a scope can also lose a big
-        // chunk of rows to isEligibleSocialClassification (TX/GA/IN/CA/OH
-        // now only keep their bigger classification tiers) stacked on top
-        // of the existing exclusion filter -- 3x headroom was already
-        // tight with just one filter and could under-fill a run's target
-        // count in a heavily-filtered state even when plenty more eligible
-        // schools exist further down the id-ordered list.
-        .limit(targetCount * 6);
-      if (scopeMode !== "all" || states.length) {
-        query = query.in("state", states);
-      }
+      const buildQuery = () => {
+        let q = supabase
+          .from("schools")
+          .select("id,name,city,state,classification,hc_first_name,hc_last_name")
+          .not("hc_first_name", "is", null)
+          .neq("hc_first_name", "")
+          .not("hc_last_name", "is", null)
+          .neq("hc_last_name", "")
+          .or("hc_twitter.is.null,hc_twitter.eq.,hc_facebook.is.null,hc_facebook.eq.")
+          // Skip schools a human has already confirmed have no social media --
+          // otherwise they'd resurface here forever (blank fields look the
+          // same as "not yet checked"). See lib/dataQuality.js.
+          .eq("social_not_available", false)
+          // Closed/discontinued schools will never have real social media to
+          // find -- see lib/dataQuality.js.
+          .eq("is_closed", false)
+          .order("id", { ascending: true });
+        // Verified schools are skipped only when "Include verified schools"
+        // is turned off -- see includeVerified's comment above. (This is
+        // about the coach/email check; it says nothing about social handles.)
+        if (!includeVerified) q = q.neq("verification_status", "verified");
+        if (scopeMode !== "all" || states.length) q = q.in("state", states);
+        return q;
+      };
 
-      const { data: rawSchoolsData, error: schoolsErr } = await query;
-      if (schoolsErr) throw schoolsErr;
+      // Supabase returns at most 1000 rows per request no matter what
+      // .limit() asks for, and the exclusion + classification filters below
+      // run client-side -- so page through the id-ordered list 1000 at a
+      // time until enough eligible schools are collected (or it runs out),
+      // instead of one capped request that can come back nearly empty.
       // isEligibleSocialClassification is a no-op (always true) for any
       // state outside lib/socialLookup's CLASSIFICATION_FILTERED_STATES --
       // see that file's comment for why TX/GA/IN/CA/OH specifically get
       // narrowed to their bigger classification tiers and every other
       // state doesn't.
-      const schoolsData = (rawSchoolsData || [])
-        .filter((s) => !excludedIds.has(s.id) && isEligibleSocialClassification(s.state, s.classification))
-        .slice(0, targetCount);
+      const schoolsData = [];
+      for (let from = 0; schoolsData.length < targetCount; from += 1000) {
+        const { data: chunk, error: schoolsErr } = await buildQuery().range(from, from + 999);
+        if (schoolsErr) throw schoolsErr;
+        (chunk || []).forEach((sc) => {
+          if (schoolsData.length < targetCount && !excludedIds.has(sc.id) && isEligibleSocialClassification(sc.state, sc.classification)) schoolsData.push(sc);
+        });
+        if (!chunk || chunk.length < 1000) break;
+      }
       if (!schoolsData || schoolsData.length === 0) {
-        setCreateError("No schools matched -- everyone with a coach name on file in this scope already has both a Twitter/X and Facebook handle, has already been through this tool before, or falls below the classification tier this scope now searches.");
+        setCreateError("No schools matched -- everyone with a coach name on file in this scope already has both a Twitter/X and Facebook handle, has already been through this tool before, or falls below the classification tier this scope now searches." + (includeVerified ? "" : " (Verified schools are currently skipped -- tick \"Include verified schools\" to bring them in.)"));
         return;
       }
 
@@ -1409,6 +1413,10 @@ function BatchSocialPageInner() {
                 style={{ maxWidth: 360 }}
               />
             )}
+            <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
+              <input type="checkbox" checked={includeVerified} onChange={(e) => setIncludeVerified(e.target.checked)} />
+              Include schools already marked verified (their coach/email were checked, but their social handles usually weren&apos;t)
+            </label>
             <label style={{ fontSize: 13 }}>
               How many schools:{" "}
               <select value={targetCount} onChange={(e) => setTargetCount(Number(e.target.value))}>
