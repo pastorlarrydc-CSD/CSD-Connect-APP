@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
+import { settleReVerifyItem } from "@/lib/backlogVerify";
 import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion, autoConfirmNoDataAvailable, runWithConcurrency, findDuplicateNameSchoolsForMany } from "@/lib/coachInfoLookup";
 import { normalizeAthleticsSuggestion } from "@/lib/athleticsLookup";
 import { normalizeMaxPrepsSuggestion } from "@/lib/maxPrepsLookup";
@@ -325,6 +326,11 @@ export async function GET(req) {
         let autoApplyHeld = 0;
         let autoConfirmed = 0;
         let autoConfirmErrors = 0;
+        // Backlog verification (re_verify runs only) -- see lib/backlogVerify.js
+        let reVerifyConfirmed = 0;
+        let reVerifyFlagged = 0;
+        let reVerifySkipped = 0;
+        let reVerifyErrors = 0;
 
         // Processed COLLECT_CONCURRENCY-at-a-time rather than one line at a
         // time -- see COLLECT_CONCURRENCY's comment above. The counters
@@ -373,6 +379,7 @@ export async function GET(req) {
           // whole -- every suggestion from a bounce_recovery run still lands
           // in the review queue for a human Apply click, same as
           // medium/low-confidence suggestions from any other run.
+          let lastApplyResult = null;
           if (!itemErr && tool.autoApplyHighConfidence && run.candidate_mode !== "bounce_recovery" && patch.suggestion?.confidence === "high") {
             const schoolId = schoolIdByItemId?.get(itemId);
             if (schoolId) {
@@ -384,6 +391,7 @@ export async function GET(req) {
                 suggestion: patch.suggestion,
                 actorUserId: SYSTEM_USER_ID,
               });
+              lastApplyResult = applyResult;
               if (applyResult.applied) autoApplied++;
               else if (applyResult.held) {
                 // Not an error -- autoApplyHighConfidenceSuggestion itself
@@ -397,6 +405,31 @@ export async function GET(req) {
                 autoApplyErrors++;
                 console.error(`cron collect-batch-runs: auto-apply error for ${tool.key} run ${run.id} item ${itemId}`, applyResult.error);
               }
+            }
+          }
+
+          // Backlog verification: a re_verify result for a school that is
+          // not verified and not flagged is settled right here -- verified
+          // if the fresh web check matched the on-file coach AND email at
+          // high confidence, flagged for Needs Review if it found a
+          // different coach, otherwise left exactly as it was.
+          if (!itemErr && tool.key === "coach_info" && run.candidate_mode === "re_verify" && patch.suggestion) {
+            const schoolId = schoolIdByItemId?.get(itemId);
+            if (schoolId) {
+              const settled = await settleReVerifyItem({
+                supabase,
+                schoolId,
+                runId: run.id,
+                suggestion: patch.suggestion,
+                applyResult: lastApplyResult,
+                actorUserId: SYSTEM_USER_ID,
+              });
+              if (settled.outcome === "confirmed") reVerifyConfirmed++;
+              else if (settled.outcome === "flagged") reVerifyFlagged++;
+              else if (settled.outcome === "error") {
+                reVerifyErrors++;
+                console.error(`cron collect-batch-runs: re-verify settle error for run ${run.id} item ${itemId}`, settled.reason);
+              } else reVerifySkipped++;
             }
           }
 
@@ -444,10 +477,14 @@ export async function GET(req) {
           auto_apply_errors: autoApplyErrors,
           auto_confirmed_no_data: autoConfirmed,
           auto_confirm_errors: autoConfirmErrors,
+          ...(tool.key === "coach_info" && run.candidate_mode === "re_verify"
+            ? { re_verify_confirmed: reVerifyConfirmed, re_verify_flagged: reVerifyFlagged, re_verify_skipped: reVerifySkipped, re_verify_errors: reVerifyErrors }
+            : {}),
         });
         console.log(
           `cron collect-batch-runs: collected ${tool.key} run ${run.id} -- ${succeeded} succeeded, ${failed} failed` +
             (tool.notAvailableField ? `, ${autoConfirmed} auto-confirmed no-data, ${autoConfirmErrors} auto-confirm errors` : "") +
+            (tool.key === "coach_info" && run.candidate_mode === "re_verify" ? `, re-verify: ${reVerifyConfirmed} verified, ${reVerifyFlagged} flagged, ${reVerifySkipped} left as-is, ${reVerifyErrors} errors` : "") +
             (tool.autoApplyHighConfidence ? `, ${autoApplied} auto-applied, ${autoApplyHeld} held for review (would overwrite existing name/email), ${autoApplyErrors} auto-apply errors` : "")
         );
       }
