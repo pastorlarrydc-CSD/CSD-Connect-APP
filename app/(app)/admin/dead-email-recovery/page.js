@@ -28,6 +28,13 @@ import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
 // run on its own; it's still shown here (toggle-able) for full visibility,
 // since a person coming back to this page wants the whole picture of
 // what's currently broken, not just the stuck half.
+// "123 Main St, Suite 4, Delray Beach, FL 33444" -- whatever parts are on file.
+function addressLine(r, extra) {
+  const e = extra || {};
+  const cityState = [r.city, [r.state, e.zip].filter(Boolean).join(" ")].filter(Boolean).join(", ");
+  return [e.addr1, e.addr2, cityState].filter((x) => x && String(x).trim()).join(", ");
+}
+
 export default function DeadEmailRecoveryPage() {
   const supabase = getSupabaseBrowserClient();
   const router = useRouter();
@@ -38,11 +45,64 @@ export default function DeadEmailRecoveryPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [onlyStuck, setOnlyStuck] = useState(true);
+  // Schools a reviewer already clicked "Confirm -- same address" on stay in
+  // dead_email_schools on purpose (the bounce history is kept), but they are
+  // finished work -- hide them by default so "select all" can't re-send them.
+  const [hideConfirmed, setHideConfirmed] = useState(true);
+  // What the last Coach-Info AI pass found for each school, and the street
+  // address, keyed by school id. Loaded after the main list.
+  const [extras, setExtras] = useState({});
+  // "all" | "different" | "same" | "none" -- filters by what the AI found.
+  const [aiFilter, setAiFilter] = useState("all");
   const [selected, setSelected] = useState(() => new Set());
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState("");
   const [confirming, setConfirming] = useState(false);
   const [confirmError, setConfirmError] = useState("");
+
+  // For every listed school: the street address, and what the MOST RECENT
+  // Coach-Info item for it suggested. Loaded in chunks of 100 school ids so a
+  // single request never gets near PostgREST's 1000-row cap.
+  async function loadExtras(list) {
+    const ids = list.map((r) => r.school_id);
+    const next = {};
+    for (let i = 0; i < ids.length; i += 100) {
+      const chunk = ids.slice(i, i + 100);
+      const [{ data: schoolRows }, { data: itemRows }] = await Promise.all([
+        supabase.from("schools").select("id,addr1,addr2,zip").in("id", chunk),
+        supabase
+          .from("coach_info_batch_items")
+          .select("id,school_id,review_status,suggestion")
+          .in("school_id", chunk)
+          .order("id", { ascending: false })
+          .limit(1000),
+      ]);
+      (schoolRows || []).forEach((sc) => {
+        next[sc.id] = { ...(next[sc.id] || {}), addr1: sc.addr1, addr2: sc.addr2, zip: sc.zip };
+      });
+      const seen = new Set();
+      (itemRows || []).forEach((it) => {
+        if (seen.has(it.school_id)) return; // newest first -- keep only the latest
+        seen.add(it.school_id);
+        next[it.school_id] = {
+          ...(next[it.school_id] || {}),
+          sugEmail: String(it.suggestion?.hc_email || "").trim(),
+          confidence: it.suggestion?.confidence || "",
+          reviewStatus: it.review_status || "",
+        };
+      });
+    }
+    setExtras(next);
+  }
+
+  // "different" = the AI proposed another email, "same" = it re-found the
+  // address that bounced, "none" = it found no email at all.
+  function aiResult(r) {
+    const e = extras[r.school_id];
+    if (!e || e.sugEmail === undefined) return "none";
+    if (!e.sugEmail) return "none";
+    return e.sugEmail.toLowerCase() === String(r.hc_email || "").trim().toLowerCase() ? "same" : "different";
+  }
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -57,6 +117,7 @@ export default function DeadEmailRecoveryPage() {
         .limit(2000);
       if (err) throw err;
       setRows(data || []);
+      await loadExtras(data || []);
     } catch (err) {
       setError(err.message || "Could not load dead-email schools.");
     } finally {
@@ -69,9 +130,30 @@ export default function DeadEmailRecoveryPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canReview]);
 
-  const visibleRows = useMemo(() => (onlyStuck ? rows.filter((r) => r.ever_touched_by_coach_info) : rows), [rows, onlyStuck]);
-  const stuckCount = useMemo(() => rows.filter((r) => r.ever_touched_by_coach_info).length, [rows]);
-  const neverTriedCount = rows.length - stuckCount;
+  // Everything still open (not already confirmed by a person).
+  const openRows = useMemo(() => rows.filter((r) => !r.manually_confirmed_at), [rows]);
+  const confirmedCount = rows.length - openRows.length;
+  const baseRows = hideConfirmed ? openRows : rows;
+  const visibleRows = useMemo(() => {
+    let list = onlyStuck ? baseRows.filter((r) => r.ever_touched_by_coach_info) : baseRows;
+    if (aiFilter !== "all") list = list.filter((r) => aiResult(r) === aiFilter);
+    return list;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [baseRows, onlyStuck, aiFilter, extras]);
+  const aiCounts = useMemo(() => {
+    const c = { all: 0, different: 0, same: 0, none: 0 };
+    (onlyStuck ? baseRows.filter((r) => r.ever_touched_by_coach_info) : baseRows).forEach((r) => {
+      c.all += 1;
+      c[aiResult(r)] += 1;
+    });
+    return c;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [baseRows, onlyStuck, extras]);
+  const stuckCount = useMemo(() => openRows.filter((r) => r.ever_touched_by_coach_info).length, [openRows]);
+  const neverTriedCount = openRows.length - stuckCount;
+  // Only rows that are on screen AND ticked count -- a row hidden by a filter
+  // is never sent or confirmed by accident.
+  const selectedVisible = useMemo(() => visibleRows.filter((r) => selected.has(r.school_id)), [visibleRows, selected]);
 
   function toggleOne(schoolId) {
     setSelected((prev) => {
@@ -105,7 +187,7 @@ export default function DeadEmailRecoveryPage() {
   // has, by definition, already been through the tool before (that's why
   // it's stuck), so re-including them is the whole point.
   async function sendSelectedForRetry() {
-    const selectedRows = rows.filter((r) => selected.has(r.school_id));
+    const selectedRows = selectedVisible;
     if (selectedRows.length === 0) return;
     setSending(true);
     setSendError("");
@@ -160,7 +242,7 @@ export default function DeadEmailRecoveryPage() {
   // manually_confirmed_at/by on the underlying bounce event so the "Confirmed
   // current" badge below can distinguish this from a never-checked row.
   async function confirmSelectedCurrent() {
-    const selectedRows = rows.filter((r) => selected.has(r.school_id));
+    const selectedRows = selectedVisible;
     if (selectedRows.length === 0) return;
     setConfirming(true);
     setConfirmError("");
@@ -240,6 +322,12 @@ export default function DeadEmailRecoveryPage() {
       {!loading && (
         <div className="card" style={{ marginBottom: 14, fontSize: 12.5, color: "#697386" }}>
           <strong style={{ color: "#b3261e" }}>{stuckCount}</strong> already went through Coach-Info once and are stuck there for good unless retried here
+          {confirmedCount > 0 && (
+            <>
+              {" "}
+              · <strong>{confirmedCount}</strong> already confirmed by you ({hideConfirmed ? "hidden" : "shown"})
+            </>
+          )}
           {neverTriedCount > 0 && (
             <>
               {" "}
@@ -256,16 +344,36 @@ export default function DeadEmailRecoveryPage() {
             <input type="checkbox" checked={onlyStuck} onChange={(e) => setOnlyStuck(e.target.checked)} />
             Only show schools stuck after already going through Coach-Info once
           </label>
+          <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
+            <input type="checkbox" checked={hideConfirmed} onChange={(e) => setHideConfirmed(e.target.checked)} />
+            Hide schools I already confirmed
+          </label>
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-            <button className="btn btn-sm" onClick={confirmSelectedCurrent} disabled={confirming || selected.size === 0} title="Use this when you've personally re-checked these schools and the same email is still the best one on file -- keeps the bounce history, just clears the stuck flag.">
-              {confirming ? "Saving…" : `Confirm ${selected.size} selected -- same address, no better option found`}
+            <button className="btn btn-sm" onClick={confirmSelectedCurrent} disabled={confirming || selectedVisible.length === 0} title="Use this when you've personally re-checked these schools and the same email is still the best one on file -- keeps the bounce history, just clears the stuck flag.">
+              {confirming ? "Saving…" : `Confirm ${selectedVisible.length} selected -- same address, no better option found`}
             </button>
-            <button className="btn btn-sm btn-gold" onClick={sendSelectedForRetry} disabled={sending || selected.size === 0}>
-              {sending ? "Starting…" : `Send ${selected.size} selected to Coach-Info for another AI pass`}
+            <button className="btn btn-sm btn-gold" onClick={sendSelectedForRetry} disabled={sending || selectedVisible.length === 0}>
+              {sending ? "Starting…" : `Send ${selectedVisible.length} selected to Coach-Info for another AI pass`}
             </button>
           </div>
         </div>
       </div>
+
+      {!loading && (
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 12, alignItems: "center", fontSize: 12.5 }}>
+          <span style={{ color: "#697386" }}>What the last AI pass found:</span>
+          {[
+            ["all", "All"],
+            ["different", "Suggested a DIFFERENT email"],
+            ["same", "Suggested the same bounced email"],
+            ["none", "Found no email"],
+          ].map(([key, label]) => (
+            <button key={key} className={`btn btn-sm${aiFilter === key ? " btn-gold" : ""}`} onClick={() => setAiFilter(key)}>
+              {label} ({aiCounts[key]})
+            </button>
+          ))}
+        </div>
+      )}
 
       {loading ? (
         <div className="empty-state">Loading…</div>
@@ -281,6 +389,7 @@ export default function DeadEmailRecoveryPage() {
               <th>School</th>
               <th>Coach</th>
               <th>Dead email on file</th>
+              <th>Last AI pass</th>
               <th>Bounced</th>
               <th>Status</th>
             </tr>
@@ -293,14 +402,27 @@ export default function DeadEmailRecoveryPage() {
                 </td>
                 <td>
                   <Link href={`/schools/${r.school_id}`}>{r.name}</Link>
-                  <div style={{ fontSize: 11.5, color: "#697386" }}>
-                    {r.city}, {r.state}
-                  </div>
+                  <div style={{ fontSize: 11.5, color: "#697386" }}>{addressLine(r, extras[r.school_id])}</div>
                 </td>
                 <td>
                   {r.hc_first_name || r.hc_last_name ? `${r.hc_first_name ?? ""} ${r.hc_last_name ?? ""}`.trim() : <span style={{ color: "#a2a9b6" }}>—</span>}
                 </td>
                 <td>{r.hc_email}</td>
+                <td style={{ fontSize: 12 }}>
+                  {(() => {
+                    const e = extras[r.school_id] || {};
+                    const res = aiResult(r);
+                    if (res === "different")
+                      return (
+                        <span title="The AI proposed a different email last time -- it was never applied. Worth a look.">
+                          <strong style={{ color: "#1a7f4b" }}>New: {e.sugEmail}</strong>
+                          <div style={{ color: "#697386" }}>{[e.confidence, e.reviewStatus].filter(Boolean).join(" · ")}</div>
+                        </span>
+                      );
+                    if (res === "same") return <span style={{ color: "#8a6100" }}>Same bounced address</span>;
+                    return <span style={{ color: "#a2a9b6" }}>No email found</span>;
+                  })()}
+                </td>
                 <td style={{ fontSize: 12, color: "#697386" }}>
                   {r.detected_at ? new Date(r.detected_at).toLocaleDateString() : "—"}
                   {r.bounce_type ? ` · ${r.bounce_type}` : ""}
