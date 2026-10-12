@@ -11,6 +11,8 @@ import { EDIT_FIELDS, EDIT_LABELS, isValidEmail, linkableUrl } from "@/lib/needs
 const EDIT_ALL_CAP = 40;
 // Rows saved at the same time by "Save all changed".
 const SAVE_CONCURRENCY = 5;
+// The recruiting states the rest of the app treats as priority.
+const PRIORITY_STATES = ["TX", "FL", "GA", "CA", "OH", "IN"];
 
 // The open editors, what's typed in them, the filters, and which school you
 // were last working on are kept in this browser (localStorage), so leaving the
@@ -85,6 +87,8 @@ export default function DeadEmailRecoveryPage() {
   const [extras, setExtras] = useState({});
   // "all" | "different" | "same" | "none" -- filters by what the AI found.
   const [aiFilter, setAiFilter] = useState("all");
+  // "priority" (default), "all", or one state code like "TX".
+  const [stateFilter, setStateFilter] = useState("priority");
   // Multi-edit: open editors keyed by school id, per-row errors/notes, and
   // progress/summary for "Save all changed".
   const [editDrafts, setEditDrafts] = useState({});
@@ -154,6 +158,7 @@ export default function DeadEmailRecoveryPage() {
       if (typeof saved.onlyStuck === "boolean") setOnlyStuck(saved.onlyStuck);
       if (typeof saved.hideConfirmed === "boolean") setHideConfirmed(saved.hideConfirmed);
       if (AI_FILTERS.includes(saved.aiFilter)) setAiFilter(saved.aiFilter);
+      if (typeof saved.stateFilter === "string" && /^(all|priority|[A-Z]{2})$/.test(saved.stateFilter)) setStateFilter(saved.stateFilter);
       if (saved.anchor) anchorRef.current = saved.anchor;
     }
     setRestored(true);
@@ -161,8 +166,8 @@ export default function DeadEmailRecoveryPage() {
 
   useEffect(() => {
     if (!restored) return;
-    mergeSavedState({ drafts: editDrafts, onlyStuck, hideConfirmed, aiFilter });
-  }, [restored, editDrafts, onlyStuck, hideConfirmed, aiFilter]);
+    mergeSavedState({ drafts: editDrafts, onlyStuck, hideConfirmed, aiFilter, stateFilter });
+  }, [restored, editDrafts, onlyStuck, hideConfirmed, aiFilter, stateFilter]);
 
   // Remember the school you were last working on (clicked in, typed in, or
   // followed a link from) so coming back scrolls straight to it.
@@ -203,7 +208,13 @@ export default function DeadEmailRecoveryPage() {
   // Everything still open (not already confirmed by a person).
   const openRows = useMemo(() => rows.filter((r) => !r.manually_confirmed_at), [rows]);
   const confirmedCount = rows.length - openRows.length;
-  const baseRows = hideConfirmed ? openRows : rows;
+  const stateOk = (r) => stateFilter === "all" || (stateFilter === "priority" ? PRIORITY_STATES.includes(r.state) : r.state === stateFilter);
+  const stateOptions = useMemo(() => [...new Set((hideConfirmed ? openRows : rows).map((r) => r.state).filter(Boolean))].sort(), [rows, openRows, hideConfirmed]);
+  const baseRows = useMemo(
+    () => (hideConfirmed ? openRows : rows).filter(stateOk),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [rows, openRows, hideConfirmed, stateFilter]
+  );
   const visibleRows = useMemo(() => {
     let list = onlyStuck ? baseRows.filter((r) => r.ever_touched_by_coach_info) : baseRows;
     if (aiFilter !== "all") list = list.filter((r) => aiResult(r) === aiFilter);
@@ -576,6 +587,18 @@ export default function DeadEmailRecoveryPage() {
           <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
             <input type="checkbox" checked={onlyStuck} onChange={(e) => setOnlyStuck(e.target.checked)} />
             Only show schools stuck after already going through Coach-Info once
+          </label>
+          <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
+            State:
+            <select value={stateFilter} onChange={(e) => setStateFilter(e.target.value)}>
+              <option value="priority">Priority states (TX, FL, GA, CA, OH, IN)</option>
+              <option value="all">All states</option>
+              {stateOptions.map((st) => (
+                <option key={st} value={st}>
+                  {st}
+                </option>
+              ))}
+            </select>
           </label>
           <label style={{ fontSize: 13, display: "flex", gap: 6, alignItems: "center" }}>
             <input type="checkbox" checked={hideConfirmed} onChange={(e) => setHideConfirmed(e.target.checked)} />
