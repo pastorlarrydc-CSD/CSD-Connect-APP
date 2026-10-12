@@ -8,6 +8,7 @@ import { useAuth } from "@/lib/auth-context";
 import { fetchAllTouchedSchoolIds } from "@/lib/batchExclusion";
 import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
 import { assessCoachChange } from "@/lib/coachEmailFit";
+import { fetchRecentReVerifySchoolIds } from "@/lib/backlogVerify";
 
 // Overnight Coach-Info Batch API job -- see the batch-coach-info-discovery
 // spec doc in the project for the full plan this implements. Turns the
@@ -356,6 +357,14 @@ function BatchCoachInfoPageInner() {
   // many days ago is eligible to be re-included; never-reviewed schools are
   // always eligible regardless of this number.
   const [staleDays, setStaleDays] = useState(DEFAULT_STALE_DAYS);
+  // Also only "re_verify" mode. On (the default): the run is the VERIFICATION
+  // BACKLOG -- schools that are not verified and not already flagged for
+  // review. When that run is collected, each school with a high-confidence
+  // web-check match on its coach AND email is verified automatically, and a
+  // school where the web check found a different coach is flagged for Needs
+  // Review (see lib/backlogVerify.js). Off: the older behavior (anything
+  // never reviewed or stale), where nothing is auto-verified.
+  const [backlogOnly, setBacklogOnly] = useState(true);
   // Off by default so this tool keeps pulling from its full existing pool
   // (athletics URL OR just a general website) unless asked not to. On, it
   // narrows to schools that already have an Athletics URL specifically --
@@ -380,6 +389,7 @@ function BatchCoachInfoPageInner() {
 
   const [collecting, setCollecting] = useState(false);
   const [collectError, setCollectError] = useState("");
+  const [collectNotice, setCollectNotice] = useState("");
 
   const [applyingId, setApplyingId] = useState(null);
   const [reviewError, setReviewError] = useState("");
@@ -1054,6 +1064,7 @@ function BatchCoachInfoPageInner() {
     setSubmitError("");
     setStatusError("");
     setCollectError("");
+    setCollectNotice("");
     setReviewError("");
     setFocusedIndex(0);
   }
@@ -1083,19 +1094,43 @@ function BatchCoachInfoPageInner() {
         // eligible; previously-reviewed ones need days_since_review >=
         // staleDays. Oldest/never-checked first, same ordering the
         // dashboard uses.
-        let viewQuery = supabase
-          .from("school_review_status")
-          .select("id,name,city,state")
-          .or(`never_reviewed.eq.true,days_since_review.gte.${staleDays}`)
-          .order("never_reviewed", { ascending: false })
-          .order("days_since_review", { ascending: false, nullsFirst: true })
-          .limit(targetCount * 3);
-        if (scopeMode !== "all" || states.length) {
-          viewQuery = viewQuery.in("state", states);
+        const baseView = () => {
+          let q = supabase.from("school_review_status").select("id,name,city,state");
+          if (backlogOnly) {
+            // The verification backlog: unverified AND not already flagged
+            // (flagged schools have their own Needs Review path). No
+            // staleness filter -- "not verified" is the whole point.
+            q = q.eq("verification_status", "not_verified").eq("flagged_needs_review", false).order("id", { ascending: true });
+          } else {
+            q = q
+              .or(`never_reviewed.eq.true,days_since_review.gte.${staleDays}`)
+              .order("never_reviewed", { ascending: false })
+              .order("days_since_review", { ascending: false, nullsFirst: true })
+              .order("id", { ascending: true }); // stable order so .range() pages never overlap
+          }
+          if (scopeMode !== "all" || states.length) q = q.in("state", states);
+          return q;
+        };
+        // Supabase returns at most 1000 rows per request no matter what
+        // .limit() says, so page through in 1000-row chunks until there is
+        // enough to fill the run (with headroom for the filters below).
+        const wanted = targetCount * 3;
+        const rawReviewRows = [];
+        for (let from = 0; rawReviewRows.length < wanted; from += 1000) {
+          const { data: chunk, error: viewErr } = await baseView().range(from, from + 999);
+          if (viewErr) throw viewErr;
+          rawReviewRows.push(...(chunk || []));
+          if (!chunk || chunk.length < 1000) break;
         }
-        const { data: rawReviewRows, error: viewErr } = await viewQuery;
-        if (viewErr) throw viewErr;
-        schoolsData = rawReviewRows || [];
+        schoolsData = rawReviewRows;
+
+        // Backlog runs skip any school a re-verify run already covered in the
+        // last 60 days, so running the same state twice doesn't pay for the
+        // same schools again (results stay valid for the 60-day AI window).
+        if (backlogOnly && schoolsData.length) {
+          const recent = await fetchRecentReVerifySchoolIds(supabase, 60);
+          schoolsData = schoolsData.filter((r) => !recent.has(r.id));
+        }
 
         // school_review_status doesn't carry athletics_url/website (it's
         // scoped to the coach-contact fields), so requireAthletics needs a
@@ -1103,21 +1138,27 @@ function BatchCoachInfoPageInner() {
         // "athletics URL specifically" check the other modes use -- rather
         // than duplicating those columns into the view.
         if (requireAthletics && schoolsData.length) {
-          const { data: withAthletics, error: athErr } = await supabase
-            .from("schools")
-            .select("id")
-            .in("id", schoolsData.map((s) => s.id))
-            .not("athletics_url", "is", null)
-            .neq("athletics_url", "");
-          if (athErr) throw athErr;
-          const athleticsIds = new Set((withAthletics || []).map((r) => r.id));
+          const athleticsIds = new Set();
+          const allIds = schoolsData.map((s) => s.id);
+          for (let i = 0; i < allIds.length; i += 200) {
+            const { data: withAthletics, error: athErr } = await supabase
+              .from("schools")
+              .select("id")
+              .in("id", allIds.slice(i, i + 200))
+              .not("athletics_url", "is", null)
+              .neq("athletics_url", "");
+            if (athErr) throw athErr;
+            (withAthletics || []).forEach((r) => athleticsIds.add(r.id));
+          }
           schoolsData = schoolsData.filter((s) => athleticsIds.has(s.id));
         }
 
         schoolsData = schoolsData.slice(0, targetCount);
         if (!schoolsData || schoolsData.length === 0) {
           setCreateError(
-            `No schools matched -- everyone in this scope was reviewed within the last ${staleDays} days (or requireAthletics narrowed the pool to nothing). Try a shorter staleness window, a wider state scope, or turning off "Require an Athletics URL."`
+            backlogOnly
+              ? 'No schools matched -- every unverified, unflagged school in this scope was already included in a re-verify run in the last 60 days (or "Require an Athletics URL" narrowed the pool to nothing). Try another state, or turn off "Require an Athletics URL."'
+              : `No schools matched -- everyone in this scope was reviewed within the last ${staleDays} days (or requireAthletics narrowed the pool to nothing). Try a shorter staleness window, a wider state scope, or turning off "Require an Athletics URL."`
           );
           return;
         }
@@ -1379,6 +1420,7 @@ function BatchCoachInfoPageInner() {
     if (!selectedRun) return;
     setCollecting(true);
     setCollectError("");
+    setCollectNotice("");
     try {
       const {
         data: { session },
@@ -1389,6 +1431,13 @@ function BatchCoachInfoPageInner() {
       });
       const json = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(json.error || "Could not collect this run's results.");
+      if (typeof json.re_verify_confirmed === "number" && (json.re_verify_confirmed || json.re_verify_flagged || json.re_verify_skipped || json.re_verify_errors)) {
+        setCollectNotice(
+          `Backlog check done: ${json.re_verify_confirmed} verified automatically (high-confidence match on coach and email), ${json.re_verify_flagged} flagged for Needs Review (a different coach was found), ${json.re_verify_skipped} left as they were` +
+            (json.re_verify_errors ? `, ${json.re_verify_errors} hit an error` : "") +
+            "."
+        );
+      }
       await loadRuns();
       await loadItems(selectedRun.id);
     } catch (err) {
@@ -2112,7 +2161,9 @@ function BatchCoachInfoPageInner() {
             : candidateMode === "missing_cell"
             ? "Pulls schools that already have a head coach name on file but are missing a cell number -- searches for that specific coach by name instead of the generic \"who is the coach\" search."
             : candidateMode === "re_verify"
-            ? "Pulls schools this tool has already touched before, but not recently -- a fresh open search per school (not name-anchored), so a coach who's since changed gets caught instead of re-confirmed."
+            ? backlogOnly
+              ? "Verification backlog: pulls schools that are not verified and not already flagged for review -- a fresh open search per school (not name-anchored). When the run is collected, a school whose web check names the same coach AND email at high confidence is verified automatically; a school where a different coach turns up is flagged for Needs Review; everything else is left as it was."
+              : "Pulls schools this tool has already touched before, but not recently -- a fresh open search per school (not name-anchored), so a coach who's since changed gets caught instead of re-confirmed."
             : candidateMode === "bounce_recovery"
             ? "Pulls schools from the bounce list (email_bounce_events) whose on-file coach email is confirmed dead -- the AI is told explicitly that address bounced, and every suggestion from this mode always waits for your manual Apply click, even a high-confidence one, since it's overwriting data that was often recently marked verified."
             : "Pulls schools missing a head coach name that have an athletics or general website on file to search from -- schools with neither can't be helped by this tool."}
@@ -2144,6 +2195,12 @@ function BatchCoachInfoPageInner() {
               Bounced emails: schools whose on-file email is confirmed dead (from a bounce report)
             </label>
             {candidateMode === "re_verify" && (
+              <label style={{ fontSize: 13, marginLeft: 22, display: "flex", gap: 6, alignItems: "center" }}>
+                <input type="checkbox" checked={backlogOnly} onChange={(e) => setBacklogOnly(e.target.checked)} />
+                Only unverified schools that aren&apos;t already flagged (the verification backlog) -- matches get verified automatically
+              </label>
+            )}
+            {candidateMode === "re_verify" && !backlogOnly && (
               <label style={{ fontSize: 13, marginLeft: 22 }}>
                 Only include schools last reviewed more than{" "}
                 <select value={staleDays} onChange={(e) => setStaleDays(Number(e.target.value))}>
@@ -2331,6 +2388,11 @@ function BatchCoachInfoPageInner() {
 
           {selectedRun.status === "collected" && (
             <div>
+              {collectNotice && (
+                <div className="notice" style={{ marginBottom: 10, fontSize: 12.5 }}>
+                  {collectNotice}
+                </div>
+              )}
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8, marginBottom: 10 }}>
                 <p style={{ fontSize: 12.5, color: "#697386", margin: 0 }}>
                   {pendingReview.length} suggestion{pendingReview.length === 1 ? "" : "s"} to review
