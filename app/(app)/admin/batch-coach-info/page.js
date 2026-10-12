@@ -68,7 +68,7 @@ const FIELD_LABELS = {
 };
 
 const ITEM_SELECT =
-  "id,batch_run_id,school_id,fetch_status,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,ad_name,ad_email,athletics_url,website,verification_status,last_verified_at)";
+  "id,batch_run_id,school_id,fetch_status,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,addr1,addr2,zip,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,ad_name,ad_email,athletics_url,website,verification_status,last_verified_at)";
 
 async function runWithConcurrency(items, limit, worker) {
   let next = 0;
@@ -139,6 +139,15 @@ function linkableUrl(value) {
 // The school's own athletics site (falling back to its general website) as a
 // new-tab link, so a reviewer can pull up the staff page and confirm the
 // coach's email without leaving the review list.
+// "123 Main St, Suite 4, Delray Beach, FL 33444" -- whatever parts are on
+// file. Shown under each school name so same-named schools are easy to tell
+// apart when checking a suggestion against a source.
+function schoolAddressLine(s) {
+  if (!s) return "";
+  const cityState = [s.city, [s.state, s.zip].filter(Boolean).join(" ")].filter(Boolean).join(", ");
+  return [s.addr1, s.addr2, cityState].filter((x) => x && String(x).trim()).join(", ");
+}
+
 function SchoolSiteLink({ school }) {
   const ath = linkableUrl(school?.athletics_url);
   const web = ath ? null : linkableUrl(school?.website);
@@ -813,6 +822,8 @@ function BatchCoachInfoPageInner() {
     const haystack = [
       s?.name,
       s?.city,
+      s?.addr1,
+      s?.zip,
       s?.hc_first_name,
       s?.hc_last_name,
       s?.hc_email,
@@ -2625,7 +2636,7 @@ function BatchCoachInfoPageInner() {
                     {failedItems.map((item) => (
                       <div key={item.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8, fontSize: 12, padding: "3px 0" }}>
                         <span>
-                          {item.school?.name} — {item.school?.city}, {item.school?.state}
+                          {item.school?.name} — {schoolAddressLine(item.school)}
                           <span style={{ color: "#9aa1ab" }}> ({item.suggestion_error})</span>
                         </span>
                         <button className="btn btn-sm" onClick={() => confirmNoDataAvailable(item)} disabled={applyingId === item.id || bulkSkipping}>
@@ -2727,9 +2738,7 @@ function BatchCoachInfoPageInner() {
                           >
                             <td style={{ padding: "8px", whiteSpace: "nowrap" }}>
                               <div style={{ fontWeight: 600 }}>{s.name}</div>
-                              <div style={{ color: "#9aa1ab" }}>
-                                {s.city}, {s.state}
-                              </div>
+                              <div style={{ color: "#9aa1ab", whiteSpace: "normal", maxWidth: 230 }}>{schoolAddressLine(s)}</div>
                               {wasVerifiedElsewhere(item, selectedRun) && (
                                 <span className="badge" style={{ color: "#1e7145", background: "#1e714519", fontWeight: 600, marginTop: 2, display: "inline-block" }}>
                                   ✓ Verified elsewhere since this run started
