@@ -1,5 +1,5 @@
 "use client";
-import { Fragment, useState, useEffect, useCallback, useMemo } from "react";
+import { Fragment, useState, useEffect, useCallback, useMemo, useRef } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
@@ -11,6 +11,31 @@ import { EDIT_FIELDS, EDIT_LABELS, isValidEmail, linkableUrl } from "@/lib/needs
 const EDIT_ALL_CAP = 40;
 // Rows saved at the same time by "Save all changed".
 const SAVE_CONCURRENCY = 5;
+
+// The open editors, what's typed in them, the filters, and which school you
+// were last working on are kept in this browser (localStorage), so leaving the
+// page -- following a school link, a browser reload, a tab the browser put to
+// sleep -- and coming back puts you on the same screen with nothing lost.
+// A draft for a school that's no longer on the list (it was saved) is dropped.
+const SAVED_STATE_KEY = "csdDeadEmailRecovery:v1";
+const AI_FILTERS = ["all", "different", "same", "none"];
+function readSavedState() {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage.getItem(SAVED_STATE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (_) {
+    return null;
+  }
+}
+function mergeSavedState(patch) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(SAVED_STATE_KEY, JSON.stringify({ ...(readSavedState() || {}), ...patch }));
+  } catch (_) {
+    /* storage full or blocked -- the page just won't remember */
+  }
+}
 
 // Dead Email Recovery -- built alongside the needs_review-clearing fix
 // (lib/needsReview.js) after Larry asked which of Run #34's 110
@@ -67,6 +92,11 @@ export default function DeadEmailRecoveryPage() {
   const [rowNotes, setRowNotes] = useState({});
   const [saveAllProgress, setSaveAllProgress] = useState(null);
   const [saveSummary, setSaveSummary] = useState("");
+  // Saved state is read after mount (not in the initializers) so the first
+  // render matches the server's. Nothing is written back until it's read.
+  const [restored, setRestored] = useState(false);
+  const anchorRef = useRef(null);
+  const anchorDoneRef = useRef(false);
   const [selected, setSelected] = useState(() => new Set());
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState("");
@@ -117,6 +147,30 @@ export default function DeadEmailRecoveryPage() {
     return e.sugEmail.toLowerCase() === String(r.hc_email || "").trim().toLowerCase() ? "same" : "different";
   }
 
+  useEffect(() => {
+    const saved = readSavedState();
+    if (saved) {
+      if (saved.drafts && typeof saved.drafts === "object") setEditDrafts(saved.drafts);
+      if (typeof saved.onlyStuck === "boolean") setOnlyStuck(saved.onlyStuck);
+      if (typeof saved.hideConfirmed === "boolean") setHideConfirmed(saved.hideConfirmed);
+      if (AI_FILTERS.includes(saved.aiFilter)) setAiFilter(saved.aiFilter);
+      if (saved.anchor) anchorRef.current = saved.anchor;
+    }
+    setRestored(true);
+  }, []);
+
+  useEffect(() => {
+    if (!restored) return;
+    mergeSavedState({ drafts: editDrafts, onlyStuck, hideConfirmed, aiFilter });
+  }, [restored, editDrafts, onlyStuck, hideConfirmed, aiFilter]);
+
+  // Remember the school you were last working on (clicked in, typed in, or
+  // followed a link from) so coming back scrolls straight to it.
+  const rememberSchool = (id) => {
+    anchorRef.current = id;
+    mergeSavedState({ anchor: id });
+  };
+
   const load = useCallback(async () => {
     setLoading(true);
     setError("");
@@ -130,6 +184,9 @@ export default function DeadEmailRecoveryPage() {
         .limit(2000);
       if (err) throw err;
       setRows(data || []);
+      // Drop drafts for schools no longer on the list (saved or fixed since).
+      const stillListed = new Set((data || []).map((r) => r.school_id));
+      setEditDrafts((prev) => Object.fromEntries(Object.entries(prev).filter(([id]) => stillListed.has(Number(id)))));
       await loadExtras(data || []);
     } catch (err) {
       setError(err.message || "Could not load dead-email schools.");
@@ -453,6 +510,19 @@ export default function DeadEmailRecoveryPage() {
   const dirtyEditCount = visibleRows.filter((r) => isEditing(r) && isDirty(r)).length;
   const openEditCount = visibleRows.filter((r) => isEditing(r)).length;
 
+  // Once the list has rendered after a visit, scroll back to the school you
+  // were last on (once only -- never again while you work).
+  useEffect(() => {
+    if (!restored || loading || anchorDoneRef.current) return;
+    anchorDoneRef.current = true;
+    const id = anchorRef.current;
+    if (!id) return;
+    setTimeout(() => {
+      const el = document.getElementById(`dead-row-${id}`);
+      if (el) el.scrollIntoView({ block: "center" });
+    }, 250);
+  }, [restored, loading, rows.length]);
+
   if (!canReview) {
     return (
       <div className="view">
@@ -583,7 +653,7 @@ export default function DeadEmailRecoveryPage() {
           <tbody>
             {visibleRows.map((r) => (
               <Fragment key={r.school_id}>
-              <tr>
+              <tr id={`dead-row-${r.school_id}`} onClickCapture={() => rememberSchool(r.school_id)}>
                 <td>
                   <input type="checkbox" checked={selected.has(r.school_id)} onChange={() => toggleOne(r.school_id)} />
                 </td>
@@ -659,7 +729,7 @@ export default function DeadEmailRecoveryPage() {
                 </td>
               </tr>
               {isEditing(r) && (
-                <tr>
+                <tr onClickCapture={() => rememberSchool(r.school_id)} onFocusCapture={() => rememberSchool(r.school_id)}>
                   <td colSpan={7} style={{ background: "#f7f9fc", padding: "10px 12px" }}>
                     <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 8 }}>
                       {EDIT_FIELDS.map((f) => (
