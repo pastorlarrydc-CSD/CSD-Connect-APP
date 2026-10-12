@@ -1,5 +1,6 @@
 import { NextResponse } from "next/server";
 import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
+import { settleReVerifyItem } from "@/lib/backlogVerify";
 import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion, runWithConcurrency, findDuplicateNameSchoolsForMany } from "@/lib/coachInfoLookup";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
@@ -125,6 +126,11 @@ export async function POST(req, { params }) {
     let autoApplied = 0;
     let autoApplyHeld = 0;
     let autoApplyErrors = 0;
+    // Backlog verification (re_verify runs only) -- see lib/backlogVerify.js
+    let reVerifyConfirmed = 0;
+    let reVerifyFlagged = 0;
+    let reVerifySkipped = 0;
+    let reVerifyErrors = 0;
     let saveErr = null;
 
     // Processed COLLECT_CONCURRENCY-at-a-time rather than one line at a
@@ -175,6 +181,7 @@ export async function POST(req, { params }) {
       // specifically -- every suggestion from a bounce_recovery run should
       // land in the review queue for a human Apply click, no matter which
       // button collected the results.
+      let lastApplyResult = null;
       if (!itemErr && run.candidate_mode !== "bounce_recovery" && patch.suggestion?.confidence === "high") {
         const schoolId = schoolIdByItemId.get(itemId);
         if (schoolId) {
@@ -186,6 +193,7 @@ export async function POST(req, { params }) {
             suggestion: patch.suggestion,
             actorUserId: userData.user.id,
           });
+          lastApplyResult = result;
           if (result.applied) autoApplied++;
           else if (result.held) {
             // Not an error -- see OVERWRITE_GATED_FIELDS in
@@ -197,6 +205,30 @@ export async function POST(req, { params }) {
             autoApplyErrors++;
             console.error("batch-coach-info collect auto-apply error for item", itemId, result.error);
           }
+        }
+      }
+
+      // Backlog verification: settle a re_verify result for a school that is
+      // not verified and not flagged -- verified on a high-confidence match of
+      // coach AND email, flagged for Needs Review on a different coach,
+      // otherwise untouched (see lib/backlogVerify.js).
+      if (!itemErr && run.candidate_mode === "re_verify" && patch.suggestion) {
+        const schoolId = schoolIdByItemId.get(itemId);
+        if (schoolId) {
+          const settled = await settleReVerifyItem({
+            supabase,
+            schoolId,
+            runId,
+            suggestion: patch.suggestion,
+            applyResult: lastApplyResult,
+            actorUserId: userData.user.id,
+          });
+          if (settled.outcome === "confirmed") reVerifyConfirmed++;
+          else if (settled.outcome === "flagged") reVerifyFlagged++;
+          else if (settled.outcome === "error") {
+            reVerifyErrors++;
+            console.error("batch-coach-info collect re-verify settle error for item", itemId, settled.reason);
+          } else reVerifySkipped++;
         }
       }
     });
@@ -213,7 +245,7 @@ export async function POST(req, { params }) {
       console.error("batch-coach-info collect run-update error", updateErr);
     }
 
-    return NextResponse.json({ status: "collected", succeeded, failed, auto_applied: autoApplied, auto_apply_held: autoApplyHeld, auto_apply_errors: autoApplyErrors });
+    return NextResponse.json({ status: "collected", succeeded, failed, auto_applied: autoApplied, auto_apply_held: autoApplyHeld, auto_apply_errors: autoApplyErrors, re_verify_confirmed: reVerifyConfirmed, re_verify_flagged: reVerifyFlagged, re_verify_skipped: reVerifySkipped, re_verify_errors: reVerifyErrors });
   } catch (err) {
     console.error("batch-coach-info collect error", err);
     return NextResponse.json({ error: "Could not collect this run's results. Please try again." }, { status: 500 });
