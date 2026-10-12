@@ -1,10 +1,16 @@
 "use client";
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { Fragment, useState, useEffect, useCallback, useMemo } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
+import { EDIT_FIELDS, EDIT_LABELS, isValidEmail, linkableUrl } from "@/lib/needsReviewEdit";
+
+// Most rows that can be opened for editing at once ("Edit all shown").
+const EDIT_ALL_CAP = 40;
+// Rows saved at the same time by "Save all changed".
+const SAVE_CONCURRENCY = 5;
 
 // Dead Email Recovery -- built alongside the needs_review-clearing fix
 // (lib/needsReview.js) after Larry asked which of Run #34's 110
@@ -54,6 +60,13 @@ export default function DeadEmailRecoveryPage() {
   const [extras, setExtras] = useState({});
   // "all" | "different" | "same" | "none" -- filters by what the AI found.
   const [aiFilter, setAiFilter] = useState("all");
+  // Multi-edit: open editors keyed by school id, per-row errors/notes, and
+  // progress/summary for "Save all changed".
+  const [editDrafts, setEditDrafts] = useState({});
+  const [editErrors, setEditErrors] = useState({});
+  const [rowNotes, setRowNotes] = useState({});
+  const [saveAllProgress, setSaveAllProgress] = useState(null);
+  const [saveSummary, setSaveSummary] = useState("");
   const [selected, setSelected] = useState(() => new Set());
   const [sending, setSending] = useState(false);
   const [sendError, setSendError] = useState("");
@@ -69,7 +82,7 @@ export default function DeadEmailRecoveryPage() {
     for (let i = 0; i < ids.length; i += 100) {
       const chunk = ids.slice(i, i + 100);
       const [{ data: schoolRows }, { data: itemRows }] = await Promise.all([
-        supabase.from("schools").select("id,addr1,addr2,zip").in("id", chunk),
+        supabase.from("schools").select("id,addr1,addr2,zip,hc_office,hc_cell,athletics_url,website").in("id", chunk),
         supabase
           .from("coach_info_batch_items")
           .select("id,school_id,review_status,suggestion")
@@ -78,7 +91,7 @@ export default function DeadEmailRecoveryPage() {
           .limit(1000),
       ]);
       (schoolRows || []).forEach((sc) => {
-        next[sc.id] = { ...(next[sc.id] || {}), addr1: sc.addr1, addr2: sc.addr2, zip: sc.zip };
+        next[sc.id] = { ...(next[sc.id] || {}), addr1: sc.addr1, addr2: sc.addr2, zip: sc.zip, hc_office: sc.hc_office, hc_cell: sc.hc_cell, athletics_url: sc.athletics_url, website: sc.website };
       });
       const seen = new Set();
       (itemRows || []).forEach((it) => {
@@ -290,6 +303,156 @@ export default function DeadEmailRecoveryPage() {
     }
   }
 
+  // ---- Multi-edit -------------------------------------------------------
+  // Same save path as Needs Review's Quick Fix (/api/admin/needs-review/save):
+  // only values that differ are written and logged, and a record that would be
+  // left with a changed coach but no confirmed email, or a previous coach's
+  // email, is saved but kept flagged and unverified -- never stamped verified.
+  async function authedFetch(url, options = {}) {
+    const {
+      data: { session },
+    } = await supabase.auth.getSession();
+    return fetch(url, { ...options, headers: { ...(options.headers || {}), Authorization: `Bearer ${session?.access_token}` } });
+  }
+
+  function draftFromRow(r) {
+    const e = extras[r.school_id] || {};
+    return {
+      hc_first_name: r.hc_first_name || "",
+      hc_last_name: r.hc_last_name || "",
+      hc_email: r.hc_email || "",
+      hc_office: e.hc_office || "",
+      hc_cell: e.hc_cell || "",
+    };
+  }
+  const isEditing = (r) => Object.prototype.hasOwnProperty.call(editDrafts, r.school_id);
+  // Changed = any field differs from how the editor opened. Save all only
+  // writes changed rows, so opening 40 editors and pressing Save all can't
+  // quietly save 40 schools nobody touched.
+  const isDirty = (r) => {
+    const d = editDrafts[r.school_id];
+    if (!d) return false;
+    const base = draftFromRow(r);
+    return EDIT_FIELDS.some((f) => (d[f] || "").trim() !== (base[f] || "").trim());
+  };
+  const clearRowMsg = (id) => {
+    setEditErrors((prev) => {
+      const { [id]: _drop, ...rest } = prev;
+      return rest;
+    });
+  };
+  const closeEdit = (id) => {
+    setEditDrafts((prev) => {
+      const { [id]: _drop, ...rest } = prev;
+      return rest;
+    });
+    clearRowMsg(id);
+  };
+  function toggleEdit(r) {
+    if (isEditing(r)) {
+      closeEdit(r.school_id);
+      return;
+    }
+    setEditDrafts((prev) => ({ ...prev, [r.school_id]: draftFromRow(r) }));
+    clearRowMsg(r.school_id);
+  }
+  const updateDraft = (id, field, value) => setEditDrafts((prev) => ({ ...prev, [id]: { ...(prev[id] || {}), [field]: value } }));
+  function openEditAllShown() {
+    const targets = visibleRows.slice(0, EDIT_ALL_CAP);
+    setEditDrafts((prev) => {
+      const next = { ...prev };
+      targets.forEach((r) => {
+        if (!Object.prototype.hasOwnProperty.call(next, r.school_id)) next[r.school_id] = draftFromRow(r);
+      });
+      return next;
+    });
+  }
+  function closeAllEdits() {
+    setEditDrafts({});
+    setEditErrors({});
+  }
+  // The email the AI proposed last time, when it differs from the bounced one.
+  function useAiEmail(r) {
+    const e = extras[r.school_id];
+    if (e?.sugEmail) updateDraft(r.school_id, "hc_email", e.sugEmail);
+  }
+
+  // Saves one school. Returns "cleared" | "held" | "error".
+  async function saveRow(r) {
+    const d = editDrafts[r.school_id] || {};
+    clearRowMsg(r.school_id);
+    const newEmail = (d.hc_email || "").trim();
+    // The dead address is the whole problem here: saving with it unchanged
+    // would stamp the school verified while the bounced email is still on it.
+    if (!newEmail || newEmail.toLowerCase() === String(r.hc_email || "").trim().toLowerCase()) {
+      setEditErrors((prev) => ({ ...prev, [r.school_id]: "Enter a NEW email to save. If the same address is right, tick the school and use \"Confirm selected -- same address\" instead." }));
+      return "error";
+    }
+    if (!isValidEmail(newEmail)) {
+      setEditErrors((prev) => ({ ...prev, [r.school_id]: `"${newEmail}" doesn't look like an email address.` }));
+      return "error";
+    }
+    try {
+      const fields = {};
+      EDIT_FIELDS.forEach((f) => {
+        const v = (d[f] || "").trim();
+        if (v) fields[f] = v;
+      });
+      const res = await authedFetch("/api/admin/needs-review/save", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ school_id: r.school_id, fields }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || "Could not save this school.");
+      closeEdit(r.school_id);
+      if (!json.cleared) {
+        setRowNotes((prev) => ({ ...prev, [r.school_id]: `Saved, but still flagged: ${json.reason}` }));
+        return "held";
+      }
+      return "cleared";
+    } catch (err) {
+      setEditErrors((prev) => ({ ...prev, [r.school_id]: err.message || "Could not save this school." }));
+      return "error";
+    }
+  }
+
+  async function saveOne(r) {
+    setSaveSummary("");
+    const result = await saveRow(r);
+    if (result !== "error") await load();
+  }
+
+  async function saveAllChanged() {
+    const targets = visibleRows.filter((r) => isEditing(r) && isDirty(r));
+    if (targets.length === 0) return;
+    setSaveSummary("");
+    const tally = { cleared: 0, held: 0, error: 0 };
+    let done = 0;
+    setSaveAllProgress({ done: 0, total: targets.length });
+    let idx = 0;
+    async function worker() {
+      while (idx < targets.length) {
+        const r = targets[idx++];
+        const result = await saveRow(r);
+        tally[result] += 1;
+        done += 1;
+        setSaveAllProgress({ done, total: targets.length });
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(SAVE_CONCURRENCY, targets.length) }, worker));
+    setSaveAllProgress(null);
+    setSaveSummary(
+      `Saved ${tally.cleared + tally.held} of ${targets.length}: ${tally.cleared} cleared` +
+        (tally.held ? `, ${tally.held} saved but still flagged (see the note on each)` : "") +
+        (tally.error ? `, ${tally.error} not saved (see the red message on each)` : "") +
+        "."
+    );
+    await load();
+  }
+  const dirtyEditCount = visibleRows.filter((r) => isEditing(r) && isDirty(r)).length;
+  const openEditCount = visibleRows.filter((r) => isEditing(r)).length;
+
   if (!canReview) {
     return (
       <div className="view">
@@ -375,6 +538,29 @@ export default function DeadEmailRecoveryPage() {
         </div>
       )}
 
+      {!loading && (
+        <div className="card" style={{ marginBottom: 14, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", fontSize: 13 }}>
+          <button className="btn btn-sm" onClick={openEditAllShown} disabled={visibleRows.length === 0 || !!saveAllProgress}>
+            Edit all shown ({Math.min(visibleRows.length, EDIT_ALL_CAP)})
+          </button>
+          <span>
+            {openEditCount} open · {dirtyEditCount} changed
+          </span>
+          <button className="btn btn-sm btn-gold" onClick={saveAllChanged} disabled={!!saveAllProgress || dirtyEditCount === 0}>
+            {saveAllProgress ? `Saving ${saveAllProgress.done} of ${saveAllProgress.total}…` : `Save all changed (${dirtyEditCount})`}
+          </button>
+          <button className="btn btn-sm" onClick={closeAllEdits} disabled={openEditCount === 0 || !!saveAllProgress}>
+            Close all
+          </button>
+          <span style={{ color: "#697386", fontSize: 12 }}>Save all only writes rows you changed, and every changed row needs a NEW email.</span>
+        </div>
+      )}
+      {saveSummary && (
+        <div className="notice" style={{ marginBottom: 14 }}>
+          {saveSummary}
+        </div>
+      )}
+
       {loading ? (
         <div className="empty-state">Loading…</div>
       ) : visibleRows.length === 0 ? (
@@ -396,13 +582,27 @@ export default function DeadEmailRecoveryPage() {
           </thead>
           <tbody>
             {visibleRows.map((r) => (
-              <tr key={r.school_id}>
+              <Fragment key={r.school_id}>
+              <tr>
                 <td>
                   <input type="checkbox" checked={selected.has(r.school_id)} onChange={() => toggleOne(r.school_id)} />
                 </td>
                 <td>
                   <Link href={`/schools/${r.school_id}`}>{r.name}</Link>
                   <div style={{ fontSize: 11.5, color: "#697386" }}>{addressLine(r, extras[r.school_id])}</div>
+                  <div style={{ fontSize: 11.5, display: "flex", gap: 10 }}>
+                    {linkableUrl(extras[r.school_id]?.athletics_url) && (
+                      <a href={linkableUrl(extras[r.school_id].athletics_url)} target="_blank" rel="noopener noreferrer">
+                        Athletics site ↗
+                      </a>
+                    )}
+                    {linkableUrl(extras[r.school_id]?.website) && (
+                      <a href={linkableUrl(extras[r.school_id].website)} target="_blank" rel="noopener noreferrer">
+                        Website ↗
+                      </a>
+                    )}
+                  </div>
+                  {rowNotes[r.school_id] && <div style={{ fontSize: 11.5, color: "#8a6100", marginTop: 2 }}>{rowNotes[r.school_id]}</div>}
                 </td>
                 <td>
                   {r.hc_first_name || r.hc_last_name ? `${r.hc_first_name ?? ""} ${r.hc_last_name ?? ""}`.trim() : <span style={{ color: "#a2a9b6" }}>—</span>}
@@ -442,6 +642,11 @@ export default function DeadEmailRecoveryPage() {
                       Needs review
                     </span>
                   )}
+                  <div style={{ marginTop: 4 }}>
+                    <button className="btn btn-sm" onClick={() => toggleEdit(r)} disabled={!!saveAllProgress}>
+                      {isEditing(r) ? "Close" : "Edit"}
+                    </button>
+                  </div>
                   {r.manually_confirmed_at && (
                     <span
                       className="badge"
@@ -453,6 +658,37 @@ export default function DeadEmailRecoveryPage() {
                   )}
                 </td>
               </tr>
+              {isEditing(r) && (
+                <tr>
+                  <td colSpan={7} style={{ background: "#f7f9fc", padding: "10px 12px" }}>
+                    <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 8 }}>
+                      {EDIT_FIELDS.map((f) => (
+                        <label key={f} style={{ fontSize: 11.5, color: "#697386", display: "flex", flexDirection: "column", gap: 2 }}>
+                          {EDIT_LABELS[f]}
+                          <input
+                            value={editDrafts[r.school_id]?.[f] ?? ""}
+                            onChange={(e) => updateDraft(r.school_id, f, e.target.value)}
+                            style={f === "hc_email" ? { borderColor: "#b3261e" } : undefined}
+                          />
+                        </label>
+                      ))}
+                    </div>
+                    <div style={{ display: "flex", gap: 8, marginTop: 8, alignItems: "center", flexWrap: "wrap" }}>
+                      {aiResult(r) === "different" && (
+                        <button className="btn btn-sm" onClick={() => useAiEmail(r)}>
+                          Use AI&apos;s email: {extras[r.school_id]?.sugEmail}
+                        </button>
+                      )}
+                      <button className="btn btn-sm btn-gold" onClick={() => saveOne(r)} disabled={!!saveAllProgress || !isDirty(r)}>
+                        Save this school
+                      </button>
+                      <span style={{ fontSize: 11.5, color: "#697386" }}>The email box (red) holds the bounced address -- replace it with the working one.</span>
+                    </div>
+                    {editErrors[r.school_id] && <div style={{ color: "#b3261e", fontSize: 12, marginTop: 6 }}>{editErrors[r.school_id]}</div>}
+                  </td>
+                </tr>
+              )}
+              </Fragment>
             ))}
           </tbody>
         </table>
