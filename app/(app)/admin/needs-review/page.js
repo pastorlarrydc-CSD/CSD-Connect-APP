@@ -67,6 +67,11 @@ const AI_FILTERS = {
 };
 const AI_FILTER_ORDER = ["ai_matched", "ai_review", "ai_pending", "ai_none"];
 
+// Schools flagged because their head-coach email hard-bounced (the HS Coach
+// Newsletter #1 send, 9/23/26) -- the flag's own note says so. Lets the queue
+// be narrowed to just those, so "Send to AI verification" only sends them.
+const isHardBounceFlag = (s) => /hard-bounced/i.test(String(s?.needs_review_note || ""));
+
 function AiCheckCell({ ai }) {
   if (!ai) return <span style={{ color: "#a2a9b6" }}>—</span>;
   if (ai.status === "pending") {
@@ -725,6 +730,7 @@ function NeedsReviewPageInner() {
     reasonCounts[reasonOf(s)] += 1;
   });
   const flaggedCount = reasonCounts.paste + reasonCounts.unchecked + reasonCounts.flagged;
+  const bounceCount = schools.filter(isHardBounceFlag).length;
   const aiCounts = {};
   AI_FILTER_ORDER.forEach((k) => {
     aiCounts[k] = schools.filter(AI_FILTERS[k].test).length;
@@ -732,6 +738,7 @@ function NeedsReviewPageInner() {
   const shownSchools = schools.filter((s) => {
     if (reasonFilter === "all") return true;
     if (reasonFilter === "flagged") return reasonOf(s) !== "never";
+    if (reasonFilter === "bounce") return isHardBounceFlag(s);
     if (AI_FILTERS[reasonFilter]) return AI_FILTERS[reasonFilter].test(s);
     return reasonOf(s) === reasonFilter;
   });
@@ -872,6 +879,11 @@ function NeedsReviewPageInner() {
               {flaggedCount > 0 && (
                 <button className={`btn btn-sm ${reasonFilter === "flagged" ? "btn-gold" : ""}`} onClick={() => setReasonFilter("flagged")}>
                   All flagged ({flaggedCount})
+                </button>
+              )}
+              {bounceCount > 0 && (
+                <button className={`btn btn-sm ${reasonFilter === "bounce" ? "btn-gold" : ""}`} onClick={() => setReasonFilter("bounce")} title="Schools flagged because their head coach email hard-bounced in the 9/23 newsletter send.">
+                  Hard bounce ({bounceCount})
                 </button>
               )}
               {REASON_ORDER.filter((r) => reasonCounts[r] > 0).map((r) => (
