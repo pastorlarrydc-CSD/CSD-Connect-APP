@@ -154,6 +154,43 @@ function CoverageBar({ pct }) {
 
 const LAST_STATE_KEY = "needsReviewLastState";
 
+// Where you were, per state: open Quick Fix editors (with what you typed), the
+// filter chip you had on, and the school you last clicked in. Kept in this
+// browser (not just this tab) so leaving for another website, closing the tab,
+// or a browser restart still puts you back exactly where you were.
+const VIEW_KEY = "csdNeedsReview:v1";
+const VIEW_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+const PRIORITY_ONLY_KEY = "csdNeedsReviewPriorityOnly";
+const VALID_FILTERS = ["all", "flagged", "bounce", ...REASON_ORDER, ...AI_FILTER_ORDER];
+
+function readViewState(state) {
+  try {
+    const all = JSON.parse(window.localStorage.getItem(VIEW_KEY) || "{}");
+    const v = all && all[state];
+    if (!v || typeof v !== "object") return null;
+    if (v.savedAt && Date.now() - v.savedAt > VIEW_MAX_AGE_MS) return null;
+    return v;
+  } catch {
+    return null;
+  }
+}
+
+function writeViewState(state, patch) {
+  try {
+    const all = JSON.parse(window.localStorage.getItem(VIEW_KEY) || "{}") || {};
+    const next = { ...(all[state] || {}), ...patch, savedAt: Date.now() };
+    // Don't keep empty entries around.
+    if (!Object.keys(next.drafts || {}).length) delete next.drafts;
+    if (!next.reasonFilter || next.reasonFilter === "all") delete next.reasonFilter;
+    all[state] = next;
+    // Forget states untouched for a week so this never grows.
+    Object.keys(all).forEach((k) => {
+      if (all[k]?.savedAt && Date.now() - all[k].savedAt > VIEW_MAX_AGE_MS) delete all[k];
+    });
+    window.localStorage.setItem(VIEW_KEY, JSON.stringify(all));
+  } catch {}
+}
+
 // "123 Main St, Suite 4, Chicago, IL 60601" -- whatever parts are on file.
 // Shown under each school name so same-named schools are easy to tell apart.
 function schoolAddressLine(s) {
@@ -200,6 +237,11 @@ function NeedsReviewPageInner() {
   const [aiNotesOpen, setAiNotesOpen] = useState({}); // schoolId -> true while "Why?" is open
   const [priorityOnly, setPriorityOnly] = useState(true);
   const [error, setError] = useState("");
+  // Which state's saved view has been put back (so nothing is written to
+  // storage until the restore has happened, and a failed load never wipes it).
+  const [viewReadyFor, setViewReadyFor] = useState(null);
+  const anchorRef = useRef(null);
+  const pendingScrollRef = useRef(false);
 
   const authedFetch = useCallback(
     async (url, options = {}) => {
@@ -255,6 +297,8 @@ function NeedsReviewPageInner() {
         }
       } catch {}
       setReasonFilter("all");
+      setViewReadyFor(null);
+      pendingScrollRef.current = false;
       setAiNote(null);
       setEditDrafts({});
       setEditErrors({});
@@ -266,17 +310,26 @@ function NeedsReviewPageInner() {
         const json = await res.json();
         if (!res.ok) throw new Error(json.error || "Could not load this state's queue.");
         setSchools(json.schools || []);
-        // Put back edits that were open and unsaved when the page last went away
-        // (accidental reload, browser restart of the tab, etc.).
+        // Put back where you were: open edits (and what was typed), the filter
+        // chip, and the school you last clicked in.
         try {
-          const saved = JSON.parse(window.sessionStorage.getItem(`needsReviewDrafts:${state}`) || "{}");
-          const here = new Set((json.schools || []).map((x) => x.id));
-          const keep = {};
-          Object.keys(saved).forEach((id) => {
-            if (here.has(id) || here.has(Number(id))) keep[id] = saved[id];
-          });
-          if (Object.keys(keep).length) setEditDrafts(keep);
+          const view = readViewState(state);
+          if (view) {
+            const here = new Set((json.schools || []).map((x) => Number(x.id)));
+            const saved = view.drafts && typeof view.drafts === "object" ? view.drafts : {};
+            const keep = {};
+            Object.keys(saved).forEach((id) => {
+              if (here.has(Number(id))) keep[id] = saved[id];
+            });
+            if (Object.keys(keep).length) setEditDrafts(keep);
+            if (VALID_FILTERS.includes(view.reasonFilter)) setReasonFilter(view.reasonFilter);
+            if (view.anchor && here.has(Number(view.anchor))) {
+              anchorRef.current = view.anchor;
+              pendingScrollRef.current = true;
+            }
+          }
         } catch {}
+        setViewReadyFor(state);
         setTotalInQueue(json.total_in_queue ?? (json.schools || []).length);
         setReviewedToday(json.reviewed_today || 0);
       } catch (err) {
@@ -311,15 +364,47 @@ function NeedsReviewPageInner() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canReview]);
 
-  // Save open edit drafts for this browser tab only, so nothing typed is lost.
+  // Save the view (open edits + typed text, filter chip) as you go, so nothing
+  // typed is lost and you can pick up exactly where you left off.
   useEffect(() => {
-    if (!selectedState || loadingSchools) return;
+    if (!selectedState || loadingSchools || viewReadyFor !== selectedState) return;
+    writeViewState(selectedState, { drafts: editDrafts, reasonFilter });
+  }, [editDrafts, reasonFilter, selectedState, loadingSchools, viewReadyFor]);
+
+  // Remember the school you were last working on (clicked or typed in) so coming
+  // back scrolls straight to it.
+  const rememberSchool = (id) => {
+    anchorRef.current = id;
+    if (selectedState) writeViewState(selectedState, { anchor: id });
+  };
+
+  // Once the queue has drawn after a visit, scroll back to that school (once).
+  useEffect(() => {
+    if (loadingSchools || !pendingScrollRef.current || viewReadyFor !== selectedState) return;
+    pendingScrollRef.current = false;
+    const id = anchorRef.current;
+    if (!id) return;
+    setTimeout(() => {
+      const el = document.getElementById(`nr-row-${id}`);
+      if (el) el.scrollIntoView({ block: "center" });
+    }, 300);
+  }, [loadingSchools, viewReadyFor, selectedState, schools.length]);
+
+  // The "priority states only" checkbox is remembered too.
+  const [prioLoaded, setPrioLoaded] = useState(false);
+  useEffect(() => {
     try {
-      const key = `needsReviewDrafts:${selectedState}`;
-      if (Object.keys(editDrafts).length) window.sessionStorage.setItem(key, JSON.stringify(editDrafts));
-      else window.sessionStorage.removeItem(key);
+      const v = window.localStorage.getItem(PRIORITY_ONLY_KEY);
+      if (v === "0") setPriorityOnly(false);
     } catch {}
-  }, [editDrafts, selectedState, loadingSchools]);
+    setPrioLoaded(true);
+  }, []);
+  useEffect(() => {
+    if (!prioLoaded) return;
+    try {
+      window.localStorage.setItem(PRIORITY_ONLY_KEY, priorityOnly ? "1" : "0");
+    } catch {}
+  }, [priorityOnly, prioLoaded]);
 
   // A school just left the queue (confirmed, or saved and cleared): drop its
   // row, any open editor, and move the state's counters.
@@ -1020,7 +1105,7 @@ function NeedsReviewPageInner() {
                   const editing = isEditing(s);
                   const saving = !!savingIds[s.id];
                   return [
-                  <tr key={s.id}>
+                  <tr key={s.id} id={`nr-row-${s.id}`} onClickCapture={() => rememberSchool(s.id)} onFocusCapture={() => rememberSchool(s.id)}>
                     <td>
                       <Link href={`/schools/${s.id}`} target="_blank" rel="noopener noreferrer" title="Opens in a new tab so this queue stays open">{s.name}</Link>
                       <div style={{ fontSize: 11.5, color: "#697386" }}>{schoolAddressLine(s)}</div>
@@ -1092,7 +1177,7 @@ function NeedsReviewPageInner() {
                     </tr>
                   ),
                   editing && (
-                    <tr key={`edit-${s.id}`} style={{ background: "#f8fafc" }}>
+                    <tr key={`edit-${s.id}`} style={{ background: "#f8fafc" }} onClickCapture={() => rememberSchool(s.id)} onFocusCapture={() => rememberSchool(s.id)}>
                       <td colSpan={8} style={{ padding: "10px 8px 14px" }}>
                         <div style={{ fontSize: 11.5, fontWeight: 600, color: "#697386", marginBottom: 8, display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
                           <span>Quick Fix — {s.name}</span>
