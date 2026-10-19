@@ -83,8 +83,13 @@ export async function POST(req) {
     const priorLast = priorLastFromNote(school.needs_review_note);
     const staleLeft =
       !assess.nameChanged && priorLast && emailFit(next.hc_email, { last: next.hc_last_name }, { last: priorLast }) === "stale";
+    // The reviewer hand-edited the coach's name and the email already on file
+    // contains the NEW coach's surname (e.g. the coach was set back to the one
+    // the email belongs to). That email fits -- it is not an "unconfirmed" one,
+    // so it must not keep the school flagged with the old coach-change note.
+    const emailAlreadyFitsNewCoach = assess.fit === "match" && !assess.emailChanged && !emailRemoved;
     let holdReason = null;
-    if (assess.nameChanged && assess.emailUnconfirmed) holdReason = assess.reviewNote(null);
+    if (assess.nameChanged && assess.emailUnconfirmed && !emailAlreadyFitsNewCoach) holdReason = assess.reviewNote(null);
     else if (staleLeft) holdReason = `The email on file (${next.hc_email}) still contains the previous coach's surname (${priorLast}) -- find or confirm the current coach's email.`;
     else if (emailRemoved && !clean(next.hc_email)) holdReason = "The previous coach's email was removed and no replacement was added yet -- find the current coach's email.";
 
