@@ -70,12 +70,24 @@ export async function POST(req) {
     // raised for. The reviewer fixes the email (Edit on the queue) first.
     // (An AI check that matched the on-file coach AND email at high
     // confidence is different: the email was seen on the school's own site.)
+    //
+    // override_stale: the reviewer looked at the school's own site, saw that the
+    // email on file really is the current coach's, and chose "Confirm anyway".
+    // That skips the warning but is written to the log with its own wording so
+    // it can always be told apart from a plain confirmation.
+    const overrideStale = body.override_stale === true;
     const stale = !aiItemId ? staleEmailInfo(school) : null;
-    if (stale) {
+    if (stale && !overrideStale) {
       return NextResponse.json(
-        { error: `The email on file (${school.hc_email}) still looks like the previous coach's (${stale.priorLast}). Use Edit to enter or confirm the current coach's email first.` },
+        {
+          code: "stale_email",
+          error: `The email on file (${school.hc_email}) still looks like the previous coach's (${stale.priorLast}). Use Edit to enter or confirm the current coach's email first, or use "Confirm anyway" if you have checked that this email is the current coach's.`,
+        },
         { status: 409 }
       );
+    }
+    if (stale && overrideStale) {
+      confirmSource = `Needs-Review dashboard - confirmed accurate, no change needed (email checked by hand; previous-coach email warning for "${stale.priorLast}" overridden)`;
     }
     if (aiItemId) {
       const { data: aiItem } = await admin
