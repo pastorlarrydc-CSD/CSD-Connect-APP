@@ -232,6 +232,11 @@ function NeedsReviewPageInner() {
   const [editDrafts, setEditDrafts] = useState({});
   const [editErrors, setEditErrors] = useState({});
   const [rowNotes, setRowNotes] = useState({});
+  // Per-row "Confirmed accurate" refusals: { [schoolId]: { message, stale } }.
+  // Shown on the row itself (not only in the bar at the top of the page, which
+  // is easy to miss when scrolled down the queue). stale = true offers the
+  // "Confirm anyway" button.
+  const [confirmErrors, setConfirmErrors] = useState({});
   const [savingIds, setSavingIds] = useState({});
   const [saveAllProgress, setSaveAllProgress] = useState(null); // { done, total }
   const [aiNotesOpen, setAiNotesOpen] = useState({}); // schoolId -> true while "Why?" is open
@@ -303,6 +308,7 @@ function NeedsReviewPageInner() {
       setEditDrafts({});
       setEditErrors({});
       setRowNotes({});
+      setConfirmErrors({});
       setLoadingSchools(true);
       setError("");
       try {
@@ -434,22 +440,36 @@ function NeedsReviewPageInner() {
   // server re-checks that and logs it as an AI lookup, not a human confirm.
   // Returns true on success so the bulk "Confirm AI-matched" loop can stop
   // on the first failure.
-  const confirmAccurate = async (schoolId, aiItemId = null) => {
+  const confirmAccurate = async (schoolId, aiItemId = null, overrideStale = false) => {
     setConfirmingId(schoolId);
     setError("");
+    setConfirmErrors((prev) => {
+      const { [schoolId]: _drop, ...rest } = prev;
+      return rest;
+    });
+    let json = {};
     try {
+      const payload = { school_id: schoolId };
+      if (aiItemId) payload.ai_item_id = aiItemId;
+      if (overrideStale) payload.override_stale = true;
       const res = await authedFetch("/api/admin/needs-review/confirm", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(aiItemId ? { school_id: schoolId, ai_item_id: aiItemId } : { school_id: schoolId }),
+        body: JSON.stringify(payload),
       });
-      const json = await res.json();
+      json = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(json.error || "Could not save this confirmation.");
 
       dropClearedSchool(schoolId);
       return true;
     } catch (err) {
-      setError(err.message);
+      if (aiItemId) {
+        // Bulk "Confirm AI-matched" loop: keep the message in the bar at the top.
+        setError(err.message);
+      } else {
+        // A single-row click: show the reason right on that row.
+        setConfirmErrors((prev) => ({ ...prev, [schoolId]: { message: err.message, stale: json.code === "stale_email" } }));
+      }
       return false;
     } finally {
       setConfirmingId(null);
@@ -1163,12 +1183,30 @@ function NeedsReviewPageInner() {
                         style={{ background: "#1e7145", color: "#fff", borderColor: "#1e7145" }}
                         onClick={() => confirmAccurate(s.id)}
                         disabled={confirmingId === s.id || saving}
-                        title={stale ? "The email on file still looks like the previous coach's — open Edit to fix it first" : undefined}
+                        title={stale ? "The email on file still looks like the previous coach's — Edit it first, or use Confirm anyway if you have checked it" : undefined}
                       >
                         {confirmingId === s.id ? "Saving…" : "Confirmed accurate"}
                       </button>
                     </td>
                   </tr>,
+                  confirmErrors[s.id] && !editing && (
+                    <tr key={`confirm-err-${s.id}`}>
+                      <td colSpan={8} style={{ fontSize: 12.5, color: "#b3261e", paddingTop: 0 }}>
+                        <strong>Not confirmed:</strong> {confirmErrors[s.id].message}
+                        {confirmErrors[s.id].stale && (
+                          <button
+                            className="btn btn-sm"
+                            style={{ marginLeft: 10 }}
+                            onClick={() => confirmAccurate(s.id, null, true)}
+                            disabled={confirmingId === s.id}
+                            title="Use this only after checking that this email really is the current coach's. It is logged as an override."
+                          >
+                            {confirmingId === s.id ? "Saving…" : "Confirm anyway"}
+                          </button>
+                        )}
+                      </td>
+                    </tr>
+                  ),
                   rowNotes[s.id] && !editing && (
                     <tr key={`note-${s.id}`}>
                       <td colSpan={8} style={{ fontSize: 12, color: "#8a6d3b", paddingTop: 0 }}>
