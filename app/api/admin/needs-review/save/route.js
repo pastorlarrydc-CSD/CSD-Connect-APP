@@ -22,6 +22,7 @@ import { getSupabaseAdminClient } from "@/lib/supabase/admin";
 import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
 import { assessCoachChange, emailFit } from "@/lib/coachEmailFit";
 import { EDIT_FIELDS, isValidEmail, priorLastFromNote } from "@/lib/needsReviewEdit";
+import { findOtherSchoolsWithEmail } from "@/lib/sharedEmail";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
 const EDIT_SOURCE = "Needs-Review quick fix - edited by hand";
@@ -129,10 +130,23 @@ export async function POST(req) {
       if (logErr) throw logErr;
     }
 
+    // Heads-up (never blocks the save): the email just saved is already on
+    // another open school -- usually a copy from a same-named or neighboring
+    // school. The Shared Email page (/admin/shared-email) settles these.
+    let sharedWith = [];
+    if (update.hc_email) {
+      try {
+        sharedWith = await findOtherSchoolsWithEmail(admin, update.hc_email, schoolId);
+      } catch (_) {
+        sharedWith = [];
+      }
+    }
+
     return NextResponse.json({
       ok: true,
       cleared: !holdReason,
       reason: holdReason,
+      shared_email: sharedWith,
       changed: changes.map((c) => c.field_name),
       school: { hc_first_name: next.hc_first_name, hc_last_name: next.hc_last_name, hc_email: next.hc_email, hc_office: next.hc_office, hc_cell: next.hc_cell },
     });
