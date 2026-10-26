@@ -22,7 +22,7 @@ import { getSupabaseAdminClient } from "@/lib/supabase/admin";
 import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
 import { assessCoachChange, emailFit } from "@/lib/coachEmailFit";
 import { EDIT_FIELDS, isValidEmail, priorLastFromNote } from "@/lib/needsReviewEdit";
-import { findOtherSchoolsWithEmail } from "@/lib/sharedEmail";
+import { findSharedWarnings } from "@/lib/sharedEmail";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
 const EDIT_SOURCE = "Needs-Review quick fix - edited by hand";
@@ -136,7 +136,7 @@ export async function POST(req) {
     let sharedWith = [];
     if (update.hc_email) {
       try {
-        sharedWith = await findOtherSchoolsWithEmail(admin, update.hc_email, schoolId);
+        sharedWith = await findSharedWarnings(admin, update.hc_email, schoolId);
       } catch (_) {
         sharedWith = [];
       }
