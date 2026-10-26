@@ -1404,6 +1404,11 @@ export default function SchoolProfilePage() {
         <div>
           <h1>
             {school.name}
+            {school.is_co_op === "Yes" && (
+              <span className="badge" style={{ marginLeft: 10, verticalAlign: "middle", color: "#5b3fa6", background: "#efe9fb", fontWeight: 700 }} title="This school plays in a co-op / combined football program">
+                Co-op
+              </span>
+            )}
             {school.is_closed && (
               <span className="badge badge-private" style={{ marginLeft: 10, verticalAlign: "middle" }}>
                 {school.closed_category === "football_discontinued" ? "Football program discontinued" : "Closed"}
