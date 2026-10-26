@@ -331,6 +331,65 @@ export default function SchoolProfilePage() {
   const [staffEditing, setStaffEditing] = useState(false);
   const [staffCoachChangeFrom, setStaffCoachChangeFrom] = useState(null);
   const [staffEditValues, setStaffEditValues] = useState(EMPTY_STAFF_FORM);
+
+  // Shared-email warnings (staff only). sharedWith = other schools that already
+  // use this school's SAVED head-coach email (banner in the coach card);
+  // editEmailShared = other schools that already use the email being TYPED in
+  // Quick Fix, checked as you type. Both come from
+  // /api/admin/shared-email/check and stay empty when the email was already
+  // marked "both correct" on the Shared Email page.
+  const [sharedWith, setSharedWith] = useState([]);
+  const [editEmailShared, setEditEmailShared] = useState([]);
+  useEffect(() => {
+    let cancelled = false;
+    setSharedWith([]);
+    if (!isStaff || !school?.id || !school?.hc_email) return undefined;
+    (async () => {
+      try {
+        const {
+          data: { session },
+        } = await supabase.auth.getSession();
+        const res = await fetch(`/api/admin/shared-email/check?school_id=${encodeURIComponent(school.id)}`, {
+          headers: { Authorization: `Bearer ${session?.access_token}` },
+        });
+        if (!res.ok) return;
+        const json = await res.json().catch(() => ({}));
+        if (!cancelled) setSharedWith(Array.isArray(json.shared) ? json.shared : []);
+      } catch (_) {
+        /* a warning is a nicety -- never block the page on it */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isStaff, school?.id, school?.hc_email]);
+  const typedEmail = (staffEditValues.hc_email || "").trim();
+  useEffect(() => {
+    let cancelled = false;
+    setEditEmailShared([]);
+    if (!isStaff || !staffEditing || !school?.id || !typedEmail || typedEmail.toLowerCase() === (school.hc_email || "").trim().toLowerCase()) return undefined;
+    const timer = setTimeout(async () => {
+      try {
+        const {
+          data: { session },
+        } = await supabase.auth.getSession();
+        const res = await fetch(`/api/admin/shared-email/check?school_id=${encodeURIComponent(school.id)}&email=${encodeURIComponent(typedEmail)}`, {
+          headers: { Authorization: `Bearer ${session?.access_token}` },
+        });
+        if (!res.ok) return;
+        const json = await res.json().catch(() => ({}));
+        if (!cancelled) setEditEmailShared(Array.isArray(json.shared) ? json.shared : []);
+      } catch (_) {
+        /* ignore */
+      }
+    }, 500);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isStaff, staffEditing, typedEmail, school?.id, school?.hc_email]);
   // Lets a human confirm "no social media exists for this program" as
   // distinct from "nobody's checked" -- see lib/dataQuality.js's
   // hasFullCoachRecord for why that distinction matters. Not part of
@@ -1899,6 +1958,18 @@ export default function SchoolProfilePage() {
                 </button>
               )}
             </div>
+            {isStaff && sharedWith.length > 0 && (
+              <div className="notice" style={{ marginTop: 10, background: "#fff1de", color: "#8a4b00", fontSize: 13 }}>
+                <strong>Shared email:</strong> {school.hc_email} is also on{" "}
+                {sharedWith.map((o, i) => (
+                  <span key={o.id}>
+                    {i > 0 ? ", " : ""}
+                    <a href={`/schools/${o.id}`} target="_blank" rel="noopener noreferrer">{o.name} ({o.city}, {o.state})</a>
+                  </span>
+                ))}
+                . One of them is usually wrong. <a href="/admin/shared-email">Open Shared Email</a> to decide, or mark both correct there if this is a co-op or one coach really covers both.
+              </div>
+            )}
             <div className="kv" style={{ marginTop: 10 }}>
               <div className="k">Name</div>
               <div className="v">
@@ -1989,6 +2060,18 @@ export default function SchoolProfilePage() {
                     </div>
                   ))}
                 </div>
+                {editEmailShared.length > 0 && (
+                  <div className="notice" style={{ marginBottom: 8, background: "#fff1de", color: "#8a4b00", fontSize: 13 }}>
+                    <strong>Heads up:</strong> {typedEmail} is already on{" "}
+                    {editEmailShared.map((o, i) => (
+                      <span key={o.id}>
+                        {i > 0 ? ", " : ""}
+                        <a href={`/schools/${o.id}`} target="_blank" rel="noopener noreferrer">{o.name} ({o.city}, {o.state})</a>
+                      </span>
+                    ))}
+                    . Fine for a co-op or one coach covering both schools; otherwise this is probably the wrong school&apos;s email.
+                  </div>
+                )}
                 <div className="form-field" style={{ marginBottom: 8 }}>
                   <label style={{ display: "flex", alignItems: "center", gap: 6, fontWeight: 400 }}>
                     <input
