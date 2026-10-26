@@ -13,9 +13,11 @@
 //   action "duplicate" { email_key, keep_school_id }
 //        The schools in the group are the same school entered more than once.
 //        Every school except keep_school_id is closed as a duplicate of it.
-//   action "dismiss"   { email_key | email_keys[], note? }
+//   action "dismiss"   { email_key | email_keys[], note?, mark_coop? }
 //        Both/all schools are correct (a combined program, or one coach who
-//        really coaches both). The email stops being listed.
+//        really coaches both). The email stops being listed. With mark_coop
+//        true, every school in the group is also marked is_co_op = 'Yes'
+//        (logged), so the co-op badge shows on its profile and in Needs Review.
 //
 // Nothing here changes verification_status: a school that was verified stays
 // verified; an email that gets cleared leaves the school flagged for review.
@@ -28,6 +30,7 @@ import { SHARED_NOTE_PREFIX, emailKey, groupSharedRows, isSharedAuditNote } from
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
 const KEEP_SOURCE = "Shared-email review - email belongs to another school; cleared and sent to Needs Review";
 const DUP_SOURCE = "Shared-email review - closed as a duplicate school";
+const COOP_SOURCE = "Shared-email review - both schools correct; marked as a co-op / combined program";
 
 async function authorize(req) {
   const token = (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "");
@@ -82,6 +85,27 @@ export async function POST(req) {
       if (!keys.length) return NextResponse.json({ error: "email_key is required." }, { status: 400 });
       if (keys.length > 200) return NextResponse.json({ error: "Too many at once (200 max)." }, { status: 400 });
       const note = String(body.note || "").trim().slice(0, 500) || null;
+      const markCoop = body.mark_coop === true;
+      let coopMarked = 0;
+      if (markCoop) {
+        // Read the schools still sharing these emails BEFORE the dismissal hides them.
+        const { data: members, error: memErr } = await admin.from("shared_email_schools").select("id,is_co_op,email_key").in("email_key", keys).limit(5000);
+        if (memErr) throw memErr;
+        const todo = (members || []).filter((m) => m.is_co_op !== "Yes");
+        const ids = todo.map((m) => m.id);
+        for (let i = 0; i < ids.length; i += 200) {
+          const { error: coopErr } = await admin.from("schools").update({ is_co_op: "Yes" }).in("id", ids.slice(i, i + 200));
+          if (coopErr) throw coopErr;
+        }
+        if (todo.length) {
+          const logRows = todo.map((m) => ({ school_id: m.id, field_name: "is_co_op", old_value: m.is_co_op == null ? null : String(m.is_co_op), new_value: "Yes", source: COOP_SOURCE, changed_by: userId }));
+          for (let i = 0; i < logRows.length; i += 200) {
+            const { error: logErr } = await admin.from("school_change_log").insert(logRows.slice(i, i + 200));
+            if (logErr) throw logErr;
+          }
+        }
+        coopMarked = todo.length;
+      }
       const { error: insErr } = await admin
         .from("shared_email_dismissals")
         .upsert(keys.map((k) => ({ email_key: k, resolution: "both_correct", note, resolved_by: userId, resolved_at: now })), { onConflict: "email_key" });
@@ -93,7 +117,7 @@ export async function POST(req) {
         const { error: clrErr } = await admin.from("schools").update({ ...NEEDS_REVIEW_CLEAR_FIELDS }).in("id", clearIds);
         if (clrErr) throw clrErr;
       }
-      return NextResponse.json({ ok: true, dismissed: keys.length, flags_cleared: clearIds.length });
+      return NextResponse.json({ ok: true, dismissed: keys.length, flags_cleared: clearIds.length, coop_marked: coopMarked });
     }
 
     const key = emailKey(body.email_key);
