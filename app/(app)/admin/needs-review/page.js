@@ -1145,6 +1145,9 @@ function NeedsReviewPageInner() {
                   <tr key={s.id} id={`nr-row-${s.id}`} onClickCapture={() => rememberSchool(s.id)} onFocusCapture={() => rememberSchool(s.id)}>
                     <td>
                       <Link href={`/schools/${s.id}`} target="_blank" rel="noopener noreferrer" title="Opens in a new tab so this queue stays open">{s.name}</Link>
+                      {s.is_co_op === "Yes" && (
+                        <span className="badge" style={{ marginLeft: 6, color: "#5b3fa6", background: "#efe9fb", fontWeight: 700 }} title="Co-op / combined program">Co-op</span>
+                      )}
                       <div style={{ fontSize: 11.5, color: "#697386" }}>{schoolAddressLine(s)}</div>
                       <div style={{ marginTop: 3 }}>
                         <SchoolSiteLink school={s} />
