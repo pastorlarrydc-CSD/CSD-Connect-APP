@@ -242,6 +242,9 @@ function NeedsReviewPageInner() {
   const [aiNotesOpen, setAiNotesOpen] = useState({}); // schoolId -> true while "Why?" is open
   const [priorityOnly, setPriorityOnly] = useState(true);
   const [error, setError] = useState("");
+  // Set after a save when the email just entered is already on another open
+  // school: { school, email, others: [{id,name,city,state}] }. Shown as a banner.
+  const [sharedNotice, setSharedNotice] = useState(null);
   // Which state's saved view has been put back (so nothing is written to
   // storage until the restore has happened, and a failed load never wipes it).
   const [viewReadyFor, setViewReadyFor] = useState(null);
@@ -772,6 +775,9 @@ function NeedsReviewPageInner() {
       });
       const json = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(json.error || "Could not save this school.");
+      if (Array.isArray(json.shared_email) && json.shared_email.length > 0) {
+        setSharedNotice({ school: s.name, email: json.school?.hc_email || "", others: json.shared_email });
+      }
       if (json.cleared) {
         dropClearedSchool(s.id);
         return true;
@@ -865,9 +871,20 @@ function NeedsReviewPageInner() {
             Schools that need a second look, by state: ones someone flagged for review (with the reason shown) come first, then schools whose
             coach name, email, cell, or office phone has never been specifically re-checked since import.
           </p>
+          <p>
+            <Link href="/admin/shared-email" className="btn btn-sm btn-gold">Shared Email: one coach email on two schools</Link>
+          </p>
         </div>
       </div>
 
+      {sharedNotice && (
+        <div className="notice" style={{ marginBottom: 14, background: "#fff1de", color: "#8a4b00" }}>
+          Saved {sharedNotice.school}, but heads up: {sharedNotice.email} is also on{" "}
+          {sharedNotice.others.map((o) => `${o.name} (${o.city}, ${o.state})`).join("; ")}. One of them may be wrong.{" "}
+          <Link href="/admin/shared-email">Open Shared Email</Link>{" "}
+          <button className="btn btn-sm" style={{ marginLeft: 8 }} onClick={() => setSharedNotice(null)}>Dismiss</button>
+        </div>
+      )}
       {error && (
         <div className="notice danger" style={{ marginBottom: 14 }}>
           {error}
