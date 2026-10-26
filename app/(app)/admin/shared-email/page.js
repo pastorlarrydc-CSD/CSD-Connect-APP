@@ -18,7 +18,10 @@ import { linkableUrl } from "@/lib/needsReviewEdit";
 //   - "Email belongs here"   -> clears the email from the other school(s) and
 //                               sends them to Needs Review for a coach lookup
 //   - "Keep this, close the others" -> same school entered twice
-//   - "Both correct"         -> a combined program / one coach for two schools
+//   - "Both correct"         -> one coach really coaches both schools
+//   - "Both correct, mark as co-op" -> a combined / co-op program: same as Both
+//                               correct, and every school in the group also gets
+//                               the Co-op badge (is_co_op = Yes)
 const FILTERS = {
   all: { label: "All", test: () => true },
   same_city: { label: "Same city", test: (g) => g.same_city },
@@ -72,6 +75,9 @@ function SchoolColumn({ s, group, busy, onKeep, onDuplicate }) {
         )}
         {s.needs_review && (
           <span className="badge" style={{ color: "#b3261e", background: "#fdeeed", marginLeft: 6 }}>Flagged</span>
+        )}
+        {s.is_co_op === "Yes" && (
+          <span className="badge" style={{ color: "#5b3fa6", background: "#efe9fb", marginLeft: 6, fontWeight: 700 }}>Co-op</span>
         )}
       </div>
       <div style={{ fontSize: 12.5, marginBottom: 8 }}>
@@ -207,14 +213,18 @@ export default function SharedEmailPage() {
     }
   };
 
-  const dismissOne = async (group) => {
+  const dismissOne = async (group, markCoop = false) => {
     setBusyKey(group.email_key);
     setError("");
     setNotice("");
     try {
-      await post({ action: "dismiss", email_key: group.email_key });
+      await post({ action: "dismiss", email_key: group.email_key, mark_coop: markCoop });
       dropGroup(group.email_key);
-      setNotice(`Marked correct: ${group.email} (${group.schools.length} schools). It won't be listed again.`);
+      setNotice(
+        markCoop
+          ? `Marked as a co-op: ${group.email} (${group.schools.length} schools now show the Co-op badge). It won't be listed again.`
+          : `Marked correct: ${group.email} (${group.schools.length} schools). It won't be listed again.`
+      );
     } catch (err) {
       setError(err.message);
     } finally {
@@ -241,10 +251,12 @@ export default function SharedEmailPage() {
     [groups, filter, stateFilter]
   );
 
-  const dismissAllShown = async () => {
+  const dismissAllShown = async (markCoop = false) => {
     if (!shown.length) return;
     const ok = window.confirm(
-      `Mark ALL ${shown.length} shown emails as correct?\n\nOnly do this for combined programs and coaches who really coach both schools. Each email stops being listed.`
+      markCoop
+        ? `Mark ALL ${shown.length} shown emails as correct AND tag every school in them as a Co-op?\n\nOnly do this for combined / co-op programs. Each email stops being listed.`
+        : `Mark ALL ${shown.length} shown emails as correct?\n\nOnly do this for combined programs and coaches who really coach both schools. Each email stops being listed.`
     );
     if (!ok) return;
     setBulkBusy(true);
@@ -253,10 +265,10 @@ export default function SharedEmailPage() {
     try {
       const keys = shown.map((g) => g.email_key);
       for (let i = 0; i < keys.length; i += 100) {
-        await post({ action: "dismiss", email_keys: keys.slice(i, i + 100) });
+        await post({ action: "dismiss", email_keys: keys.slice(i, i + 100), mark_coop: markCoop });
       }
       setGroups((prev) => prev.filter((g) => !keys.includes(g.email_key)));
-      setNotice(`Marked ${keys.length} shared emails as correct.`);
+      setNotice(markCoop ? `Marked ${keys.length} shared emails as correct and tagged their schools as Co-op.` : `Marked ${keys.length} shared emails as correct.`);
     } catch (err) {
       setError(err.message);
       load();
@@ -318,9 +330,14 @@ export default function SharedEmailPage() {
               ))}
             </select>
             {filter === "same_coach" && shown.length > 0 && (
-              <button className="btn btn-sm" disabled={bulkBusy} onClick={dismissAllShown} style={{ marginLeft: "auto" }}>
-                {bulkBusy ? "Saving…" : `Mark all ${shown.length} shown as correct`}
-              </button>
+              <span style={{ marginLeft: "auto", display: "inline-flex", gap: 8, flexWrap: "wrap" }}>
+                <button className="btn btn-sm btn-gold" disabled={bulkBusy} onClick={() => dismissAllShown(true)}>
+                  {bulkBusy ? "Saving…" : `Mark all ${shown.length} shown as co-op`}
+                </button>
+                <button className="btn btn-sm" disabled={bulkBusy} onClick={() => dismissAllShown(false)}>
+                  {bulkBusy ? "Saving…" : `Mark all ${shown.length} shown as correct`}
+                </button>
+              </span>
             )}
           </div>
           <div style={{ fontSize: 13, color: "#697386", marginBottom: 10 }}>
@@ -336,9 +353,14 @@ export default function SharedEmailPage() {
                 <span className="badge" style={{ background: "#eef0f3", color: "#697386" }}>{g.schools.length} schools</span>
                 {g.same_city && <span className="badge" style={{ background: "#fff1de", color: "#8a4b00" }}>Same city</span>}
                 {!g.same_coach && <span className="badge" style={{ background: "#fdeeed", color: "#b3261e" }}>Different coach names</span>}
-                <button className="btn btn-sm" disabled={busyKey === g.email_key} onClick={() => dismissOne(g)} style={{ marginLeft: "auto" }}>
-                  Both correct
-                </button>
+                <span style={{ marginLeft: "auto", display: "inline-flex", gap: 6, flexWrap: "wrap" }}>
+                  <button className="btn btn-sm btn-gold" disabled={busyKey === g.email_key} onClick={() => dismissOne(g, true)} title="Combined / co-op program: both correct, and every school here gets the Co-op badge.">
+                    Both correct, mark as co-op
+                  </button>
+                  <button className="btn btn-sm" disabled={busyKey === g.email_key} onClick={() => dismissOne(g, false)} title="One coach really coaches both schools. No Co-op badge.">
+                    Both correct
+                  </button>
+                </span>
               </div>
               <div style={{ display: "flex", flexWrap: "wrap", gap: 12 }}>
                 {g.schools.map((s) => (
