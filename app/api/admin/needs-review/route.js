@@ -129,9 +129,9 @@ export async function GET(req) {
     const siteBySchool = new Map();
     for (let i = 0; i < schoolRows.length; i += 200) {
       const chunk = schoolRows.slice(i, i + 200).map((s) => s.id);
-      const { data: sites, error: sitesErr } = await admin.from("schools").select("id,athletics_url,website,addr1,addr2,zip,county").in("id", chunk);
+      const { data: sites, error: sitesErr } = await admin.from("schools").select("id,athletics_url,website,addr1,addr2,zip,county,is_co_op").in("id", chunk);
       if (sitesErr) throw sitesErr;
-      (sites || []).forEach((r) => siteBySchool.set(r.id, { athletics_url: r.athletics_url || null, website: r.website || null, addr1: r.addr1 || null, addr2: r.addr2 || null, zip: r.zip || null, county: r.county || null }));
+      (sites || []).forEach((r) => siteBySchool.set(r.id, { athletics_url: r.athletics_url || null, website: r.website || null, addr1: r.addr1 || null, addr2: r.addr2 || null, zip: r.zip || null, county: r.county || null, is_co_op: r.is_co_op || null }));
     }
     // What the AI found for a school, trimmed to what Quick Fix shows. Null when
     // there is no result, or it is older than AI_CHECK_MAX_AGE_DAYS.
@@ -158,7 +158,7 @@ export async function GET(req) {
       };
     };
     const schoolsWithAi = schoolRows.map((row) => {
-      const s = { ...row, ...(siteBySchool.get(row.id) || { athletics_url: null, website: null, addr1: null, addr2: null, zip: null, county: null }) };
+      const s = { ...row, ...(siteBySchool.get(row.id) || { athletics_url: null, website: null, addr1: null, addr2: null, zip: null, county: null, is_co_op: null }) };
       const it = aiBySchool.get(s.id);
       if (!it) return { ...s, ai_check: null };
       // Only re_verify runs count (see AI_TRUSTED_MODE) -- results from
