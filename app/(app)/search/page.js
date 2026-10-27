@@ -34,6 +34,7 @@ const DATE_PRESETS = [
 // change log (see school_verification_meta). A paste-match only means the
 // pasted list agreed with our own database; it is NOT an independent check.
 const METHODS = {
+  two_source: { label: "Two sources agree", color: "#0f6b3a", bg: "#d3f0df" },
   independent_web: { label: "Independent web check", color: "#1d7a4c", bg: "#e3f4ea" },
   staff_list: { label: "Staff / list verified", color: "#1f4fa3", bg: "#e4ecfa" },
   manual_edit: { label: "Manual edit", color: "#4a5568", bg: "#edf0f4" },
