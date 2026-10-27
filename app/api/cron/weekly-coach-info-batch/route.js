@@ -77,6 +77,7 @@ export const maxDuration = 60;
 //
 // Same CRON_SECRET auth and system_settings kill-switch pattern (key:
 // weekly_coach_info_batch_enabled) as every other cron route in this app.
+const KEY_STATES = ["TX", "FL", "GA", "CA", "OH", "IN"]; // same six states the other weekly batches target
 const WEEKLY_TARGET_COUNT = 300; // matches the manual tool's own default run size
 const FETCH_CONCURRENCY = 8; // no live user waiting on this one -- matches the other three weekly-*-batch crons' own concurrency
 const TIME_BUDGET_MS = 45_000; // leaves headroom under maxDuration=60 for the Anthropic Batch submit call after the fetch loop
@@ -125,20 +126,33 @@ export async function GET(req) {
     if (touchedErr) throw touchedErr;
     const excludedIds = new Set((touchedRows || []).map((r) => r.school_id));
 
-    const { data: rawCandidates, error: candErr } = await supabase
-      .from("schools")
-      .select("id,name,city,state,athletics_url,website,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,ad_name,ad_email")
-      .not("hc_first_name", "is", null)
-      .neq("hc_first_name", "")
-      .not("hc_last_name", "is", null)
-      .neq("hc_last_name", "")
-      .or("hc_email.is.null,hc_email.eq.")
-      // Closed/discontinued schools will never have a real coach to find
-      // -- see lib/dataQuality.js.
-      .eq("is_closed", false)
-      .order("id", { ascending: true })
-      .limit(WEEKLY_TARGET_COUNT * 3);
+    // Key recruiting states first (TX, FL, GA, CA, OH, IN), then everyone
+    // else to fill whatever room is left in this week's run. Built as one
+    // helper so both passes use the identical eligibility rules.
+    const pullCandidates = (applyStateScope) => {
+      let q = supabase
+        .from("schools")
+        .select("id,name,city,state,athletics_url,website,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,ad_name,ad_email")
+        .not("hc_first_name", "is", null)
+        .neq("hc_first_name", "")
+        .not("hc_last_name", "is", null)
+        .neq("hc_last_name", "")
+        .or("hc_email.is.null,hc_email.eq.")
+        // Closed/discontinued schools will never have a real coach to find
+        // -- see lib/dataQuality.js.
+        .eq("is_closed", false);
+      q = applyStateScope(q);
+      return q.order("id", { ascending: true }).limit(WEEKLY_TARGET_COUNT * 3);
+    };
+    const { data: keyStateRows, error: candErr } = await pullCandidates((q) => q.in("state", KEY_STATES));
     if (candErr) throw candErr;
+    const keyStateCandidates = (keyStateRows || []).filter((s) => !excludedIds.has(s.id));
+    let rawCandidates = keyStateCandidates;
+    if (keyStateCandidates.length < WEEKLY_TARGET_COUNT) {
+      const { data: otherRows, error: otherErr } = await pullCandidates((q) => q.not("state", "in", `(${KEY_STATES.join(",")})`));
+      if (otherErr) throw otherErr;
+      rawCandidates = [...keyStateCandidates, ...(otherRows || [])];
+    }
 
     const candidates = (rawCandidates || []).filter((s) => !excludedIds.has(s.id)).slice(0, WEEKLY_TARGET_COUNT);
     if (candidates.length === 0) {
