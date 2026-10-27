@@ -164,6 +164,9 @@ export async function GET(req) {
     // 12,000+ never-checked backlog. Final school_id tiebreaker just keeps
     // the batch order deterministic run to run.
     .order("last_checked_at", { ascending: true, nullsFirst: true })
+    // Among schools equally stale, the six key recruiting states (TX, FL, GA,
+    // CA, OH, IN -- see school_recheck_priority.is_key_state) go first.
+    .order("is_key_state", { ascending: false })
     .order("has_athletics_url", { ascending: false })
     .order("school_id", { ascending: true })
     .limit(BATCH_SIZE);
