@@ -729,7 +729,23 @@ export async function GET(req) {
       duplicateAlert = { error: err.message || String(err) };
     }
 
-    return NextResponse.json({ summary, duration_ms: Date.now() - startedAt, pool_alert: poolAlert, duplicate_touch_alert: duplicateAlert });
+    // Housekeeping (non-fatal): close pending coach proposals that leave
+    // nothing for a person to decide -- the AI named the coach already on
+    // file and suggested nothing new, or a person already handled the school
+    // after the AI ran. Status-only (pending -> skipped); no school data is
+    // touched. Rules live in the close_stale_pending_ai_items() database
+    // function. Added Oct 2026 after stale items kept re-accumulating (~100 a
+    // day) in the review lists.
+    let staleItemsClosed = null;
+    try {
+      const { data: closedCount, error: closeErr } = await supabase.rpc("close_stale_pending_ai_items");
+      if (closeErr) console.error("cron collect-batch-runs: stale-item sweep failed (non-fatal)", closeErr);
+      else staleItemsClosed = closedCount;
+    } catch (err) {
+      console.error("cron collect-batch-runs: stale-item sweep threw (non-fatal)", err);
+    }
+
+    return NextResponse.json({ summary, duration_ms: Date.now() - startedAt, pool_alert: poolAlert, duplicate_touch_alert: duplicateAlert, stale_items_closed: staleItemsClosed });
   } catch (err) {
     console.error("cron collect-batch-runs error", err);
     return NextResponse.json({ error: err.message || "Automated batch collection failed.", summary }, { status: 500 });
