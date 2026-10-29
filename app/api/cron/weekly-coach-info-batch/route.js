@@ -12,6 +12,7 @@ import {
   SYSTEM_PROMPT,
   MODEL,
   RESPONSE_MAX_TOKENS,
+  fetchAllOpenSchools,
 } from "@/lib/coachInfoLookup";
 // Reused here so this cron's own up-front duplicate-name detection (below)
 // stays in sync with findDuplicateNameSchools in lib/coachInfoLookup.js --
@@ -197,7 +198,15 @@ export async function GET(req) {
     // suggestion mentioning a conflicting state down to "low" confidence
     // regardless of what the model claims, once this run reaches
     // collect-batch-runs.
-    const { data: allOpenSchools } = await supabase.from("schools").select("id,name,city,state").eq("is_closed", false);
+    // Paged read of ALL open schools (a bare select only returns the first
+    // 1000 -- see fetchAllOpenSchools). Best-effort: on a read error the
+    // run proceeds without duplicate warnings, same as before.
+    let allOpenSchools = [];
+    try {
+      allOpenSchools = await fetchAllOpenSchools(supabase, "id,name,city,state");
+    } catch (err) {
+      console.error("cron weekly-coach-info-batch: could not load schools for duplicate-name check (continuing without it)", err);
+    }
     const duplicatesByKey = new Map();
     for (const row of allOpenSchools || []) {
       const key = looseSchoolNameKey(row.name);
