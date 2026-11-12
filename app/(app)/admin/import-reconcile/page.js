@@ -17,6 +17,7 @@ import {
 } from "@/lib/importReconcile";
 import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
 import { buildSchoolIndex, buildSheetIndex, evaluateGuard, indexAddSchool, indexUpdateSchool, rowKeyFor } from "@/lib/importGuard";
+import { summarizeImpact, impactLines } from "@/lib/importImpact";
 
 const PAGE_SIZE = 1000;
 const BATCH_SIZE = 300;
@@ -393,6 +394,9 @@ export default function ImportReconcilePage() {
   const [leftoverBusy, setLeftoverBusy] = useState(false);
   const [bulkStatus, setBulkStatus] = useState("");
   const [bulkError, setBulkError] = useState("");
+  // Dry-run preview shown before "Apply all" / "Add all" actually writes
+  // anything: { kind: "new_info" | "new_school", loading, error, summary }.
+  const [impact, setImpact] = useState(null);
   const [conflictSelections, setConflictSelections] = useState({}); // { [rowId]: { [field]: bool } }
   const [aiNote, setAiNote] = useState({}); // { [rowId]: "AI added 2 suggested fields..." } -- set by runAiLookup, cleared per-row on its next run
 
@@ -1390,6 +1394,63 @@ export default function ImportReconcilePage() {
     return rows.filter((r) => r.bucket === bucket && r.resolution === "pending" && (guards[r.id]?.level || "none") === "none" && !isWeakMatch(r));
   }
 
+  // Dry run for the two bulk buttons. Nothing is written here: it reads each
+  // affected school's current status and pending flags, then shows what the
+  // click would do (lib/importImpact.js). The modal's own button is what
+  // calls applyAllNewInfo / addAllNewSchools.
+  async function openImpact(kind) {
+    if (!schoolIndexRef.current) {
+      setBulkError("Still loading the school list for the safety check — try again in a few seconds.");
+      return;
+    }
+    const pending = safeRowsOf(kind);
+    if (!pending.length) return;
+    const trust = trustInfo(selectedBatch?.source_trust);
+    setBulkError("");
+    if (kind === "new_school") {
+      setImpact({ kind, loading: false, error: "", summary: summarizeImpact({ items: [], trusted: trust.trusted, newSchools: pending.length }), count: pending.length });
+      return;
+    }
+    setImpact({ kind, loading: true, error: "", summary: null, count: pending.length });
+    try {
+      const ids = [...new Set(pending.map((r) => r.match_school_id).filter(Boolean))];
+      const statusById = {};
+      const pendingFlags = {};
+      for (let i = 0; i < ids.length; i += 200) {
+        const chunk = ids.slice(i, i + 200);
+        // eslint-disable-next-line no-await-in-loop
+        const { data: sch, error: sErr } = await supabase.from("schools").select("id, verification_status, needs_review").in("id", chunk);
+        if (sErr) throw sErr;
+        (sch || []).forEach((s) => {
+          statusById[String(s.id)] = { verification_status: s.verification_status, needs_review: s.needs_review === true };
+        });
+        if (trust.trusted) {
+          // eslint-disable-next-line no-await-in-loop
+          const { data: fl, error: fErr } = await supabase.from("school_flags").select("school_id").in("school_id", chunk).eq("status", "pending");
+          if (fErr) throw fErr;
+          (fl || []).forEach((f) => {
+            pendingFlags[String(f.school_id)] = (pendingFlags[String(f.school_id)] || 0) + 1;
+          });
+        }
+      }
+      const index = schoolIndexRef.current;
+      const items = pending.map((r) => {
+        const s = index.byId.get(String(r.match_school_id));
+        return { schoolId: String(r.match_school_id), name: s?.name || r.mapped_data?.name || "", state: s?.state || r.mapped_data?.state || "", fields: r.diff || [] };
+      });
+      setImpact({ kind, loading: false, error: "", summary: summarizeImpact({ items, trusted: trust.trusted, statusById, pendingFlags, newSchools: 0 }), count: pending.length });
+    } catch (err) {
+      setImpact({ kind, loading: false, error: err.message || "Could not build the preview.", summary: null, count: pending.length });
+    }
+  }
+
+  async function confirmImpact() {
+    const kind = impact?.kind;
+    setImpact(null);
+    if (kind === "new_info") await applyAllNewInfo();
+    else if (kind === "new_school") await addAllNewSchools();
+  }
+
   async function applyAllNewInfo() {
     if (!schoolIndexRef.current) {
       setBulkError("Still loading the school list for the safety check — try again in a few seconds.");
@@ -2358,6 +2419,8 @@ export default function ImportReconcilePage() {
               </div>
             )}
 
+            {impact && <ImpactModal impact={impact} trustShort={batchTrust.short} trusted={batchTrust.trusted} onCancel={() => setImpact(null)} onConfirm={confirmImpact} />}
+
             {activeBucket === "new_info" && pendingInBucket.length > 0 && (
               <div className="card" style={{ marginBottom: 14 }}>
                 <p style={{ marginTop: 0, fontSize: 12.5, color: "#697386" }}>
@@ -2372,7 +2435,7 @@ export default function ImportReconcilePage() {
                     </>
                   )}
                 </p>
-                <button className="btn btn-sm btn-gold" onClick={applyAllNewInfo} disabled={bulkBusy || !indexReady || safeNewInfo.length === 0}>
+                <button className="btn btn-sm btn-gold" onClick={() => openImpact("new_info")} disabled={bulkBusy || !indexReady || safeNewInfo.length === 0}>
                   {bulkBusy ? bulkStatus || "Applying…" : !indexReady ? "Checking for mix-ups…" : `Apply all ${safeNewInfo.length} safe row${safeNewInfo.length === 1 ? "" : "s"}`}
                 </button>{" "}
                 {missingEmailInBucket.length > 0 && (
@@ -2413,7 +2476,7 @@ export default function ImportReconcilePage() {
                     (shown first, below) and {pendingInBucket.length - safeNewSchools.length > 1 ? "are" : "is"} left out of &quot;Add all&quot;.
                   </p>
                 )}
-                <button className="btn btn-sm btn-gold" onClick={addAllNewSchools} disabled={bulkBusy || !indexReady || safeNewSchools.length === 0}>
+                <button className="btn btn-sm btn-gold" onClick={() => openImpact("new_school")} disabled={bulkBusy || !indexReady || safeNewSchools.length === 0}>
                   {bulkBusy ? bulkStatus || "Adding…" : !indexReady ? "Checking for mix-ups…" : `Add all ${safeNewSchools.length} safe new school${safeNewSchools.length === 1 ? "" : "s"}`}
                 </button>
               </div>
@@ -3053,6 +3116,119 @@ function RowCard({ row, tag, busy, error, aiNote, guard, selection, onToggleFiel
 // it (row list, active tab, scroll position) never has to know this is
 // open, and never re-renders because of anything happening in here except
 // the one row this drawer is editing.
+// "What will this click do?" -- shown before Apply all / Add all writes
+// anything. All numbers come from lib/importImpact.js (a dry run, no writes).
+function ImpactModal({ impact, trustShort, trusted, onCancel, onConfirm }) {
+  const s = impact.summary;
+  const fieldRows = s ? Object.entries(s.byField).sort((a, b) => b[1].fill + b[1].overwrite + b[1].clear - (a[1].fill + a[1].overwrite + a[1].clear)) : [];
+  const confirmLabel = impact.kind === "new_school" ? `Add ${impact.count} new school${impact.count === 1 ? "" : "s"}` : `Apply to ${impact.count} school${impact.count === 1 ? "" : "s"}`;
+  return (
+    <>
+      <div onClick={onCancel} style={{ position: "fixed", inset: 0, background: "rgba(20, 24, 33, 0.45)", zIndex: 1100 }} />
+      <div
+        role="dialog"
+        aria-modal="true"
+        aria-label="Preview of what this will change"
+        style={{
+          position: "fixed",
+          top: "50%",
+          left: "50%",
+          transform: "translate(-50%, -50%)",
+          width: "min(560px, calc(100vw - 24px))",
+          maxHeight: "calc(100vh - 48px)",
+          overflowY: "auto",
+          background: "#fff",
+          borderRadius: 10,
+          zIndex: 1101,
+          boxShadow: "0 12px 40px rgba(20, 24, 33, 0.3)",
+          padding: "18px 20px",
+        }}
+      >
+        <h3 style={{ margin: "0 0 4px" }}>Before you click: here&apos;s what this will do</h3>
+        <p style={{ margin: "0 0 12px", fontSize: 12.5, color: "#697386" }}>
+          Nothing has been changed yet. Sheet source: <strong>{trustShort}</strong> ({trusted ? "treated as checked" : "treated as NOT checked"}).
+        </p>
+
+        {impact.loading && <p>Checking the current status of each school…</p>}
+        {impact.error && <div className="notice danger">{impact.error}</div>}
+
+        {s && (
+          <>
+            <ul style={{ margin: "0 0 12px", paddingLeft: 18, fontSize: 13.5, lineHeight: 1.55 }}>
+              {impactLines(s).map((line) => (
+                <li key={line}>{line}</li>
+              ))}
+            </ul>
+
+            {fieldRows.length > 0 && (
+              <table className="table" style={{ width: "100%", fontSize: 12.5, marginBottom: 12 }}>
+                <thead>
+                  <tr>
+                    <th style={{ textAlign: "left" }}>Field</th>
+                    <th>Filled</th>
+                    <th>Replaced</th>
+                    <th>Cleared</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {fieldRows.map(([label, c]) => (
+                    <tr key={label}>
+                      <td>{label}</td>
+                      <td style={{ textAlign: "center" }}>{c.fill || "–"}</td>
+                      <td style={{ textAlign: "center" }}>{c.overwrite || "–"}</td>
+                      <td style={{ textAlign: "center", color: c.clear ? "#b3261e" : undefined }}>{c.clear || "–"}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+
+            {s.watch.length > 0 && (
+              <div className="notice danger" style={{ marginBottom: 12 }}>
+                <strong>Worth a second look</strong>
+                <ul style={{ margin: "6px 0 0", paddingLeft: 18 }}>
+                  {s.watch.map((w) => (
+                    <li key={w}>{w}</li>
+                  ))}
+                </ul>
+                {s.nameChanges.length > 0 && (
+                  <div style={{ marginTop: 8, fontSize: 12.5 }}>
+                    Coach changes:{" "}
+                    {s.nameChanges
+                      .slice(0, 8)
+                      .map((n) => `${n.name}${n.state ? ` (${n.state})` : ""}: ${n.from || "blank"} → ${n.to}`)
+                      .join("; ")}
+                    {s.nameChanges.length > 8 ? `; and ${s.nameChanges.length - 8} more` : ""}
+                  </div>
+                )}
+                {s.verifiedDowngraded.length > 0 && (
+                  <div style={{ marginTop: 8, fontSize: 12.5 }}>
+                    Will lose Verified:{" "}
+                    {s.verifiedDowngraded
+                      .slice(0, 8)
+                      .map((n) => `${n.name}${n.state ? ` (${n.state})` : ""}`)
+                      .join("; ")}
+                    {s.verifiedDowngraded.length > 8 ? `; and ${s.verifiedDowngraded.length - 8} more` : ""}
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        )}
+
+        <div style={{ display: "flex", gap: 8, justifyContent: "flex-end", flexWrap: "wrap" }}>
+          <button className="btn btn-sm" onClick={onCancel}>
+            Cancel — change nothing
+          </button>
+          <button className="btn btn-sm btn-gold" onClick={onConfirm} disabled={impact.loading || !s}>
+            {confirmLabel}
+          </button>
+        </div>
+      </div>
+    </>
+  );
+}
+
 function SchoolProfileDrawer({ open, loading, saving, justSaved, error, aiBusy, aiNote, school, values, row, onChange, onClose, onSave, onRunAi }) {
   if (!open) return null;
 
