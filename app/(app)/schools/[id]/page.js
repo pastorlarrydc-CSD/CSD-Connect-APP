@@ -5,6 +5,7 @@ import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 import { resolveCoachNameAt } from "@/lib/coachHistory";
 import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
+import { assessEmailOwnership, carryOverFromHistory } from "@/lib/emailOwnership";
 
 function fmtPhone(v) {
   if (!v) return "";
@@ -1196,11 +1197,66 @@ export default function SchoolProfilePage() {
     if (error) console.error("Could not stamp manually_confirmed_at/by on the bounce event", error);
   }
 
+  // "Does the email on this record belong to the coach on it?" -- asked just
+  // before a record is stamped Verified, because Verified is read as "this
+  // contact info is right". Nov 2026: five schools were verified with the
+  // new coach's name and the departed coach's email still on them. Uses the
+  // school's change history to find the previous coach and whether the email
+  // was touched since (lib/emailOwnership.js). Never blocks -- it asks, and
+  // the reviewer can go ahead. Returns true to continue, false to stop.
+  //   proposed: { first, last, email } as it WILL be after this action.
+  async function confirmEmailOwnership(proposed) {
+    try {
+      const email = (proposed.email || "").trim();
+      if (!email) return true;
+      const curFirst = (school.hc_first_name || "").trim();
+      const curLast = (school.hc_last_name || "").trim();
+      const nameChanging = Boolean((curFirst || curLast) && ((proposed.first || "").trim() !== curFirst || (proposed.last || "").trim() !== curLast));
+      let priorCoach;
+      let carriedOver;
+      if (nameChanging) {
+        // This very save changes the coach: the coach on file now is the
+        // previous one, and the email is carried over if it isn't being edited.
+        priorCoach = { first: curFirst, last: curLast };
+        carriedOver = email === (school.hc_email || "").trim();
+      } else {
+        const { data: hist, error: histErr } = await supabase
+          .from("school_change_log")
+          .select("field_name, old_value, new_value, changed_at")
+          .eq("school_id", id)
+          .in("field_name", ["hc_first_name", "hc_last_name", "hc_email"])
+          .order("changed_at", { ascending: false })
+          .limit(60);
+        if (histErr) return true; // can't check -- don't get in the way
+        const carry = carryOverFromHistory(hist || []);
+        priorCoach = carry.priorCoach;
+        carriedOver = carry.carriedOver === true && email === (school.hc_email || "").trim();
+      }
+      const verdict = assessEmailOwnership({
+        email,
+        coach: { first: (proposed.first || "").trim(), last: (proposed.last || "").trim() },
+        priorCoach,
+        carriedOver,
+      });
+      if (verdict.level === "ok") return true;
+      return window.confirm(`${verdict.message}\n\nMarking this record Verified says the email is right. Continue anyway?`);
+    } catch (err) {
+      console.error("Email ownership check failed -- continuing without it", err);
+      return true;
+    }
+  }
+
   async function saveStaffEdit(e) {
     e.preventDefault();
     setStaffSaveError("");
     setStaffSaving(true);
     try {
+      const okToSave = await confirmEmailOwnership({
+        first: staffEditValues.hc_first_name || "",
+        last: staffEditValues.hc_last_name || "",
+        email: staffEditValues.hc_email || "",
+      });
+      if (!okToSave) return;
       const isCoachChange = !!staffCoachChangeFrom;
       const changes = [];
       const nowIso = new Date().toISOString();
@@ -1280,6 +1336,12 @@ export default function SchoolProfilePage() {
     setMarkingVerified(true);
     setMarkVerifiedError("");
     try {
+      const okToVerify = await confirmEmailOwnership({
+        first: school.hc_first_name || "",
+        last: school.hc_last_name || "",
+        email: school.hc_email || "",
+      });
+      if (!okToVerify) return;
       const nowIso = new Date().toISOString();
       const update = { verification_status: "verified", last_verified_at: nowIso, coach_radar_reviewed_at: nowIso };
       // Dead Email Recovery tie-in -- see findConfirmableBounce above. Mark
