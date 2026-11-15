@@ -1,7 +1,10 @@
 import { NextResponse } from "next/server";
 import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
 import { settleReVerifyItem } from "@/lib/backlogVerify";
-import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion, runWithConcurrency, findDuplicateNameSchoolsForMany } from "@/lib/coachInfoLookup";
+import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion, runWithConcurrency, findDuplicateNameSchoolsForMany, loadItemSourceText } from "@/lib/coachInfoLookup";
+import { secondPassIfNeeded } from "@/lib/aiSecondPass";
+
+export const maxDuration = 60;
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
 
@@ -98,7 +101,7 @@ export async function POST(req, { params }) {
     // school_id -> schools FK) so normalizeSuggestion's same-name-school
     // backstops below have something to check the AI's answer against --
     // see that function's own comment in lib/coachInfoLookup.js.
-    const { data: itemRows } = await supabase.from("coach_info_batch_items").select("id,school_id,school:schools(name,city,state)").eq("batch_run_id", runId);
+    const { data: itemRows } = await supabase.from("coach_info_batch_items").select("id,school_id,school:schools(name,city,state,hc_first_name,hc_last_name)").eq("batch_run_id", runId);
     const schoolIdByItemId = new Map((itemRows || []).map((r) => [r.id, r.school_id]));
     // hasKnownDuplicates per school -- one query for the whole run (see
     // findDuplicateNameSchoolsForMany's own comment) rather than one per
@@ -132,6 +135,9 @@ export async function POST(req, { params }) {
     let reVerifySkipped = 0;
     let reVerifyErrors = 0;
     let saveErr = null;
+    // Second-look budget (see lib/aiSecondPass.js): once spent, remaining
+    // suggestions are stored as they were, without the skeptical re-read.
+    const secondPassBudget = { deadline: Date.now() + 40000 };
 
     // Processed COLLECT_CONCURRENCY-at-a-time rather than one line at a
     // time -- see COLLECT_CONCURRENCY's comment above. The counters below
@@ -156,7 +162,15 @@ export async function POST(req, { params }) {
         const rawText = entry.result.message?.content?.[0]?.text || "";
         const parsed = parseModelJson(rawText);
         if (parsed) {
-          patch = { suggestion: normalizeSuggestion(parsed, "batch AI lookup", schoolLocationByItemId.get(itemId)), suggestion_error: null };
+          // The exact text the model was given, so its quotes/dates can be
+          // checked (lib/aiEvidence.js), then a skeptical second read for the
+          // suggestions that matter (lib/aiSecondPass.js). Both only ever
+          // lower confidence.
+          const loc = schoolLocationByItemId.get(itemId);
+          const sourceText = await loadItemSourceText(supabase, "coach_info_batch_items", itemId);
+          let suggestion = normalizeSuggestion(parsed, "batch AI lookup", loc, sourceText);
+          suggestion = await secondPassIfNeeded({ apiKey, school: loc, suggestion, sourceText, budget: secondPassBudget });
+          patch = { suggestion, suggestion_error: null };
           succeeded++;
         } else {
           patch = { suggestion: null, suggestion_error: "Could not parse the AI's response for this school." };
