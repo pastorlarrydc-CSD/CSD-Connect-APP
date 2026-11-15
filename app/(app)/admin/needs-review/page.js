@@ -97,7 +97,8 @@ function EvidenceBadges({ ai }) {
       </span>
     );
     if (ev.quote_verified === false) items.push(<span key="q" style={{ color: "#b3261e" }}>quote not found on page</span>);
-    if (ev.email_verified === false) items.push(<span key="e" style={{ color: "#b3261e" }}>email not on page</span>);
+    if (ev.email_verified === false && ev.email_on_file_only) items.push(<span key="e" style={{ color: "#8a6100" }}>email on file, not re-confirmed</span>);
+    else if (ev.email_verified === false) items.push(<span key="e" style={{ color: "#b3261e" }}>email not on page</span>);
   }
   if (items.length === 0) return null;
   return (
