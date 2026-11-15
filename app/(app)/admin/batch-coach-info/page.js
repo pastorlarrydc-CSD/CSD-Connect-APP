@@ -158,8 +158,9 @@ function evidenceWarning(sug) {
   const reasons = [];
   if (sp && sp.verdict === "contradicted") reasons.push(`second look found a conflict${sp.conflicting_name ? ` (${sp.conflicting_name})` : ""}`);
   if (ev && ev.name_quote_verified === false) reasons.push("the AI's quote was not found on the page");
-  if (ev && ev.email_verified === false && sug.hc_email && !sug.hc_email_estimated) reasons.push("the email was not found on the page");
-  if (ev && ev.freshness && ev.freshness !== "current") reasons.push(ev.freshness === "undated" ? "no dated proof" : ev.freshness === "older" ? "proof is from last season" : "proof is stale");
+  if (ev && ev.email_verified === false && !ev.email_on_file_only && sug.hc_email && !sug.hc_email_estimated) reasons.push("the email was not found on the page");
+  const undatedSoft = ev && Array.isArray(ev.soft) && ev.soft.some((x) => /no date was shown/.test(x));
+  if (ev && ev.freshness && ev.freshness !== "current" && !undatedSoft) reasons.push(ev.freshness === "undated" ? "no dated proof" : ev.freshness === "older" ? "proof is from last season" : "proof is stale");
   return reasons;
 }
 
@@ -205,7 +206,8 @@ function EvidenceBlock({ sug }) {
             {ev.source_date ? ` · page dated ${ev.source_date}` : ""}
             {ev.recency_date ? ` · activity dated ${ev.recency_date}` : ""}
           </div>
-          {sug.hc_email && !sug.hc_email_estimated && ev.email_verified === false && <div style={{ color: "#b3261e" }}>The email address was not found in the pages the AI read.</div>}
+          {sug.hc_email && !sug.hc_email_estimated && ev.email_verified === false && !ev.email_on_file_only && <div style={{ color: "#b3261e" }}>The email address was not found in the pages the AI read.</div>}
+          {ev.email_on_file_only && <div style={{ color: "#8a6100" }}>Same email as on file; not re-confirmed on a page.</div>}
         </div>
       )}
     </div>
