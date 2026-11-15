@@ -23,7 +23,7 @@
 import { NextResponse } from "next/server";
 import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
-import { compareSuggestion, isFreshAiCheck, AI_TRUSTED_MODE } from "@/lib/needsReviewAi";
+import { compareSuggestion, isFreshAiCheck, AI_TRUSTED_MODE, summarizeEvidence } from "@/lib/needsReviewAi";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
 const PRIORITY_STATES = ["TX", "FL", "GA", "CA", "OH", "IN"];
@@ -155,6 +155,7 @@ export async function GET(req) {
         hc_cell: text(sg.hc_cell),
         source: text(sg.source).slice(0, 80),
         notes: text(sg.notes).slice(0, 600),
+        ...summarizeEvidence(sg),
       };
     };
     const schoolsWithAi = schoolRows.map((row) => {
