@@ -148,6 +148,70 @@ function schoolAddressLine(s) {
   return [s.addr1, s.addr2, cityState].filter((x) => x && String(x).trim()).join(", ");
 }
 
+// Proof the AI showed for a suggestion, plus the second look's verdict (see
+// lib/aiEvidence.js and lib/aiSecondPass.js). Both are stored on the
+// suggestion. Suggestions from batches run before those checks existed carry
+// neither, and show nothing extra.
+function evidenceWarning(sug) {
+  const ev = sug && sug.evidence && sug.evidence.checked ? sug.evidence : null;
+  const sp = sug && sug.second_pass ? sug.second_pass : null;
+  const reasons = [];
+  if (sp && sp.verdict === "contradicted") reasons.push(`second look found a conflict${sp.conflicting_name ? ` (${sp.conflicting_name})` : ""}`);
+  if (ev && ev.name_quote_verified === false) reasons.push("the AI's quote was not found on the page");
+  if (ev && ev.email_verified === false && sug.hc_email && !sug.hc_email_estimated) reasons.push("the email was not found on the page");
+  if (ev && ev.freshness && ev.freshness !== "current") reasons.push(ev.freshness === "undated" ? "no dated proof" : ev.freshness === "older" ? "proof is from last season" : "proof is stale");
+  return reasons;
+}
+
+function EvidenceBlock({ sug }) {
+  const ev = sug && sug.evidence && sug.evidence.checked ? sug.evidence : null;
+  const sp = sug && sug.second_pass ? sug.second_pass : null;
+  if (!ev && !sp) return null;
+  const fresh = ev ? ev.freshness || "undated" : null;
+  const freshLabel = fresh === "current" ? "Current-season evidence" : fresh === "older" ? "Only last season's evidence" : fresh === "stale" ? "Evidence is more than a season old" : "No dated evidence shown";
+  const srcUrl = ev ? linkableUrl(ev.source_url) : null;
+  return (
+    <div style={{ marginTop: 6, fontSize: 11.5 }}>
+      {sp && sp.verdict === "contradicted" && (
+        <div style={{ padding: "5px 7px", background: "#fdeeed", border: "1px solid #f3c9c5", borderRadius: 6, color: "#8c1d18", marginBottom: 4 }}>
+          <strong>Second look found a conflict</strong>
+          {sp.conflicting_name ? ` (${sp.conflicting_name})` : ""}: {sp.reason}
+          {sp.conflicting_quote && <div style={{ fontStyle: "italic", marginTop: 2 }}>"{sp.conflicting_quote}"</div>}
+        </div>
+      )}
+      {sp && sp.verdict === "supported" && <div style={{ color: "#1e7145", marginBottom: 2 }}>✓ Second look found nothing against this answer</div>}
+      {ev && (
+        <div style={{ color: "#4a5568" }}>
+          <span style={{ color: "#697386" }}>Proof shown: </span>
+          {ev.name_quote ? (
+            <span style={{ fontStyle: "italic" }}>
+              "{ev.name_quote}"
+              {ev.name_quote_verified === true && <span style={{ color: "#1e7145", fontStyle: "normal" }}> ✓ found on the page</span>}
+              {ev.name_quote_verified === false && <span style={{ color: "#b3261e", fontStyle: "normal" }}> ✗ not found on the page</span>}
+            </span>
+          ) : (
+            <span style={{ color: "#b3261e" }}>none given</span>
+          )}
+          {srcUrl && (
+            <>
+              {" "}
+              <a href={srcUrl} target="_blank" rel="noopener noreferrer">
+                open source ↗
+              </a>
+            </>
+          )}
+          <div style={{ color: fresh === "current" ? "#1e7145" : "#8a6100", marginTop: 1 }}>
+            {freshLabel}
+            {ev.source_date ? ` · page dated ${ev.source_date}` : ""}
+            {ev.recency_date ? ` · activity dated ${ev.recency_date}` : ""}
+          </div>
+          {sug.hc_email && !sug.hc_email_estimated && ev.email_verified === false && <div style={{ color: "#b3261e" }}>The email address was not found in the pages the AI read.</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function SchoolSiteLink({ school }) {
   const ath = linkableUrl(school?.athletics_url);
   const web = ath ? null : linkableUrl(school?.website);
@@ -2102,6 +2166,9 @@ function BatchCoachInfoPageInner() {
         "email_estimated",
         "source",
         "notes",
+        "evidence_quote",
+        "evidence_freshness",
+        "second_look",
         "status",
       ],
       data: visibleRows.map((item) => {
@@ -2123,6 +2190,9 @@ function BatchCoachInfoPageInner() {
           sug.hc_email_estimated ? "Yes" : "No",
           sug.source || "",
           sug.notes || "",
+          sug.evidence && sug.evidence.checked ? sug.evidence.name_quote || "" : "",
+          sug.evidence && sug.evidence.checked ? sug.evidence.freshness || "" : "",
+          sug.second_pass ? `${sug.second_pass.verdict}${sug.second_pass.conflicting_name ? `: ${sug.second_pass.conflicting_name}` : ""}` : "",
           item.review_status === "pending"
             ? "Pending"
             : item.review_status === "applied"
@@ -2816,6 +2886,7 @@ function BatchCoachInfoPageInner() {
                                   </div>
                                 ))
                               )}
+                              <EvidenceBlock sug={sug} />
                               {sug.notes && (
                                 <div style={{ marginTop: 4 }}>
                                   <button
@@ -2837,6 +2908,11 @@ function BatchCoachInfoPageInner() {
                               <span className="badge" style={{ fontSize: 11, color: sug.confidence === "high" ? "#1e7145" : sug.confidence === "medium" ? "#8a6100" : "#b3261e" }}>
                                 {sug.confidence}
                               </span>
+                              {evidenceWarning(sug).length > 0 && (
+                                <div style={{ fontSize: 10.5, color: "#b3261e", marginTop: 2, whiteSpace: "normal", maxWidth: 120 }} title={evidenceWarning(sug).join("; ")}>
+                                  ⚠ {evidenceWarning(sug).length === 1 ? evidenceWarning(sug)[0] : `${evidenceWarning(sug).length} cautions`}
+                                </div>
+                              )}
                             </td>
                             <td style={{ padding: "8px", whiteSpace: "nowrap" }}>
                               {reviewed ? (
