@@ -16,6 +16,7 @@ import {
   MODEL,
   RESPONSE_MAX_TOKENS,
 } from "@/lib/coachInfoLookup";
+import { secondPassIfNeeded } from "@/lib/aiSecondPass";
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
 // Every other network call in this route (fetchPageText, searchWeb) is
@@ -37,7 +38,7 @@ const AI_TIMEOUT_MS = 20000;
 // this stage's total; it's still bounded at roughly 16s, same as before
 // findRecentGameEvidence was added. maxDuration bumped accordingly (16s
 // fetch/search stage + AI_TIMEOUT_MS, plus headroom).
-export const maxDuration = 45;
+export const maxDuration = 60;
 
 // AI auto-fill for the Quick Fix panel: instead of a human reading a
 // school's site by hand (or Googling it) to find and retype the head
@@ -234,9 +235,14 @@ export async function POST(req, { params }) {
     // mix-up (Columbia HS, SC vs. Huntsville, AL) even when the model never
     // names the WRONG place outright, which otherStatesMentioned alone
     // can't do.
-    return NextResponse.json(
-      normalizeSuggestion(parsed, defaultSource, { city: school.city, state: school.state, hasKnownDuplicates: duplicateSchools.length > 0 })
-    );
+    const schoolLocation = { city: school.city, state: school.state, hasKnownDuplicates: duplicateSchools.length > 0 };
+    // Evidence check against the exact text sent to the model (see
+    // lib/aiEvidence.js), then -- for high-confidence answers and for a
+    // different-coach answer -- a skeptical second read of the same text
+    // (lib/aiSecondPass.js). Both only ever lower confidence.
+    let suggestion = normalizeSuggestion(parsed, defaultSource, schoolLocation, userMessage);
+    suggestion = await secondPassIfNeeded({ apiKey, school: { ...school }, suggestion, sourceText: userMessage, budget: { deadline: Date.now() + 12000 } });
+    return NextResponse.json(suggestion);
   } catch (err) {
     console.error("discover-coach-info error", err);
     return NextResponse.json({ error: "Could not look up coach info right now. Please try again." }, { status: 500 });
