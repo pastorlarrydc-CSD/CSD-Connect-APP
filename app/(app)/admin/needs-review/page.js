@@ -72,7 +72,51 @@ const AI_FILTER_ORDER = ["ai_matched", "ai_review", "ai_pending", "ai_none"];
 // be narrowed to just those, so "Send to AI verification" only sends them.
 const isHardBounceFlag = (s) => /hard-bounced/i.test(String(s?.needs_review_note || ""));
 
+// Small evidence line under the AI check: how fresh the proof is and whether
+// the second look found a conflict. Nothing renders for results from before
+// these checks existed.
+function EvidenceBadges({ ai }) {
+  if (!ai) return null;
+  const ev = ai.evidence;
+  const sp = ai.second_pass;
+  const items = [];
+  if (sp && sp.verdict === "contradicted") {
+    items.push(
+      <span key="sp" style={{ color: "#b3261e", fontWeight: 700 }} title={sp.conflicting_quote ? `"${sp.conflicting_quote}"` : sp.reason}>
+        ⚠ Second look found a conflict{sp.conflicting_name ? `: ${sp.conflicting_name}` : ""}
+      </span>
+    );
+  }
+  if (ev) {
+    const fresh = ev.freshness || "undated";
+    const color = fresh === "current" ? "#1e7145" : fresh === "undated" ? "#8a6100" : "#b3261e";
+    const label = fresh === "current" ? "Current-season proof" : fresh === "older" ? "Last season's page" : fresh === "stale" ? "Stale page" : "Undated page";
+    items.push(
+      <span key="fr" style={{ color }} title={ev.date ? `Dated: ${ev.date}` : "No date shown in the source"}>
+        {label}
+      </span>
+    );
+    if (ev.quote_verified === false) items.push(<span key="q" style={{ color: "#b3261e" }}>quote not found on page</span>);
+    if (ev.email_verified === false) items.push(<span key="e" style={{ color: "#b3261e" }}>email not on page</span>);
+  }
+  if (items.length === 0) return null;
+  return (
+    <div style={{ fontSize: 11, display: "flex", flexDirection: "column", gap: 1, marginTop: 3 }}>{items}</div>
+  );
+}
+
 function AiCheckCell({ ai }) {
+  const inner = <AiCheckCellInner ai={ai} />;
+  if (!ai || ai.status === "pending") return inner;
+  return (
+    <div>
+      {inner}
+      <EvidenceBadges ai={ai} />
+    </div>
+  );
+}
+
+function AiCheckCellInner({ ai }) {
   if (!ai) return <span style={{ color: "#a2a9b6" }}>—</span>;
   if (ai.status === "pending") {
     return <span style={{ fontSize: 12, color: "#697386" }}>In progress (run #{ai.run_id})</span>;
@@ -240,6 +284,8 @@ function NeedsReviewPageInner() {
   const [savingIds, setSavingIds] = useState({});
   const [saveAllProgress, setSaveAllProgress] = useState(null); // { done, total }
   const [aiNotesOpen, setAiNotesOpen] = useState({}); // schoolId -> true while "Why?" is open
+  // "Find email on staff pages" results per school: { loading, error, data }
+  const [emailFinds, setEmailFinds] = useState({});
   const [priorityOnly, setPriorityOnly] = useState(true);
   const [error, setError] = useState("");
   // Set after a save when the email just entered is already on another open
@@ -714,6 +760,29 @@ function NeedsReviewPageInner() {
       estimated: f === "hc_email" && sg.hc_email_estimated,
     }));
   };
+  // Reads the school's own staff pages for an email printed next to the coach
+  // (app/api/admin/needs-review/find-email). Read-only: nothing is saved until
+  // "Use this" fills the Email box and the row is saved like any other edit.
+  const findEmail = async (s) => {
+    setEmailFinds((prev) => ({ ...prev, [s.id]: { loading: true } }));
+    try {
+      const res = await authedFetch("/api/admin/needs-review/find-email", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ school_id: s.id }),
+      });
+      const json = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(json.error || "Could not search the staff pages.");
+      setEmailFinds((prev) => ({ ...prev, [s.id]: { data: json } }));
+    } catch (err) {
+      setEmailFinds((prev) => ({ ...prev, [s.id]: { error: err.message } }));
+    }
+  };
+  const useFoundEmail = (s, email) => {
+    setEmailDraft(s, email);
+  };
+  const setEmailDraft = (s, email) =>
+    setEditDrafts((prev) => ({ ...prev, [s.id]: { ...(prev[s.id] || {}), hc_email: email, __clearEmail: false } }));
   const useAiField = (s, field) => {
     const f = aiFindings(s).find((x) => x.field === field);
     if (!f) return;
@@ -1275,6 +1344,46 @@ function NeedsReviewPageInner() {
                                 </div>
                               );
                             })}
+                            {s.ai_suggestion.second_pass && s.ai_suggestion.second_pass.verdict === "contradicted" && (
+                              <div style={{ marginTop: 6, padding: "6px 8px", background: "#fdeeed", border: "1px solid #f3c9c5", borderRadius: 6, color: "#8c1d18" }}>
+                                <strong>Second look found a conflict</strong>
+                                {s.ai_suggestion.second_pass.conflicting_name ? ` (${s.ai_suggestion.second_pass.conflicting_name})` : ""}: {s.ai_suggestion.second_pass.reason}
+                                {s.ai_suggestion.second_pass.conflicting_quote && <div style={{ fontStyle: "italic", marginTop: 2 }}>&ldquo;{s.ai_suggestion.second_pass.conflicting_quote}&rdquo;</div>}
+                              </div>
+                            )}
+                            {s.ai_suggestion.evidence && (
+                              <div style={{ marginTop: 6, color: "#4a5568" }}>
+                                <span style={{ color: "#697386" }}>Proof the AI showed: </span>
+                                {s.ai_suggestion.evidence.quote ? (
+                                  <span style={{ fontStyle: "italic" }}>
+                                    &ldquo;{s.ai_suggestion.evidence.quote}&rdquo;
+                                    {s.ai_suggestion.evidence.quote_verified === true && <span style={{ color: "#1e7145", fontStyle: "normal" }}> ✓ found on the page</span>}
+                                    {s.ai_suggestion.evidence.quote_verified === false && <span style={{ color: "#b3261e", fontStyle: "normal" }}> ✗ not found on the page</span>}
+                                  </span>
+                                ) : (
+                                  <span style={{ color: "#b3261e" }}>none given</span>
+                                )}
+                                {s.ai_suggestion.evidence.url && (
+                                  <>
+                                    {" "}
+                                    <a href={linkableUrl(s.ai_suggestion.evidence.url)} target="_blank" rel="noopener noreferrer" style={{ fontSize: 11.5 }}>
+                                      open source ↗
+                                    </a>
+                                  </>
+                                )}
+                                <div style={{ fontSize: 11.5, marginTop: 2, color: s.ai_suggestion.evidence.freshness === "current" ? "#1e7145" : "#8a6100" }}>
+                                  {s.ai_suggestion.evidence.freshness === "current"
+                                    ? "Current-season evidence"
+                                    : s.ai_suggestion.evidence.freshness === "older"
+                                    ? "Only last season's evidence"
+                                    : s.ai_suggestion.evidence.freshness === "stale"
+                                    ? "Evidence is more than a season old"
+                                    : "No dated evidence shown"}
+                                  {s.ai_suggestion.evidence.date ? ` · page dated ${s.ai_suggestion.evidence.date}` : ""}
+                                  {s.ai_suggestion.evidence.recency_date ? ` · activity dated ${s.ai_suggestion.evidence.recency_date}` : ""}
+                                </div>
+                              </div>
+                            )}
                             {s.ai_suggestion.notes && (
                               <div style={{ marginTop: 4 }}>
                                 <button
@@ -1285,6 +1394,61 @@ function NeedsReviewPageInner() {
                                   {aiNotesOpen[s.id] ? "Hide reasoning" : "Why?"}
                                 </button>
                                 {aiNotesOpen[s.id] && <div style={{ marginTop: 2, fontStyle: "italic", color: "#697386" }}>&ldquo;{s.ai_suggestion.notes}&rdquo;{s.ai_suggestion.source ? ` — ${s.ai_suggestion.source}` : ""}</div>}
+                              </div>
+                            )}
+                          </div>
+                        )}
+                        {(s.hc_first_name || s.hc_last_name) && (
+                          <div style={{ marginBottom: 10, padding: "8px 10px", background: "#f7f8fb", border: "1px solid #e3e6ea", borderRadius: 8, fontSize: 12.5 }}>
+                            <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                              <strong style={{ color: "#3b4a63" }}>Staff-page email finder</strong>
+                              <span style={{ color: "#697386", fontSize: 11.5 }}>Reads this school&apos;s own pages for an address printed next to {s.hc_first_name} {s.hc_last_name}. Never guesses.</span>
+                              <button className="btn btn-sm" style={{ marginLeft: "auto" }} disabled={!!emailFinds[s.id]?.loading} onClick={() => findEmail(s)}>
+                                {emailFinds[s.id]?.loading ? "Reading pages…" : emailFinds[s.id]?.data ? "Search again" : "Find email on staff pages"}
+                              </button>
+                            </div>
+                            {emailFinds[s.id]?.error && <div style={{ color: "#b3261e", marginTop: 6 }}>{emailFinds[s.id].error}</div>}
+                            {emailFinds[s.id]?.data && (
+                              <div style={{ marginTop: 6 }}>
+                                {emailFinds[s.id].data.candidates.length === 0 && (
+                                  <div style={{ color: "#697386" }}>
+                                    No address for {emailFinds[s.id].data.coach} was found on the pages read ({emailFinds[s.id].data.pages_checked.filter((p) => p.ok).length} readable). Try the athletics site link above.
+                                  </div>
+                                )}
+                                {emailFinds[s.id].data.candidates.map((c) => {
+                                  const filled = (draft.hc_email || "").trim().toLowerCase() === c.email.toLowerCase();
+                                  return (
+                                    <div key={c.email} style={{ padding: "4px 0", borderTop: "1px solid #eceff3" }}>
+                                      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                                        <span style={{ fontWeight: 600, wordBreak: "break-all" }}>{c.email}</span>
+                                        <span style={{ color: c.strength === "strong" ? "#1e7145" : "#8a6100", fontSize: 11.5, fontWeight: 600 }}>{c.strength === "strong" ? "found next to the coach's name" : "possible match"}</span>
+                                        {c.same_as_on_file && <span style={{ color: "#697386", fontSize: 11.5 }}>(same as on file)</span>}
+                                        {c.generic && <span style={{ color: "#b3261e", fontSize: 11.5 }}>general mailbox</span>}
+                                        {c.off_domain && <span style={{ color: "#8a6100", fontSize: 11.5 }}>not on the school&apos;s domain</span>}
+                                        {filled ? (
+                                          <span style={{ color: "#1e7145", fontWeight: 600 }}>✓ filled in</span>
+                                        ) : (
+                                          <button className="btn btn-sm" onClick={() => useFoundEmail(s, c.email)}>
+                                            Use this
+                                          </button>
+                                        )}
+                                      </div>
+                                      <div style={{ fontStyle: "italic", color: "#697386", fontSize: 11.5 }}>
+                                        &ldquo;…{c.context}…&rdquo;{" "}
+                                        {c.url && (
+                                          <a href={linkableUrl(c.url)} target="_blank" rel="noopener noreferrer" style={{ fontStyle: "normal" }}>
+                                            open page ↗
+                                          </a>
+                                        )}
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                                {emailFinds[s.id].data.pattern_hint && (
+                                  <div style={{ marginTop: 4, fontSize: 11.5, color: "#8a6100" }}>
+                                    Hint only: other staff here use {emailFinds[s.id].data.pattern_hint.pattern} (for example {emailFinds[s.id].data.pattern_hint.example}). That is not this coach&apos;s email and is never applied.
+                                  </div>
+                                )}
                               </div>
                             )}
                           </div>
