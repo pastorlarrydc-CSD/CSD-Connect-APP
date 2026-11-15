@@ -1,7 +1,8 @@
 import { NextResponse } from "next/server";
 import { getSupabaseAdminClient } from "@/lib/supabase/admin";
 import { settleReVerifyItem } from "@/lib/backlogVerify";
-import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion, autoConfirmNoDataAvailable, runWithConcurrency, findDuplicateNameSchoolsForMany } from "@/lib/coachInfoLookup";
+import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion, autoConfirmNoDataAvailable, runWithConcurrency, findDuplicateNameSchoolsForMany, loadItemSourceText } from "@/lib/coachInfoLookup";
+import { secondPassIfNeeded } from "@/lib/aiSecondPass";
 import { normalizeAthleticsSuggestion } from "@/lib/athleticsLookup";
 import { normalizeMaxPrepsSuggestion } from "@/lib/maxPrepsLookup";
 import { normalizeSocialSuggestion } from "@/lib/socialLookup";
@@ -157,7 +158,7 @@ const TOOLS = [
     // uses it for the same-name-school confidence backstop; the other three
     // tools' normalize* functions below simply don't declare a second
     // parameter, so passing one is harmless.
-    buildSuggestion: (parsed, location) => normalizeSuggestion(parsed, "batch AI lookup", location),
+    buildSuggestion: (parsed, location, sourceText) => normalizeSuggestion(parsed, "batch AI lookup", location, sourceText),
     autoApplyHighConfidence: true,
     label: "Coach-Info",
     criteria: "Coach name on file, missing email",
@@ -294,7 +295,7 @@ export async function GET(req) {
         let schoolIdByItemId = null;
         let schoolLocationByItemId = null;
         if (tool.autoApplyHighConfidence || tool.notAvailableField) {
-          const selectCols = tool.key === "coach_info" ? "id,school_id,school:schools(name,city,state)" : "id,school_id";
+          const selectCols = tool.key === "coach_info" ? "id,school_id,school:schools(name,city,state,hc_first_name,hc_last_name)" : "id,school_id";
           const { data: itemRows } = await supabase.from(tool.itemsTable).select(selectCols).eq("batch_run_id", run.id);
           schoolIdByItemId = new Map((itemRows || []).map((r) => [r.id, r.school_id]));
           if (tool.key === "coach_info") {
@@ -332,6 +333,11 @@ export async function GET(req) {
         let reVerifySkipped = 0;
         let reVerifyErrors = 0;
 
+        // Second-look budget for this run (see lib/aiSecondPass.js): the
+        // skeptical re-read only runs while there is time left; once this
+        // runs out, remaining suggestions are simply stored as they were.
+        const secondPassBudget = { deadline: Date.now() + 25000 };
+
         // Processed COLLECT_CONCURRENCY-at-a-time rather than one line at a
         // time -- see COLLECT_CONCURRENCY's comment above. The counters
         // below are plain-number increments, safe to share across
@@ -353,7 +359,16 @@ export async function GET(req) {
             const rawText = entry.result.message?.content?.[0]?.text || "";
             const parsed = parseModelJson(rawText);
             if (parsed) {
-              patch = { suggestion: tool.buildSuggestion(parsed, schoolLocationByItemId?.get(itemId)), suggestion_error: null };
+              // Coach-Info only: the exact text the model was given, so its
+              // quotes/dates can be checked (lib/aiEvidence.js), then a
+              // skeptical second read for the suggestions that matter
+              // (lib/aiSecondPass.js). Both only ever lower confidence.
+              const loc = schoolLocationByItemId?.get(itemId);
+              let sourceText = "";
+              if (tool.key === "coach_info") sourceText = await loadItemSourceText(supabase, tool.itemsTable, itemId);
+              let suggestion = tool.buildSuggestion(parsed, loc, sourceText);
+              if (tool.key === "coach_info") suggestion = await secondPassIfNeeded({ apiKey, school: loc, suggestion, sourceText, budget: secondPassBudget });
+              patch = { suggestion, suggestion_error: null };
               succeeded++;
             } else {
               patch = { suggestion: null, suggestion_error: "Could not parse the AI's response for this school." };
