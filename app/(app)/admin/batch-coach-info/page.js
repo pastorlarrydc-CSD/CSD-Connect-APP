@@ -425,7 +425,7 @@ function BatchCoachInfoPageInner() {
   const stateFromUrl = searchParams.get("state");
   const modeFromUrl = searchParams.get("mode");
   const [candidateMode, setCandidateMode] = useState(
-    ["no_name", "missing_email", "missing_cell"].includes(modeFromUrl) ? modeFromUrl : "no_name"
+    ["no_name", "missing_email", "missing_cell", "re_verify"].includes(modeFromUrl) ? modeFromUrl : "no_name"
   ); // "no_name" | "missing_email" | "missing_cell" | "re_verify" | "bounce_recovery"
   const [scopeMode, setScopeMode] = useState(stateFromUrl ? "all" : "priority"); // "priority" | "all"
   const [customStates, setCustomStates] = useState(stateFromUrl || PRIORITY_STATES.join(", "));
