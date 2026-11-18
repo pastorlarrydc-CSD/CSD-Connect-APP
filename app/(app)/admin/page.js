@@ -276,6 +276,9 @@ export default function AdminPage() {
               <Link href="/admin/bulk-social" className="btn btn-sm btn-primary" style={{ marginRight: 8 }}>
                 Bulk Social Media Discovery
               </Link>
+              <Link href="/admin/finish-line" className="btn btn-sm btn-gold" style={{ marginRight: 8 }}>
+                Finish Line
+              </Link>
               <Link href="/admin/batch-status" className="btn btn-sm btn-gold" style={{ marginRight: 8 }}>
                 Batch Discovery Status
               </Link>
