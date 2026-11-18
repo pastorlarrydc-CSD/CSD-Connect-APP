@@ -272,3 +272,143 @@ export function SchoolCard({ card }) {
     </div>
   );
 }
+
+// ---- sprint plan -----------------------------------------------------------
+//
+// Turns the state numbers into an order of attack:
+//   1. review the AI answers that are already waiting (the checking is done),
+//   2. AI-check the schools nobody has checked yet, in runs of a sensible size,
+//   3. hand-finish the leftovers in the nearly finished states.
+// Expectations come from what the recent verification-backlog runs actually did
+// (finish_line_sprint_history), not from guesses. Pure function so it can be tested.
+
+const MINI_MAX = 100; // states with this many (or fewer) unchecked schools share one run
+const RUN_CAP = 300; // biggest sensible single run for one state
+
+function round10(n) {
+  return Math.round(n / 10) * 10;
+}
+
+export function buildSprintPlan(states, history) {
+  const rows = (states || []).filter((s) => s.remaining > 0);
+  const remaining = rows.reduce((t, s) => t + s.remaining, 0);
+  const waiting = rows.filter((s) => s.ai_ready > 0).sort((a, b) => b.ai_ready - a.ai_ready || a.state.localeCompare(b.state));
+  const leftovers = rows.filter((s) => s.never_checked === 0 && s.ai_ready === 0).sort((a, b) => a.remaining - b.remaining || a.state.localeCompare(b.state));
+  const toCheck = rows.filter((s) => s.never_checked > 0);
+  const mini = toCheck.filter((s) => s.never_checked <= MINI_MAX).sort((a, b) => a.never_checked - b.never_checked || a.state.localeCompare(b.state));
+  const big = toCheck.filter((s) => s.never_checked > MINI_MAX).sort((a, b) => a.never_checked - b.never_checked || a.state.localeCompare(b.state));
+
+  const href = (codes, count) => `/admin/batch-coach-info?state=${encodeURIComponent(codes.join(","))}&mode=re_verify&count=${count}`;
+  const runs = [];
+  if (mini.length) {
+    const n = mini.reduce((t, s) => t + s.never_checked, 0);
+    const codes = mini.map((s) => s.state);
+    const count = n <= 100 ? 100 : 300;
+    runs.push({ key: "mini", label: `Mini run: ${codes.join(", ")}`, states: codes, schools: n, count, runsNeeded: 1, href: href(codes, count) });
+  }
+  for (const s of big) {
+    const count = RUN_CAP;
+    runs.push({ key: s.state, label: s.state, states: [s.state], schools: s.never_checked, count, runsNeeded: Math.ceil(s.never_checked / RUN_CAP), href: href([s.state], count) });
+  }
+
+  const uncheckedTotal = toCheck.reduce((t, s) => t + s.never_checked, 0);
+  const waitingTotal = waiting.reduce((t, s) => t + s.ai_ready, 0);
+  const leftoverTotal = leftovers.reduce((t, s) => t + s.remaining, 0);
+
+  // Expectations from your own runs. Before = runs before the stricter evidence
+  // checks (Nov 15); after = runs since. Need a real sample or fall back to a
+  // cautious range and say so.
+  const b = history && history.before && history.before.schools >= 100 ? history.before : null;
+  const a = history && history.after && history.after.schools >= 100 ? history.after : null;
+  const hi = b ? b.verified / b.schools : 0.85;
+  const lo = a ? a.verified / a.schools : 0.6;
+  const forecast = {
+    from_history: Boolean(b && a),
+    verified_low_pct: Math.round(lo * 100),
+    verified_high_pct: Math.round(hi * 100),
+    before_schools: b ? b.schools : 0,
+    after_schools: a ? a.schools : 0,
+    flagged_high_pct: a ? Math.round((a.flagged / a.schools) * 100) : null,
+    flagged_low_pct: b ? Math.round((b.flagged / b.schools) * 100) : null,
+    still_low: Math.max(0, round10(remaining - uncheckedTotal * hi)),
+    still_high: Math.max(0, round10(remaining - uncheckedTotal * lo)),
+  };
+
+  return { remaining, waiting, waitingTotal, runs, uncheckedTotal, leftovers, leftoverTotal, forecast };
+}
+
+export function SprintPlan({ plan, onOpen }) {
+  if (!plan || plan.remaining === 0) return null;
+  const f = plan.forecast;
+  return (
+    <div className="card" style={{ marginBottom: 14 }}>
+      <h3 style={{ marginBottom: 4 }}>Sprint plan: the order to finish in</h3>
+      <div style={{ fontSize: 12.5, color: MUTED, marginBottom: 10 }}>Three steps, quickest wins first. Nothing starts by itself: every AI run is started by you on the Batch Coach-Info page.</div>
+
+      {plan.waitingTotal > 0 && (
+        <div style={{ marginBottom: 12 }}>
+          <strong>Step 1. Review the {fmt(plan.waitingTotal)} AI answers already waiting</strong>
+          <div style={{ fontSize: 12.5, color: MUTED }}>The checking is already done, so these are the fastest wins.</div>
+          <div style={{ marginTop: 6 }}>
+            {plan.waiting.map((s) => (
+              <button key={s.state} type="button" className="btn btn-sm" style={{ marginRight: 6, marginBottom: 6 }} onClick={() => onOpen(s.state, "answer_ready")}>
+                {s.state} · {fmt(s.ai_ready)}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {plan.runs.length > 0 && (
+        <div style={{ marginBottom: 12 }}>
+          <strong>Step 2. AI-check the {fmt(plan.uncheckedTotal)} schools nobody has checked yet</strong>
+          <div style={{ fontSize: 12.5, color: MUTED }}>
+            One run at a time: start it, let it finish (results are collected overnight, or press Collect Results), review, then start the next. Smallest first.
+          </div>
+          <div style={{ marginTop: 6 }}>
+            {plan.runs.map((r) => (
+              <div key={r.key} style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", padding: "4px 0", borderBottom: "1px solid #eef0f3", fontSize: 13 }}>
+                <span style={{ minWidth: 220 }}>
+                  <strong>{r.label}</strong>
+                </span>
+                <span style={{ color: MUTED, minWidth: 190 }}>
+                  {fmt(r.schools)} school{r.schools === 1 ? "" : "s"}
+                  {r.runsNeeded > 1 ? ` · about ${r.runsNeeded} runs of up to ${fmt(r.count)}` : ""}
+                </span>
+                <Link href={r.href} className="btn btn-sm btn-gold">
+                  Set up this run →
+                </Link>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {plan.leftovers.length > 0 && (
+        <div style={{ marginBottom: 12 }}>
+          <strong>Step 3. Finish the {fmt(plan.leftoverTotal)} hands-on leftovers in {fmt(plan.leftovers.length)} nearly finished states</strong>
+          <div style={{ fontSize: 12.5, color: MUTED }}>The AI has already looked at these. They need a person: a flag to clear or a coach to confirm by hand.</div>
+          <div style={{ marginTop: 6 }}>
+            {plan.leftovers.map((s) => (
+              <button key={s.state} type="button" className="btn btn-sm" style={{ marginRight: 6, marginBottom: 6 }} onClick={() => onOpen(s.state, "all")}>
+                {s.state} · {fmt(s.remaining)}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      <div className="notice info" style={{ fontSize: 12.5 }}>
+        <strong>What to expect.</strong>{" "}
+        {f.from_history ? (
+          <>
+            Your last {fmt(f.before_schools)} schools before the stricter checks (Nov 15) came back about {f.verified_high_pct}% verified automatically. The {fmt(f.after_schools)} since then, before this week's loosening of the email and no-date checks, came back about {f.verified_low_pct}%, with more flagged or left for you to review.
+          </>
+        ) : (
+          <>There is not enough run history yet for a precise estimate, so this assumes roughly {f.verified_low_pct}% to {f.verified_high_pct}% of checked schools verify automatically.</>
+        )}{" "}
+        If the unchecked schools do the same, about {fmt(f.still_low)} to {fmt(f.still_high)} schools would still need you after all the AI checks, down from {fmt(plan.remaining)}. I can't see the price of an AI run from here, so look at the cost of the first run before starting the rest.
+      </div>
+    </div>
+  );
+}
