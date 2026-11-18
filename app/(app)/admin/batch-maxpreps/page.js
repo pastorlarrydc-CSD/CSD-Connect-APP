@@ -5,6 +5,7 @@ import Link from "next/link";
 import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
+import { useFinishedAtFirstSight } from "@/lib/finishedItems";
 import { fetchAllTouchedSchoolIds } from "@/lib/batchExclusion";
 
 // Overnight MaxPreps-URL Batch API job -- the MaxPreps-discovery counterpart
@@ -211,6 +212,10 @@ function BatchMaxPrepsPageInner() {
   const [loadingRuns, setLoadingRuns] = useState(true);
   const [selectedRunId, setSelectedRunId] = useState(null);
   const [items, setItems] = useState([]);
+  // Rows for schools that were already verified when first shown are hidden by
+  // default (see lib/finishedItems.js); this switch brings them back.
+  const finishedAtFirstSight = useFinishedAtFirstSight(items);
+  const [showFinished, setShowFinished] = useState(false);
   const [loadingItems, setLoadingItems] = useState(false);
 
   const [scopeMode, setScopeMode] = useState(stateFromUrl ? "all" : "priority"); // "priority" | "all"
@@ -389,10 +394,12 @@ function BatchMaxPrepsPageInner() {
 
   const selectedRun = runs.find((r) => r.id === selectedRunId) || null;
 
+  const viewItems = showFinished ? items : items.filter((i) => !finishedAtFirstSight.get(i.id));
+  const hiddenFinishedCount = showFinished ? 0 : items.length - viewItems.length;
   const readyCount = items.filter((i) => i.fetch_status === "ready").length;
   const pendingFetchCount = items.filter((i) => i.fetch_status === "pending").length;
   const noContentCount = items.filter((i) => i.fetch_status === "no_content").length;
-  const suggestedItems = items.filter((i) => i.suggestion);
+  const suggestedItems = viewItems.filter((i) => i.suggestion);
   const matchedItems = suggestedItems.filter((i) => i.suggestion.best_url);
   // Pending-only on both -- once confirmed via confirmNoDataAvailable,
   // review_status moves to "confirmed_no_data" but the underlying suggestion
@@ -406,7 +413,7 @@ function BatchMaxPrepsPageInner() {
   // leaving that item stuck at review_status "pending" forever with no
   // button that could resolve it. Keyed on suggestion_error alone now so
   // both failure shapes land in the same bucket.
-  const failedItems = items.filter((i) => i.suggestion_error && i.review_status === "pending");
+  const failedItems = viewItems.filter((i) => i.suggestion_error && i.review_status === "pending");
   const pendingReview = matchedItems.filter((i) => i.review_status === "pending");
   const reviewedItems = matchedItems.filter((i) => i.review_status !== "pending");
   // Quick same-day progress count for the summary line below -- "today"
@@ -421,7 +428,7 @@ function BatchMaxPrepsPageInner() {
   // spot as failedItems above -- deliberately excludes fetch_status
   // "pending" (never searched at all) so this never confirms "no data"
   // about a school nobody actually checked.
-  const noContentItems = items.filter((i) => !i.suggestion && !i.suggestion_error && i.fetch_status !== "pending" && i.review_status === "pending");
+  const noContentItems = viewItems.filter((i) => !i.suggestion && !i.suggestion_error && i.fetch_status !== "pending" && i.review_status === "pending");
   // Everything with nothing usable to apply -- an outright AI/API failure
   // (failedItems), a search that ran fine but found no confident match
   // (noMatchItems), or a search that found no results at all to even send
@@ -1384,6 +1391,13 @@ function BatchMaxPrepsPageInner() {
                   produce a suggestion for.
                 </p>
                 <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+                  <label
+                    style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}
+                    title="Rows for schools that were already verified when you opened them are hidden so finished states stay out of your way."
+                  >
+                    <input type="checkbox" checked={showFinished} onChange={(e) => setShowFinished(e.target.checked)} />
+                    Show verified schools{hiddenFinishedCount > 0 ? ` (${hiddenFinishedCount} hidden)` : ""}
+                  </label>
                   <label style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}>
                     <input
                       type="checkbox"
