@@ -5,6 +5,7 @@ import Link from "next/link";
 import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
+import { useFinishedAtFirstSight } from "@/lib/finishedItems";
 import { fetchAllTouchedSchoolIds } from "@/lib/batchExclusion";
 import { isEligibleSocialClassification } from "@/lib/socialLookup";
 import { linkableUrl } from "@/lib/needsReviewEdit";
@@ -270,6 +271,10 @@ function BatchSocialPageInner() {
   const [loadingRuns, setLoadingRuns] = useState(true);
   const [selectedRunId, setSelectedRunId] = useState(null);
   const [items, setItems] = useState([]);
+  // Rows for schools that were already verified when first shown are hidden by
+  // default (see lib/finishedItems.js); this switch brings them back.
+  const finishedAtFirstSight = useFinishedAtFirstSight(items);
+  const [showFinished, setShowFinished] = useState(false);
   const [loadingItems, setLoadingItems] = useState(false);
 
   // Set when this page was opened via a "Focus →" link from State Progress
@@ -504,10 +509,12 @@ function BatchSocialPageInner() {
   // "all" | "safe" (verified coach & email) | "check" (everything else)
   const [trustFilter, setTrustFilter] = useState("all");
 
+  const viewItems = showFinished ? items : items.filter((i) => !finishedAtFirstSight.get(i.id));
+  const hiddenFinishedCount = showFinished ? 0 : items.length - viewItems.length;
   const readyCount = items.filter((i) => i.fetch_status === "ready").length;
   const pendingFetchCount = items.filter((i) => i.fetch_status === "pending").length;
   const noContentCount = items.filter((i) => i.fetch_status === "no_content").length;
-  const suggestedItems = items.filter((i) => i.suggestion);
+  const suggestedItems = viewItems.filter((i) => i.suggestion);
   const matchedItems = suggestedItems.filter((i) => i.suggestion.twitter_url || i.suggestion.facebook_url);
   // Pending-only on both -- once confirmed via confirmNoDataAvailable,
   // review_status moves to "confirmed_no_data" but the underlying suggestion
@@ -525,7 +532,7 @@ function BatchSocialPageInner() {
   // Keyed on suggestion_error alone now so both failure shapes (a
   // suggestion object with an error note, or no suggestion at all) land in
   // the same bucket.
-  const failedItems = items.filter((i) => i.suggestion_error && i.review_status === "pending");
+  const failedItems = viewItems.filter((i) => i.suggestion_error && i.review_status === "pending");
   const pendingReview = matchedItems.filter((i) => i.review_status === "pending");
   const reviewedItems = matchedItems.filter((i) => i.review_status !== "pending");
   // Quick same-day progress count for the summary line below -- "today"
@@ -544,7 +551,7 @@ function BatchSocialPageInner() {
   // searched yet -- deliberately excludes fetch_status "pending" (never
   // searched at all) so this never confirms "no data" about a school
   // nobody actually checked.
-  const noContentItems = items.filter((i) => !i.suggestion && !i.suggestion_error && i.fetch_status !== "pending" && i.review_status === "pending");
+  const noContentItems = viewItems.filter((i) => !i.suggestion && !i.suggestion_error && i.fetch_status !== "pending" && i.review_status === "pending");
   // Everything with nothing usable to apply -- an outright AI/API failure
   // (failedItems), a search that ran fine but found no confident match on
   // either platform (noMatchItems), or a search that found no results at
@@ -1694,6 +1701,13 @@ function BatchSocialPageInner() {
                   {failedItems.length} the AI couldn't produce a suggestion for.
                 </p>
                 <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+                  <label
+                    style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}
+                    title="Rows for schools that were already verified when you opened them are hidden so finished states stay out of your way."
+                  >
+                    <input type="checkbox" checked={showFinished} onChange={(e) => setShowFinished(e.target.checked)} />
+                    Show verified schools{hiddenFinishedCount > 0 ? ` (${hiddenFinishedCount} hidden)` : ""}
+                  </label>
                   <label style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}>
                     <input
                       type="checkbox"
