@@ -82,7 +82,23 @@ export async function GET(req) {
         never_checked: Number(r.never_checked) || 0,
         is_priority_state: PRIORITY_STATES.includes(r.state),
       }));
-      return NextResponse.json({ states });
+      // What recent verification-backlog AI runs achieved (finish_line_sprint_history view),
+      // so the sprint plan can set honest expectations. Optional: a failure here never
+      // blocks the page.
+      let history = null;
+      try {
+        const { data: h } = await admin.from("finish_line_sprint_history").select("*");
+        const pick = (after) => {
+          const r = (h || []).find((x) => Boolean(x.after_evidence_checks) === after);
+          return r
+            ? { schools: Number(r.schools) || 0, runs: Number(r.runs) || 0, verified: Number(r.verified_after) || 0, flagged: Number(r.flagged_after) || 0, waiting: Number(r.waiting_for_you) || 0 }
+            : null;
+        };
+        history = { before: pick(false), after: pick(true) };
+      } catch (_) {
+        history = null;
+      }
+      return NextResponse.json({ states, history });
     }
 
     if (!/^[A-Z]{2}$/.test(state)) return NextResponse.json({ error: "Unknown state." }, { status: 400 });
