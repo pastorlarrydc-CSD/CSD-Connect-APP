@@ -5,6 +5,7 @@ import Link from "next/link";
 import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
+import { useFinishedAtFirstSight } from "@/lib/finishedItems";
 import { fetchAllTouchedSchoolIds } from "@/lib/batchExclusion";
 import { NEEDS_REVIEW_CLEAR_FIELDS } from "@/lib/needsReview";
 import { assessCoachChange } from "@/lib/coachEmailFit";
@@ -68,7 +69,7 @@ const FIELD_LABELS = {
 };
 
 const ITEM_SELECT =
-  "id,batch_run_id,school_id,fetch_status,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,addr1,addr2,zip,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,ad_name,ad_email,athletics_url,website,verification_status,last_verified_at)";
+  "id,batch_run_id,school_id,fetch_status,suggestion,suggestion_error,review_status,school:schools(id,name,city,state,addr1,addr2,zip,hc_first_name,hc_last_name,hc_email,hc_cell,hc_office,hc_twitter,hc_facebook,ad_name,ad_email,athletics_url,website,verification_status,last_verified_at,needs_review)";
 
 async function runWithConcurrency(items, limit, worker) {
   let next = 0;
@@ -385,6 +386,10 @@ function BatchCoachInfoPageInner() {
     return Number.isFinite(fromUrl) && fromUrl > 0 ? fromUrl : null;
   });
   const [items, setItems] = useState([]);
+  // Rows for schools that were already verified when first shown are hidden by
+  // default (see lib/finishedItems.js); this switch brings them back.
+  const finishedAtFirstSight = useFinishedAtFirstSight(items);
+  const [showFinished, setShowFinished] = useState(false);
   const [loadingItems, setLoadingItems] = useState(false);
 
   // "no_name" (default): the original targeting -- schools with no head
@@ -796,10 +801,12 @@ function BatchCoachInfoPageInner() {
 
   const selectedRun = runs.find((r) => r.id === selectedRunId) || null;
 
+  const viewItems = showFinished ? items : items.filter((i) => !finishedAtFirstSight.get(i.id));
+  const hiddenFinishedCount = showFinished ? 0 : items.length - viewItems.length;
   const readyCount = items.filter((i) => i.fetch_status === "ready").length;
   const pendingFetchCount = items.filter((i) => i.fetch_status === "pending").length;
   const noContentCount = items.filter((i) => i.fetch_status === "no_content").length;
-  const suggestedItems = items.filter((i) => i.suggestion);
+  const suggestedItems = viewItems.filter((i) => i.suggestion);
   const pendingReview = suggestedItems.filter((i) => i.review_status === "pending");
   const reviewedItems = suggestedItems.filter((i) => i.review_status !== "pending");
   // Quick same-day progress count for the summary line below -- "today"
@@ -2483,6 +2490,13 @@ function BatchCoachInfoPageInner() {
                   reviewed{reviewedTodayCount > 0 ? ` (${reviewedTodayCount} today)` : ""}, {failedItems.length} the AI couldn't produce a suggestion for.
                 </p>
                 <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+                  <label
+                    style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}
+                    title="Rows for schools that were already verified when you opened them are hidden so finished states stay out of your way."
+                  >
+                    <input type="checkbox" checked={showFinished} onChange={(e) => setShowFinished(e.target.checked)} />
+                    Show verified schools{hiddenFinishedCount > 0 ? ` (${hiddenFinishedCount} hidden)` : ""}
+                  </label>
                   <label style={{ fontSize: 12.5, display: "flex", gap: 6, alignItems: "center" }}>
                     <input
                       type="checkbox"
