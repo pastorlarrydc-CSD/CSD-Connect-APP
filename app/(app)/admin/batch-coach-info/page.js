@@ -432,7 +432,8 @@ function BatchCoachInfoPageInner() {
   // A state deep-link means "clear this whole state" -- 1000 (the largest
   // option) comfortably covers any single state's real gap today. See
   // state_data_coverage.
-  const [targetCount, setTargetCount] = useState(stateFromUrl ? 1000 : DEFAULT_TARGET_COUNT);
+  const countFromUrl = Number(searchParams.get("count"));
+  const [targetCount, setTargetCount] = useState(TARGET_COUNTS.includes(countFromUrl) ? countFromUrl : stateFromUrl ? 1000 : DEFAULT_TARGET_COUNT);
   // Only used by "re_verify" mode -- a school last reviewed more than this
   // many days ago is eligible to be re-included; never-reviewed schools are
   // always eligible regardless of this number.
