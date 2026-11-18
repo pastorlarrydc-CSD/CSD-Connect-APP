@@ -17,7 +17,7 @@ import Link from "next/link";
 import { useSearchParams } from "next/navigation";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
-import { Headline, NextMove, nextMove, StateRow, SchoolCard, LANES, fmt } from "@/components/FinishLineParts";
+import { Headline, NextMove, nextMove, SprintPlan, buildSprintPlan, StateRow, SchoolCard, LANES, fmt } from "@/components/FinishLineParts";
 
 const PAGE_SIZE = 100;
 
@@ -28,6 +28,7 @@ function FinishLineInner() {
   const searchParams = useSearchParams();
 
   const [states, setStates] = useState([]);
+  const [history, setHistory] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [sortKey, setSortKey] = useState("smallest"); // "smallest" | "biggest" | "priority"
@@ -55,6 +56,7 @@ function FinishLineInner() {
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "Could not load the Finish Line.");
       setStates(json.states || []);
+      setHistory(json.history || null);
     } catch (err) {
       setError(err.message);
     } finally {
@@ -84,6 +86,18 @@ function FinishLineInner() {
   useEffect(() => {
     if (canReview && openState && !lists[openState]) loadList(openState);
   }, [canReview, openState, lists, loadList]);
+
+  // Opens a state's list straight onto one lane (used by the sprint plan buttons).
+  function openStateOn(code, lane) {
+    setSearch("");
+    setShown(PAGE_SIZE);
+    setLaneFilter(lane);
+    setOpenState(code);
+    setTimeout(() => {
+      const el = typeof document !== "undefined" ? document.getElementById(`state-${code}`) : null;
+      if (el && el.scrollIntoView) el.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 150);
+  }
 
   function toggleState(code) {
     setLaneFilter("all");
@@ -117,6 +131,7 @@ function FinishLineInner() {
     };
     return rows.slice().sort(by[sortKey] || by.smallest);
   }, [states, sortKey]);
+  const plan = useMemo(() => buildSprintPlan(states, history), [states, history]);
   const finished = useMemo(() => states.filter((s) => s.remaining === 0).map((s) => s.state).sort(), [states]);
 
   if (!canReview) {
@@ -208,6 +223,7 @@ function FinishLineInner() {
         <>
           <Headline totals={totals} />
           <NextMove move={nextMove(totals, states)} />
+          <SprintPlan plan={plan} onOpen={openStateOn} />
 
           <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", marginBottom: 10 }}>
             <strong style={{ fontSize: 14 }}>{fmt(active.length)} states still have work</strong>
@@ -223,7 +239,7 @@ function FinishLineInner() {
 
           {active.length === 0 && <div className="empty-state">Every open school is verified.</div>}
           {active.map((row) => (
-            <div key={row.state}>
+            <div key={row.state} id={`state-${row.state}`}>
               <StateRow row={row} open={openState === row.state} onToggle={() => toggleState(row.state)} />
               {openState === row.state && renderList(row.state)}
             </div>
