@@ -977,12 +977,23 @@ export default function DataQualityPage() {
       return;
     }
     setLoadingDuplicateCells(true);
-    const { data } = await supabase
-      .from("schools")
-      .select("id,name,city,state,hc_first_name,hc_last_name,hc_cell")
-      .not("hc_cell", "is", null)
-      .neq("hc_cell", "")
-      .eq("is_closed", false);
+    // Read EVERY school with a cell, 1,000 rows at a time. A single unpaged read
+    // stops at 1,000 of the ~3,800 cells on file, so most duplicates (and the
+    // "may now be coaching at" matches on the Coach Change Outreach List) were
+    // never seen -- this card showed 3 duplicates when there were about 24.
+    const data = [];
+    for (let from = 0; ; from += 1000) {
+      const { data: page } = await supabase
+        .from("schools")
+        .select("id,name,city,state,hc_first_name,hc_last_name,hc_cell")
+        .not("hc_cell", "is", null)
+        .neq("hc_cell", "")
+        .eq("is_closed", false)
+        .order("id")
+        .range(from, from + 999);
+      data.push(...(page || []));
+      if (!page || page.length < 1000) break;
+    }
     const groups = new Map();
     (data || []).forEach((s) => {
       const digits = phoneDigits(s.hc_cell);
