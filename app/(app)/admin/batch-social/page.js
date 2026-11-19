@@ -6,6 +6,7 @@ import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
 import { useAuth } from "@/lib/auth-context";
 import { useFinishedAtFirstSight } from "@/lib/finishedItems";
+import { readPlace, writePlace, clearPlace, captureScrollAnchor, restoreScrollAnchor } from "@/lib/rememberPlace";
 import { fetchAllTouchedSchoolIds } from "@/lib/batchExclusion";
 import { isEligibleSocialClassification } from "@/lib/socialLookup";
 import { linkableUrl } from "@/lib/needsReviewEdit";
@@ -74,6 +75,13 @@ function readStoredQuickFix() {
     return null;
   }
 }
+
+// "Where I was" on this screen -- see lib/rememberPlace.js. Which run was open,
+// the filters, the focused row and how far down the page, so leaving and coming
+// back lands on the same spot instead of the newest run at the top.
+const PLACE_KEY = "batch-social";
+const CONFIDENCE_VALUES = ["all", "high", "medium", "low", "reviewed"];
+const TRUST_VALUES = ["all", "safe", "check"];
 
 function StatusBadge({ status }) {
   const labels = {
@@ -249,6 +257,22 @@ function BatchSocialPageInner() {
   const pathname = usePathname();
   const searchParams = useSearchParams();
 
+  // The place left last time on this screen. Skipped when the page was opened
+  // from a link that names its own run or state (the chained-run and State
+  // Progress buttons), since those mean "start from here" on purpose.
+  const [savedPlace] = useState(() => (searchParams.get("fromCoachInfoRun") || searchParams.get("state") ? null : readPlace(PLACE_KEY)));
+  // Non-null until the saved place has been put back (rows drawn, focus and
+  // scroll restored). While set, nothing is saved, so the half-loaded page
+  // can't overwrite the place it is about to restore.
+  const restoreRef = useRef(
+    savedPlace && savedPlace.runId
+      ? { runId: savedPlace.runId, focusedItemId: savedPlace.focusedItemId ?? null, anchorId: savedPlace.anchorId ?? null, anchorTop: savedPlace.anchorTop || 0, scrollY: savedPlace.scrollY || 0 }
+      : null
+  );
+  const scrollRef = useRef({ scrollY: 0, anchorId: null, anchorTop: 0 });
+  const loadedRunRef = useRef(null);
+  const [resumedNote, setResumedNote] = useState(false);
+
   // Set when this page was opened via the "Start Social Media Discovery for
   // These Schools" button on a Batch Coach-Info run -- see that page. Drives
   // a distinct "chained run" card in place of the usual state/count picker,
@@ -267,14 +291,14 @@ function BatchSocialPageInner() {
   // "last worked" on each run row (see loadRuns) so Larry can tell which
   // run he was most recently in without opening each one.
   const [runLastWorked, setRunLastWorked] = useState({});
-  const [hideCompletedRuns, setHideCompletedRuns] = useState(true);
+  const [hideCompletedRuns, setHideCompletedRuns] = useState(savedPlace?.hideCompletedRuns !== false);
   const [loadingRuns, setLoadingRuns] = useState(true);
-  const [selectedRunId, setSelectedRunId] = useState(null);
+  const [selectedRunId, setSelectedRunId] = useState(savedPlace?.runId ?? null);
   const [items, setItems] = useState([]);
   // Rows for schools that were already verified when first shown are hidden by
   // default (see lib/finishedItems.js); this switch brings them back.
   const finishedAtFirstSight = useFinishedAtFirstSight(items);
-  const [showFinished, setShowFinished] = useState(false);
+  const [showFinished, setShowFinished] = useState(savedPlace?.showFinished === true);
   const [loadingItems, setLoadingItems] = useState(false);
 
   // Set when this page was opened via a "Focus →" link from State Progress
@@ -313,7 +337,7 @@ function BatchSocialPageInner() {
 
   const [applyingId, setApplyingId] = useState(null);
   const [reviewError, setReviewError] = useState("");
-  const [showReviewed, setShowReviewed] = useState(false);
+  const [showReviewed, setShowReviewed] = useState(savedPlace?.showReviewed === true);
   const [bulkApplying, setBulkApplying] = useState(false);
   const [bulkProgress, setBulkProgress] = useState({ done: 0, total: 0 });
   // Confidence filter + search box -- same pattern as Batch Coach-Info's
@@ -321,8 +345,8 @@ function BatchSocialPageInner() {
   // full reasoning): lets a reviewer work through one tier at a time, or
   // jump straight to a specific school, once a run's list runs into the
   // hundreds instead of scrolling one long mixed table.
-  const [confidenceFilter, setConfidenceFilter] = useState("all"); // "all" | "high" | "medium" | "low"
-  const [searchQuery, setSearchQuery] = useState("");
+  const [confidenceFilter, setConfidenceFilter] = useState(CONFIDENCE_VALUES.includes(savedPlace?.confidenceFilter) ? savedPlace.confidenceFilter : "all"); // "all" | "high" | "medium" | "low"
+  const [searchQuery, setSearchQuery] = useState(typeof savedPlace?.searchQuery === "string" ? savedPlace.searchQuery : "");
   const [focusedIndex, setFocusedIndex] = useState(0);
   // The AI's one-paragraph reasoning for each suggestion is collapsed by
   // default (Larry's own words: reading a full paragraph per row on a
@@ -507,7 +531,7 @@ function BatchSocialPageInner() {
   const [bounceMap, setBounceMap] = useState({});
   const [bounceReady, setBounceReady] = useState(false);
   // "all" | "safe" (verified coach & email) | "check" (everything else)
-  const [trustFilter, setTrustFilter] = useState("all");
+  const [trustFilter, setTrustFilter] = useState(TRUST_VALUES.includes(savedPlace?.trustFilter) ? savedPlace.trustFilter : "all");
 
   const viewItems = showFinished ? items : items.filter((i) => !finishedAtFirstSight.get(i.id));
   const hiddenFinishedCount = showFinished ? 0 : items.length - viewItems.length;
@@ -670,6 +694,87 @@ function BatchSocialPageInner() {
   const clampedFocusedIndex = keyboardTargets.length === 0 ? 0 : Math.min(focusedIndex, keyboardTargets.length - 1);
   const focusedItem = keyboardTargets[clampedFocusedIndex] || null;
 
+  // ---- Remember where I am (see lib/rememberPlace.js) ----
+  const placeRef = useRef({});
+  placeRef.current = {
+    runId: selectedRunId,
+    confidenceFilter,
+    trustFilter,
+    searchQuery,
+    showReviewed,
+    showFinished,
+    hideCompletedRuns,
+    focusedItemId: focusedItem?.id ?? null,
+  };
+  const saveSoon = useCallback(() => {
+    if (restoreRef.current) return; // still restoring -- never overwrite the saved place
+    scrollRef.current = captureScrollAnchor();
+    writePlace(PLACE_KEY, { ...placeRef.current, ...scrollRef.current });
+  }, []);
+
+  // Any change to the run, a filter, a switch or the focused row is saved a
+  // moment later (after the page has redrawn, so the scroll anchor is current).
+  useEffect(() => {
+    const t = setTimeout(saveSoon, 250);
+    return () => clearTimeout(t);
+  }, [selectedRunId, confidenceFilter, trustFilter, searchQuery, showReviewed, showFinished, hideCompletedRuns, focusedItem?.id, saveSoon]);
+
+  // Scrolling is saved once it stops.
+  useEffect(() => {
+    let t = null;
+    function onScroll() {
+      clearTimeout(t);
+      t = setTimeout(saveSoon, 200);
+    }
+    window.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      window.removeEventListener("scroll", onScroll);
+      clearTimeout(t);
+    };
+  }, [saveSoon]);
+
+  // Safety net: if the saved place can't be put back (the run is gone, a load
+  // failed), stop waiting after 15 seconds so saving starts working again.
+  useEffect(() => {
+    if (!restoreRef.current) return undefined;
+    const t = setTimeout(() => {
+      restoreRef.current = null;
+    }, 15000);
+    return () => clearTimeout(t);
+  }, []);
+
+  // Once the remembered run's rows are on screen, put focus and scroll back.
+  useEffect(() => {
+    const r = restoreRef.current;
+    if (!r || loadingRuns || loadingItems || selectedRunId !== r.runId || loadedRunRef.current !== r.runId) return;
+    // Rows under a trust filter only appear once the bounce check has loaded.
+    if (trustFilter !== "all" && !bounceReady) return;
+    restoreRef.current = null;
+    if (r.focusedItemId !== null) {
+      const idx = keyboardTargets.findIndex((i) => i.id === r.focusedItemId);
+      if (idx >= 0) setFocusedIndex(idx);
+    }
+    setResumedNote(true);
+    requestAnimationFrame(() =>
+      requestAnimationFrame(() => {
+        restoreScrollAnchor(r);
+        saveSoon();
+      })
+    );
+  }, [loadingRuns, loadingItems, selectedRunId, items, trustFilter, bounceReady, keyboardTargets, saveSoon]);
+
+  function startFresh() {
+    setConfidenceFilter("all");
+    setTrustFilter("all");
+    setSearchQuery("");
+    setShowReviewed(false);
+    setShowFinished(false);
+    setFocusedIndex(0);
+    setResumedNote(false);
+    clearPlace(PLACE_KEY);
+    window.scrollTo(0, 0);
+  }
+
   // Narrowing the confidence filter or typing a search query changes which
   // rows are keyboard-nav targets -- reset focus to the top of the new list
   // rather than leaving it pointed at an index that now means something
@@ -769,7 +874,16 @@ function BatchSocialPageInner() {
   // fires while nothing is already selected -- never overrides a run the
   // reviewer has deliberately opened.
   useEffect(() => {
-    if (selectedRunId || runs.length === 0) return;
+    if (runs.length === 0) return;
+    if (selectedRunId) {
+      // A remembered run that no longer exists (or has dropped out of the 30
+      // newest) falls back to the usual pick instead of an empty screen.
+      if (restoreRef.current && !runs.some((r) => r.id === selectedRunId)) {
+        restoreRef.current = null;
+        setSelectedRunId(null);
+      }
+      return;
+    }
     const newestCollected = runs.find((r) => r.status === "collected");
     setSelectedRunId((newestCollected || runs[0]).id);
   }, [runs, selectedRunId]);
@@ -801,6 +915,7 @@ function BatchSocialPageInner() {
           }
         });
       }
+      loadedRunRef.current = runId;
       setItems(data || []);
       setLoadingItems(false);
     },
@@ -808,8 +923,10 @@ function BatchSocialPageInner() {
   );
 
   useEffect(() => {
-    if (selectedRunId) loadItems(selectedRunId);
-  }, [selectedRunId, loadItems]);
+    // runs.length check: a remembered run id exists from the first render, but
+    // rows load only once the run list has (loadItems reads it).
+    if (selectedRunId && runs.length > 0) loadItems(selectedRunId);
+  }, [selectedRunId, loadItems, runs.length]);
 
   // Loads the bounce history for the schools in the open run -- see
   // bounceMap's comment. Pages in chunks of 200 ids so the request URL stays
@@ -1638,6 +1755,18 @@ function BatchSocialPageInner() {
             <StatusBadge status={selectedRun.status} />
           </div>
 
+          {resumedNote && (
+            <div style={{ fontSize: 12, color: "#697386", marginBottom: 8, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+              <span>↩ Picked up where you left off.</span>
+              <button type="button" className="btn btn-sm" onClick={startFresh}>
+                Start fresh
+              </button>
+              <button type="button" className="btn btn-sm" onClick={() => setResumedNote(false)}>
+                Hide
+              </button>
+            </div>
+          )}
+
           {selectedRun.status === "collecting" && (
             <div>
               <p style={{ fontSize: 12.5, color: "#697386" }}>
@@ -1973,6 +2102,7 @@ function BatchSocialPageInner() {
                       return [
                         <tr
                           key={item.id}
+                          data-place-row={item.id}
                           style={{
                             borderBottom: "1px solid #eef0f3",
                             opacity: reviewed ? 0.55 : 1,
