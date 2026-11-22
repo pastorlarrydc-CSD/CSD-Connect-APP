@@ -3,6 +3,7 @@ import { getSupabaseAdminClient } from "@/lib/supabase/admin";
 import { settleReVerifyItem } from "@/lib/backlogVerify";
 import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion, autoConfirmNoDataAvailable, runWithConcurrency, findDuplicateNameSchoolsForMany, loadItemSourceText } from "@/lib/coachInfoLookup";
 import { secondPassIfNeeded } from "@/lib/aiSecondPass";
+import { applyCoachElsewhereGuard } from "@/lib/coachElsewhere";
 import { normalizeAthleticsSuggestion } from "@/lib/athleticsLookup";
 import { normalizeMaxPrepsSuggestion } from "@/lib/maxPrepsLookup";
 import { normalizeSocialSuggestion } from "@/lib/socialLookup";
@@ -367,6 +368,10 @@ export async function GET(req) {
               let sourceText = "";
               if (tool.key === "coach_info") sourceText = await loadItemSourceText(supabase, tool.itemsTable, itemId);
               let suggestion = tool.buildSuggestion(parsed, loc, sourceText);
+              // Neighbor-coach guard (lib/coachElsewhere.js): a coach already on file at a
+              // DIFFERENT school is almost always a neighbor's or co-op partner's coach. Forced
+              // to low confidence with a note; only ever lowers confidence.
+              if (tool.key === "coach_info") suggestion = await applyCoachElsewhereGuard({ supabase, schoolId: schoolIdByItemId?.get(itemId), school: loc, suggestion });
               if (tool.key === "coach_info") suggestion = await secondPassIfNeeded({ apiKey, school: loc, suggestion, sourceText, budget: secondPassBudget });
               patch = { suggestion, suggestion_error: null };
               succeeded++;
