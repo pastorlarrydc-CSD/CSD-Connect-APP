@@ -4,7 +4,8 @@
 //
 // POST /api/admin/compare-list
 //   { action: "analyze", state: "WI", rows: [{ school, coach }, ...] }
-//       -> { counts, rows } -- one result per list row (see lib/listCompare.js). Read-only.
+//       -> { as_of, counts, rows } -- one result per list row (see lib/listCompare.js), each with the
+//          school's current verifiedAt. Read-only. The page calls it again to refresh a saved comparison.
 //   { action: "fix_spelling", state, label, fixes: [{ school_id, old_first, old_last, new_first, new_last }] }
 //       -> corrects coach-name spelling at schools where the EMAIL ON FILE carries the list's
 //          spelling. Every fix is re-checked here (same school, still the old name, pure
@@ -25,7 +26,7 @@ import { compareList, fixIsSafe } from "@/lib/listCompare";
 export const maxDuration = 60;
 
 const REVIEWER_ROLES = ["verifier", "sysadmin"];
-const SCHOOL_COLS = "id,name,city,state,hc_first_name,hc_last_name,hc_email,verification_status,needs_review";
+const SCHOOL_COLS = "id,name,city,state,hc_first_name,hc_last_name,hc_email,verification_status,needs_review,last_verified_at";
 const PAGE = 1000;
 const MAX_ROWS = 2000;
 const MAX_WRITES = 300;
@@ -87,10 +88,12 @@ export async function POST(req) {
       if (rows.length > MAX_ROWS) return NextResponse.json({ error: `That list has ${rows.length} rows. Compare up to ${MAX_ROWS} at a time.` }, { status: 400 });
       const schools = await loadStateSchools(admin, state);
       if (schools.length === 0) return NextResponse.json({ error: `No open schools on file for ${state}.` }, { status: 404 });
-      const results = compareList(rows, schools);
+      const byId = new Map(schools.map((sc) => [sc.id, sc]));
+      // verifiedAt lets the page tell a school verified AFTER the comparison from one that was already verified.
+      const results = compareList(rows, schools).map((r) => ({ ...r, verifiedAt: r.schoolId ? byId.get(r.schoolId)?.last_verified_at || null : null }));
       const counts = {};
       for (const r of results) counts[r.category] = (counts[r.category] || 0) + 1;
-      return NextResponse.json({ state, schools_on_file: schools.length, counts, rows: results });
+      return NextResponse.json({ state, as_of: nowIso, schools_on_file: schools.length, counts, rows: results });
     }
 
     if (body.action === "fix_spelling") {
