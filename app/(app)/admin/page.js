@@ -282,6 +282,9 @@ export default function AdminPage() {
               <Link href="/admin/text-outreach" className="btn btn-sm btn-gold" style={{ marginRight: 8 }}>
                 Text Outreach
               </Link>
+              <Link href="/admin/compare-list" className="btn btn-sm btn-gold" style={{ marginRight: 8 }}>
+                Compare a List
+              </Link>
               <Link href="/admin/batch-status" className="btn btn-sm btn-gold" style={{ marginRight: 8 }}>
                 Batch Discovery Status
               </Link>
