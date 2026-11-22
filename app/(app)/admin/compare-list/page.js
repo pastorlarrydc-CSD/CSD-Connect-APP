@@ -30,6 +30,7 @@ const STATES = [
 
 const CATS = [
   { key: "attention", label: "Needs a look" },
+  { key: "done", label: "Done" },
   { key: "spelling", label: "Spelling" },
   { key: "differ", label: "Different coach" },
   { key: "first_name", label: "First name differs" },
@@ -52,6 +53,15 @@ const CAT_LABEL = {
 };
 const CAT_COLOR = { agree: "#1e7145", spelling: "#8a6100", differ: "#b3261e", first_name: "#8a6100", ours_blank: "#2f5fa8", unmatched: "#697386", shared: "#697386", list_blank: "#697386" };
 const n = (x) => Number(x || 0).toLocaleString("en-US");
+const ATTENTION = ["spelling", "differ", "first_name", "ours_blank"];
+const shortDate = (iso) => {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "" : d.toLocaleDateString("en-US", { month: "short", day: "numeric" });
+};
+const clockTime = (iso) => {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? "" : d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" });
+};
 
 // The page remembers its inputs and results in this browser, so opening a school profile (or
 // reloading, or stepping away) and coming back does not lose the pasted list or the comparison.
@@ -62,7 +72,7 @@ function writeSaved(v) {
   if (!v) return;
   const base = { savedAt: Date.now(), state: v.state, label: v.label, pasted: v.pasted, fileName: v.fileName };
   try {
-    window.localStorage.setItem(STORE_KEY, JSON.stringify({ ...base, result: v.result, fixSel: v.fixSel, queueSel: v.queueSel, filter: v.filter, search: v.search, shown: v.shown, report: v.report }));
+    window.localStorage.setItem(STORE_KEY, JSON.stringify({ ...base, result: v.result, fixSel: v.fixSel, queueSel: v.queueSel, done: v.done, filter: v.filter, search: v.search, shown: v.shown, report: v.report }));
   } catch {
     try {
       window.localStorage.setItem(STORE_KEY, JSON.stringify(base)); // too big for the results: keep at least the list
@@ -115,7 +125,12 @@ export default function CompareListPage() {
   const [confirming, setConfirming] = useState(""); // "fix" | "queue" | ""
   const [report, setReport] = useState(null); // last action outcome
   const [shown, setShown] = useState(60);
+  const [done, setDone] = useState({}); // idx -> { reason, at }: schools finished since the comparison
+  const [refreshing, setRefreshing] = useState(false);
+  const [refreshedAt, setRefreshedAt] = useState("");
   const fileRef = useRef(null);
+  const refreshingRef = useRef(false);
+  const lastRefreshRef = useRef(0);
   const [ready, setReady] = useState(false); // saved work has been read back (or there was none)
   const [restored, setRestored] = useState(false);
 
@@ -133,6 +148,7 @@ export default function CompareListPage() {
           setResult(saved.result);
           setFixSel(saved.fixSel || {});
           setQueueSel(saved.queueSel || {});
+          setDone(saved.done || {});
           setFilter(saved.filter || "attention");
           setSearch(saved.search || "");
           setShown(saved.shown || 60);
@@ -149,12 +165,12 @@ export default function CompareListPage() {
   // Save after every change (a moment after the last one, so typing and ticking stay quick), and
   // once more the instant the page is left, so nothing typed in the last moment is lost.
   const latest = useRef(null);
-  latest.current = { ready, state, label, pasted, fileName, result, fixSel, queueSel, filter, search, shown, report };
+  latest.current = { ready, busy, state, label, pasted, fileName, result, fixSel, queueSel, done, filter, search, shown, report };
   useEffect(() => {
     if (!ready) return undefined;
     const t = setTimeout(() => writeSaved(latest.current), 400);
     return () => clearTimeout(t);
-  }, [ready, state, label, pasted, fileName, result, fixSel, queueSel, filter, search, shown, report]);
+  }, [ready, state, label, pasted, fileName, result, fixSel, queueSel, done, filter, search, shown, report]);
   useEffect(() => {
     const flush = () => {
       if (latest.current?.ready) writeSaved(latest.current);
@@ -174,6 +190,8 @@ export default function CompareListPage() {
     setResult(null);
     setFixSel({});
     setQueueSel({});
+    setDone({});
+    setRefreshedAt("");
     setFilter("attention");
     setSearch("");
     setShown(60);
@@ -206,6 +224,62 @@ export default function CompareListPage() {
     if (!label) setLabel(f.name.replace(/\.[a-z0-9]+$/i, "").replace(/[_-]+/g, " "));
   }
 
+  // Re-check the same list against today's data. A school drops off "Needs a look" (and moves to Done) when
+  // its coach now matches the list, or when it was verified after the comparison was first run. Read-only.
+  const refresh = useCallback(async () => {
+    const cur = latest.current;
+    if (!cur?.result || cur.busy || refreshingRef.current) return;
+    refreshingRef.current = true;
+    lastRefreshRef.current = Date.now();
+    setRefreshing(true);
+    try {
+      const old = cur.result;
+      const res = await authedFetch("/api/admin/compare-list", {
+        method: "POST",
+        body: JSON.stringify({ action: "analyze", state: old.state, rows: old.rows.map((r) => ({ school: r.listName, coach: r.listCoach })) }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json.error || "Could not refresh.");
+      const prevByIdx = new Map(old.rows.map((r) => [r.idx, r]));
+      const comparedAt = old.as_of ? Date.parse(old.as_of) : 0;
+      const nextDone = { ...(latest.current?.done || {}) };
+      json.rows.forEach((r) => {
+        if (nextDone[r.idx]) return;
+        const p = prevByIdx.get(r.idx);
+        if (!p || !ATTENTION.includes(p.category)) return;
+        if (r.category === "agree") nextDone[r.idx] = { reason: "Now matches the list", at: json.as_of };
+        else if (r.status === "verified" && r.verifiedAt && comparedAt && Date.parse(r.verifiedAt) > comparedAt) nextDone[r.idx] = { reason: `Verified ${shortDate(r.verifiedAt)}`, at: r.verifiedAt };
+      });
+      setDone(nextDone);
+      setResult((prev) => (prev ? { ...prev, schools_on_file: json.schools_on_file, rows: json.rows } : prev));
+      setRefreshedAt(json.as_of || new Date().toISOString());
+    } catch {
+      // keep what is on screen; the Refresh button tries again
+    } finally {
+      refreshingRef.current = false;
+      setRefreshing(false);
+    }
+  }, [authedFetch]);
+
+  // Come back to this tab (for example from a school profile) and the list trims itself.
+  useEffect(() => {
+    const again = () => {
+      if (document.visibilityState === "hidden") return;
+      if (Date.now() - lastRefreshRef.current < 15000) return;
+      refresh();
+    };
+    window.addEventListener("focus", again);
+    document.addEventListener("visibilitychange", again);
+    return () => {
+      window.removeEventListener("focus", again);
+      document.removeEventListener("visibilitychange", again);
+    };
+  }, [refresh]);
+  // A comparison restored from the last visit is refreshed once straight away.
+  useEffect(() => {
+    if (restored) refresh();
+  }, [restored, refresh]);
+
   async function compare() {
     setError("");
     setReport(null);
@@ -219,6 +293,8 @@ export default function CompareListPage() {
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "Could not compare that list.");
       setResult(json);
+      setDone({});
+      setRefreshedAt(json.as_of || "");
       setRestored(false);
       const fs = {};
       const qs = {};
@@ -241,25 +317,35 @@ export default function CompareListPage() {
   const rows = result?.rows || [];
   const counts = useMemo(() => {
     const c = {};
-    rows.forEach((r) => (c[r.category] = (c[r.category] || 0) + 1));
+    rows.forEach((r) => {
+      if (!done[r.idx]) c[r.category] = (c[r.category] || 0) + 1;
+    });
     return c;
-  }, [rows]);
+  }, [rows, done]);
+  const doneCount = rows.filter((r) => done[r.idx]).length;
   const attentionCount = (counts.spelling || 0) + (counts.differ || 0) + (counts.first_name || 0) + (counts.ours_blank || 0);
+  const agreeAll = (counts.agree || 0) + doneCount;
 
   const visible = useMemo(() => {
     const q = search.trim().toLowerCase();
     return rows.filter((r) => {
-      if (filter === "attention") {
-        if (!["spelling", "differ", "first_name", "ours_blank"].includes(r.category)) return false;
-      } else if (filter !== "all" && r.category !== filter) return false;
+      const isDone = Boolean(done[r.idx]);
+      if (filter === "done") {
+        if (!isDone) return false;
+      } else if (filter !== "all") {
+        if (isDone) return false;
+        if (filter === "attention") {
+          if (!ATTENTION.includes(r.category)) return false;
+        } else if (r.category !== filter) return false;
+      }
       if (!q) return true;
       return `${r.listName} ${r.listCoach} ${r.schoolName} ${ourName(r)} ${r.city}`.toLowerCase().includes(q);
     });
-  }, [rows, filter, search]);
+  }, [rows, filter, search, done]);
 
-  const fixable = rows.filter((r) => r.category === "spelling" && r.fix);
+  const fixable = rows.filter((r) => r.category === "spelling" && r.fix && !done[r.idx]);
   const fixCount = fixable.filter((r) => fixSel[r.idx]).length;
-  const queueable = rows.filter((r) => r.category === "differ" && r.schoolId && !r.needsReview);
+  const queueable = rows.filter((r) => r.category === "differ" && r.schoolId && !r.needsReview && !done[r.idx]);
   const queueCount = queueable.filter((r) => queueSel[r.idx]).length;
 
   async function runFix() {
@@ -278,10 +364,18 @@ export default function CompareListPage() {
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "Could not fix those.");
-      const done = new Set(json.applied.map((a) => a.school_id));
+      const fixedIds = new Set(json.applied.map((a) => a.school_id));
+      const doneAt = new Date().toISOString();
+      setDone((prev) => {
+        const next = { ...prev };
+        rows.forEach((r) => {
+          if (fixedIds.has(r.schoolId) && r.fix) next[r.idx] = { reason: "Spelling fixed", at: doneAt };
+        });
+        return next;
+      });
       setResult((prev) => ({
         ...prev,
-        rows: prev.rows.map((r) => (done.has(r.schoolId) && r.fix ? { ...r, ourFirst: r.fix.first, ourLast: r.fix.last, category: "agree", fix: null, note: "Spelling fixed" } : r)),
+        rows: prev.rows.map((r) => (fixedIds.has(r.schoolId) && r.fix ? { ...r, ourFirst: r.fix.first, ourLast: r.fix.last, category: "agree", fix: null, note: "Spelling fixed" } : r)),
       }));
       setReport({ kind: "fix", applied: json.applied, skipped: json.skipped });
     } catch (err) {
@@ -308,8 +402,8 @@ export default function CompareListPage() {
       });
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "Could not queue those.");
-      const done = new Set(json.queued.map((a) => a.school_id));
-      setResult((prev) => ({ ...prev, rows: prev.rows.map((r) => (done.has(r.schoolId) ? { ...r, needsReview: true } : r)) }));
+      const queuedIds = new Set(json.queued.map((a) => a.school_id));
+      setResult((prev) => ({ ...prev, rows: prev.rows.map((r) => (queuedIds.has(r.schoolId) ? { ...r, needsReview: true } : r)) }));
       setReport({ kind: "queue", queued: json.queued, skipped: json.skipped, state: result.state });
     } catch (err) {
       setError(err.message);
@@ -324,7 +418,7 @@ export default function CompareListPage() {
       rows.map((r) => ({
         "List school": r.listName,
         "List coach": r.listCoach,
-        Result: CAT_LABEL[r.category] || r.category,
+        Result: done[r.idx] ? `Done (${done[r.idx].reason})` : CAT_LABEL[r.category] || r.category,
         "Our school": r.schoolName,
         City: r.city,
         "Our coach": ourName(r),
@@ -412,18 +506,19 @@ export default function CompareListPage() {
         <>
           {restored && (
             <div className="notice" style={{ marginBottom: 12, fontSize: 12.5 }}>
-              Your last comparison was kept, so nothing was lost when you left this page. Press Compare to run it again, or Start over to clear it.
+              Your last comparison was kept, so nothing was lost when you left this page. It was checked again just now, and schools you have finished since then are under Done. Start over clears it.
             </div>
           )}
           <div className="card" style={{ padding: "10px 14px", marginBottom: 12 }}>
             <div style={{ fontSize: 14, marginBottom: 6 }}>
               <strong>{n(rows.length)}</strong> list rows compared with <strong>{n(result.schools_on_file)}</strong> open schools in {result.state} ·{" "}
-              <strong style={{ color: CAT_COLOR.agree }}>{n(counts.agree)}</strong> agree ({rows.length ? Math.round(((counts.agree || 0) / rows.length) * 100) : 0}%) ·{" "}
-              <strong style={{ color: CAT_COLOR.differ }}>{n(attentionCount)}</strong> need a look
+              <strong style={{ color: CAT_COLOR.agree }}>{n(agreeAll)}</strong> agree or done ({rows.length ? Math.round((agreeAll / rows.length) * 100) : 0}%) ·{" "}
+              <strong style={{ color: CAT_COLOR.differ }}>{n(attentionCount)}</strong>
+              {doneCount > 0 ? ` of ${n(attentionCount + doneCount)} left to check` : " need a look"}
             </div>
             <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
               {CATS.map((c) => {
-                const count = c.key === "all" ? rows.length : c.key === "attention" ? attentionCount : counts[c.key] || 0;
+                const count = c.key === "all" ? rows.length : c.key === "attention" ? attentionCount : c.key === "done" ? doneCount : counts[c.key] || 0;
                 if (c.key !== "all" && c.key !== "attention" && count === 0) return null;
                 const on = filter === c.key;
                 return (
@@ -440,9 +535,15 @@ export default function CompareListPage() {
                   </button>
                 );
               })}
-              <button type="button" className="btn btn-sm" onClick={download} style={{ marginLeft: "auto" }}>
-                Download results (CSV)
-              </button>
+              <span style={{ marginLeft: "auto", display: "inline-flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+                {refreshedAt && <span style={{ fontSize: 12, color: "#697386" }}>Checked {clockTime(refreshedAt)}</span>}
+                <button type="button" className="btn btn-sm" disabled={refreshing || busy} onClick={refresh}>
+                  {refreshing ? "Checking…" : "Refresh"}
+                </button>
+                <button type="button" className="btn btn-sm" onClick={download}>
+                  Download results (CSV)
+                </button>
+              </span>
             </div>
           </div>
 
@@ -529,20 +630,21 @@ export default function CompareListPage() {
             <div className="empty-state">Nothing in this view.</div>
           ) : (
             visible.slice(0, shown).map((r) => (
-              <div key={r.idx} className="card" style={{ marginBottom: 8, padding: "10px 14px" }}>
+              <div key={r.idx} className="card" style={{ marginBottom: 8, padding: "10px 14px", opacity: done[r.idx] ? 0.7 : 1 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
                   <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
-                    {r.category === "spelling" && r.fix && (
+                    {r.category === "spelling" && r.fix && !done[r.idx] && (
                       <input type="checkbox" checked={Boolean(fixSel[r.idx])} onChange={(e) => setFixSel((p) => ({ ...p, [r.idx]: e.target.checked }))} aria-label="Include this fix" />
                     )}
-                    {r.category === "differ" && r.schoolId && !r.needsReview && (
+                    {r.category === "differ" && r.schoolId && !r.needsReview && !done[r.idx] && (
                       <input type="checkbox" checked={Boolean(queueSel[r.idx])} onChange={(e) => setQueueSel((p) => ({ ...p, [r.idx]: e.target.checked }))} aria-label="Include in the AI check queue" />
                     )}
                     <strong>{r.listName}</strong>
                     <span className="badge" style={{ color: CAT_COLOR[r.category], background: `${CAT_COLOR[r.category]}1a`, fontWeight: 600 }}>
                       {CAT_LABEL[r.category]}
                     </span>
-                    {r.needsReview && r.category === "differ" && <span className="badge" style={{ color: "#8a6100", background: "#8a61001a" }}>Flagged for review</span>}
+                    {r.needsReview && r.category === "differ" && !done[r.idx] && <span className="badge" style={{ color: "#8a6100", background: "#8a61001a" }}>Flagged for review</span>}
+                    {done[r.idx] && <span className="badge" style={{ color: "#1e7145", background: "#1e71451a", fontWeight: 600 }}>Done · {done[r.idx].reason}</span>}
                   </div>
                   {r.schoolId && (
                     <Link href={`/schools/${r.schoolId}`} target="_blank" rel="noopener noreferrer" style={{ fontSize: 12 }}>
