@@ -13,7 +13,7 @@
 //
 // Data comes from /api/admin/compare-list. Nothing is saved until a button is pressed and
 // confirmed, and no coach, email or verification status is ever changed except the spelling fix.
-import { useState, useMemo, useCallback, useRef } from "react";
+import { useState, useMemo, useCallback, useRef, useEffect } from "react";
 import Link from "next/link";
 import Papa from "papaparse";
 import { getSupabaseBrowserClient } from "@/lib/supabase/client";
@@ -52,6 +52,11 @@ const CAT_LABEL = {
 };
 const CAT_COLOR = { agree: "#1e7145", spelling: "#8a6100", differ: "#b3261e", first_name: "#8a6100", ours_blank: "#2f5fa8", unmatched: "#697386", shared: "#697386", list_blank: "#697386" };
 const n = (x) => Number(x || 0).toLocaleString("en-US");
+
+// The page remembers its inputs and results in this browser, so opening a school profile (or
+// reloading, or stepping away) and coming back does not lose the pasted list or the comparison.
+const STORE_KEY = "csd-compare-list-v1";
+const STORE_MAX_AGE_MS = 12 * 60 * 60 * 1000;
 
 function pickColumns(rows) {
   if (!rows.length) return { start: 0, school: 0, coach: 1 };
@@ -97,6 +102,75 @@ export default function CompareListPage() {
   const [report, setReport] = useState(null); // last action outcome
   const [shown, setShown] = useState(60);
   const fileRef = useRef(null);
+  const [ready, setReady] = useState(false); // saved work has been read back (or there was none)
+  const [restored, setRestored] = useState(false);
+
+  // Read back whatever was saved the last time this page was open.
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(STORE_KEY);
+      const saved = raw ? JSON.parse(raw) : null;
+      if (saved && Date.now() - (saved.savedAt || 0) < STORE_MAX_AGE_MS) {
+        setState(saved.state || "");
+        setLabel(saved.label || "");
+        setPasted(saved.pasted || "");
+        setFileName(saved.fileName || "");
+        if (saved.result && Array.isArray(saved.result.rows)) {
+          setResult(saved.result);
+          setFixSel(saved.fixSel || {});
+          setQueueSel(saved.queueSel || {});
+          setFilter(saved.filter || "attention");
+          setSearch(saved.search || "");
+          setShown(saved.shown || 60);
+          setReport(saved.report || null);
+          setRestored(true);
+        }
+      }
+    } catch {
+      // storage can be blocked or empty; the page works the same without it
+    }
+    setReady(true);
+  }, []);
+
+  // Save after every change (a moment after the last one, so typing and ticking stay quick).
+  useEffect(() => {
+    if (!ready) return undefined;
+    const t = setTimeout(() => {
+      const base = { savedAt: Date.now(), state, label, pasted, fileName };
+      try {
+        window.localStorage.setItem(STORE_KEY, JSON.stringify({ ...base, result, fixSel, queueSel, filter, search, shown, report }));
+      } catch {
+        try {
+          window.localStorage.setItem(STORE_KEY, JSON.stringify(base)); // too big for the results: keep at least the list
+        } catch {
+          // nothing more to do
+        }
+      }
+    }, 400);
+    return () => clearTimeout(t);
+  }, [ready, state, label, pasted, fileName, result, fixSel, queueSel, filter, search, shown, report]);
+
+  function startOver() {
+    setState("");
+    setLabel("");
+    setPasted("");
+    setFileName("");
+    setResult(null);
+    setFixSel({});
+    setQueueSel({});
+    setFilter("attention");
+    setSearch("");
+    setShown(60);
+    setReport(null);
+    setConfirming("");
+    setError("");
+    setRestored(false);
+    try {
+      window.localStorage.removeItem(STORE_KEY);
+    } catch {
+      // ignore
+    }
+  }
 
   const authedFetch = useCallback(
     async (url, init = {}) => {
@@ -129,6 +203,7 @@ export default function CompareListPage() {
       const json = await res.json();
       if (!res.ok) throw new Error(json.error || "Could not compare that list.");
       setResult(json);
+      setRestored(false);
       const fs = {};
       const qs = {};
       json.rows.forEach((r) => {
@@ -303,6 +378,11 @@ export default function CompareListPage() {
             {busy && !result ? "Comparing…" : "Compare"}
           </button>
           <span style={{ fontSize: 12.5, color: "#697386" }}>Read-only until you press a button below the results.</span>
+          {(result || pasted) && (
+            <button type="button" className="btn btn-sm" disabled={busy} onClick={startOver} style={{ marginLeft: "auto" }}>
+              Start over
+            </button>
+          )}
         </div>
       </div>
 
@@ -314,6 +394,11 @@ export default function CompareListPage() {
 
       {result && (
         <>
+          {restored && (
+            <div className="notice" style={{ marginBottom: 12, fontSize: 12.5 }}>
+              Your last comparison was kept, so nothing was lost when you left this page. Press Compare to run it again, or Start over to clear it.
+            </div>
+          )}
           <div className="card" style={{ padding: "10px 14px", marginBottom: 12 }}>
             <div style={{ fontSize: 14, marginBottom: 6 }}>
               <strong>{n(rows.length)}</strong> list rows compared with <strong>{n(result.schools_on_file)}</strong> open schools in {result.state} ·{" "}
