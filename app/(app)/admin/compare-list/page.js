@@ -58,6 +58,20 @@ const n = (x) => Number(x || 0).toLocaleString("en-US");
 const STORE_KEY = "csd-compare-list-v1";
 const STORE_MAX_AGE_MS = 12 * 60 * 60 * 1000;
 
+function writeSaved(v) {
+  if (!v) return;
+  const base = { savedAt: Date.now(), state: v.state, label: v.label, pasted: v.pasted, fileName: v.fileName };
+  try {
+    window.localStorage.setItem(STORE_KEY, JSON.stringify({ ...base, result: v.result, fixSel: v.fixSel, queueSel: v.queueSel, filter: v.filter, search: v.search, shown: v.shown, report: v.report }));
+  } catch {
+    try {
+      window.localStorage.setItem(STORE_KEY, JSON.stringify(base)); // too big for the results: keep at least the list
+    } catch {
+      // nothing more to do
+    }
+  }
+}
+
 function pickColumns(rows) {
   if (!rows.length) return { start: 0, school: 0, coach: 1 };
   const head = rows[0].map((c) => String(c || "").toLowerCase());
@@ -132,23 +146,25 @@ export default function CompareListPage() {
     setReady(true);
   }, []);
 
-  // Save after every change (a moment after the last one, so typing and ticking stay quick).
+  // Save after every change (a moment after the last one, so typing and ticking stay quick), and
+  // once more the instant the page is left, so nothing typed in the last moment is lost.
+  const latest = useRef(null);
+  latest.current = { ready, state, label, pasted, fileName, result, fixSel, queueSel, filter, search, shown, report };
   useEffect(() => {
     if (!ready) return undefined;
-    const t = setTimeout(() => {
-      const base = { savedAt: Date.now(), state, label, pasted, fileName };
-      try {
-        window.localStorage.setItem(STORE_KEY, JSON.stringify({ ...base, result, fixSel, queueSel, filter, search, shown, report }));
-      } catch {
-        try {
-          window.localStorage.setItem(STORE_KEY, JSON.stringify(base)); // too big for the results: keep at least the list
-        } catch {
-          // nothing more to do
-        }
-      }
-    }, 400);
+    const t = setTimeout(() => writeSaved(latest.current), 400);
     return () => clearTimeout(t);
   }, [ready, state, label, pasted, fileName, result, fixSel, queueSel, filter, search, shown, report]);
+  useEffect(() => {
+    const flush = () => {
+      if (latest.current?.ready) writeSaved(latest.current);
+    };
+    window.addEventListener("pagehide", flush);
+    return () => {
+      window.removeEventListener("pagehide", flush);
+      flush();
+    };
+  }, []);
 
   function startOver() {
     setState("");
