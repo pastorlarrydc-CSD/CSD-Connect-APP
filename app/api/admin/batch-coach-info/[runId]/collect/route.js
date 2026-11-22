@@ -3,6 +3,7 @@ import { getSupabaseRouteClient } from "@/lib/supabase/routeClient";
 import { settleReVerifyItem } from "@/lib/backlogVerify";
 import { parseModelJson, normalizeSuggestion, autoApplyHighConfidenceSuggestion, runWithConcurrency, findDuplicateNameSchoolsForMany, loadItemSourceText } from "@/lib/coachInfoLookup";
 import { secondPassIfNeeded } from "@/lib/aiSecondPass";
+import { applyCoachElsewhereGuard } from "@/lib/coachElsewhere";
 
 export const maxDuration = 60;
 
@@ -169,6 +170,10 @@ export async function POST(req, { params }) {
           const loc = schoolLocationByItemId.get(itemId);
           const sourceText = await loadItemSourceText(supabase, "coach_info_batch_items", itemId);
           let suggestion = normalizeSuggestion(parsed, "batch AI lookup", loc, sourceText);
+          // Neighbor-coach guard (lib/coachElsewhere.js): a coach who is already on file at a
+          // DIFFERENT school is almost always the AI picking up a neighbor's or co-op partner's
+          // coach. Forced to low confidence with a note; only ever lowers confidence.
+          suggestion = await applyCoachElsewhereGuard({ supabase, schoolId: schoolIdByItemId.get(itemId), school: loc, suggestion });
           suggestion = await secondPassIfNeeded({ apiKey, school: loc, suggestion, sourceText, budget: secondPassBudget });
           patch = { suggestion, suggestion_error: null };
           succeeded++;
